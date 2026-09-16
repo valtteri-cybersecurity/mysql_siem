@@ -1,3 +1,5 @@
+```python
+import os
 import pymysql
 from utils import timestamp_util, date_util
 
@@ -5,10 +7,10 @@ def db_connect():
     timestamp = timestamp_util()
     try:
         connection = pymysql.connect(
-            host = 'localhost',
-            user = 'pythonuser',
-            password = 'NeekerinViimeinenMatka666',
-            database = 'homesystem'
+            host=os.getenv("DB_HOST"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME")
         )
         if not connection:
             print(f"{timestamp}:   Connection to the database failed.")
@@ -19,6 +21,8 @@ def db_connect():
 
 def get_data_db(connection):
     timestamp = timestamp_util()
+    cursor = None
+
     try:
         cursor = connection.cursor()
         cursor.execute("""
@@ -78,3 +82,5 @@ def write_data_db(connection, parsed_data):
 
     except pymysql.MySQLError as error:
         print(f"{timestamp}:   DATABASE ERROR: {error}")
+```
+

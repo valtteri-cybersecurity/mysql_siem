@@ -1,3 +1,4 @@
+import os
 import pymysql
 from utils import timestamp_util
 
@@ -5,10 +6,10 @@ def connect_db():
     timestamp = timestamp_util()
     try:
         connection = pymysql.connect(
-            host = 'localhost',
-            user = 'pythonuser',
-            password = 'NeekerinViimeinenMatka666',
-            database = 'homesystem'
+            host=os.getenv("DB_HOST"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME")
         )
         if connection:
             print(f"{timestamp}:   Connection to the database successfull.")
