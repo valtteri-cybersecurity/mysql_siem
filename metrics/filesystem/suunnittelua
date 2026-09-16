@@ -1,0 +1,29 @@
+-----------------------------------------------------------------
+
+Suunnittelua ja pohdiskelua 21.7.2026 -  18.21
+
+Katson tätä kirjoittaessani välilehdeltä tietokannan tuloksia
+filesystem_metrics taulusta.
+Sitä katsoessani mieleeni herää mahdollisesti helppoja ongelmien
+havaitsemis mahdollisuuksia.
+
+Esimerkiksi:
+
+1. total_files pysyy kokoajan suhteellisen samana vaikka saattaa 
+muutamalla sadalla vaihdellakkin päivien välein. Siihen voisi
+asettaa esimerkiksi ehdon "Jos total_files muuttuu yli 2000
+päivässä tai 5000 kuukaudessa, tee merkintä mysql sekä hälytys."
+
+2. modified_last_day sopii myös pian hyvin ns normaalin datan
+muuttamisen säännöstöksi. Voimme laskea keskiarvon keskimääräisestä
+muokattujen tiedostojen määrästä ja sitten tehdä säännön:
+"Jos modifie_last_day on 3x isompi kuin keskimäärin tee merkintä
+sql ja hälytys."
+
+
+
+-----------------------------------------------------------------
+
+
+
+
