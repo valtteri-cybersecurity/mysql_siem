@@ -1,0 +1,12 @@
+Sunnittelua ja pohdintoja 21.7.2026
+
+
+Kun katson tietokannasta security_metrics dataa voin todeta
+muutaman mahdollisen detection työkalun kehitys mahdollisuuden.
+
+Säännöt näille:
+
+
+1. Jos failed_logins määrä on yli 5, merkintä sql ja hälytys
+2. Jos unique_ips esiintyy 2x enemmän kuin keskimäärin
+
