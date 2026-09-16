@@ -31,7 +31,6 @@ try:
 
     cursor = connection.cursor()
 
-    # Haetaan tallennettu lukukohta
     cursor.execute("SELECT last_position FROM ufw_state WHERE id = 1")
     result = cursor.fetchone()
 
@@ -48,10 +47,8 @@ try:
     else:
         last_position = result[0]
 
-    # Tarkistetaan nykyisen lokin koko
     current_size = os.path.getsize(LOGFILE)
 
-    # Jos loki on rotateutunut ja pienentynyt, aloita alusta
     if last_position > current_size:
         last_position = 0
 
@@ -74,7 +71,6 @@ try:
             dst_ip = info_table.get("dst_ip")
             protocol = info_table.get("protocol")
 
-            # Pidä nämä nimet samoina kuin splitterissäsi
             src_port = info_table.get("src_prt")
             dst_port = info_table.get("dst_prt")
 
