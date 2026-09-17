@@ -1,24 +1,6 @@
-import os
 import pymysql
-from utils import timestamp_util
 
-def db_connect():
-    timestamp = timestamp_util()
-    try:
-        connection = pymysql.connect(
-            host=os.getenv("DB_HOST"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            database=os.getenv("DB_NAME")
-        )
-        if connection:
-            return connection
-        else:
-            print(f"{timestamp}:   Connection refused")
-            return None
-
-    except pymysql.MySQLError as error:
-        print(f"{timestamp}:   DATABASE ERROR: {error}")
+from detection.port_scan.utils import timestamp_util
 
 def get_db_data(connection):
     cursor = None
@@ -34,7 +16,7 @@ def get_db_data(connection):
             WHERE action = 'BLOCK' AND DATE(event_time) = CURDATE()
             ORDER BY event_time;
             """
-            
+
             cursor.execute(sql)
             results = cursor.fetchall()
 
