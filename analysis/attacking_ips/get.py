@@ -1,4 +1,5 @@
-from utils import date_util
+from analysis.attacking_ips.utils import date_util
+
 
 def parse_raw_result(results):
     date = date_util()
@@ -7,10 +8,11 @@ def parse_raw_result(results):
 
     for ip, hits in results:
         data = {
-            "metric_date": date, 
+            "metric_date": date,
             "src_ip": ip,
             "hits": hits
         }
 
         all_data.append(data)
+
     return all_data

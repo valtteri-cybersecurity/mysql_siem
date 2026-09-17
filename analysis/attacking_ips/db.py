@@ -1,26 +1,6 @@
-import os
 import pymysql
-from utils import timestamp_util
 
-def connect_db():
-    timestamp = timestamp_util()
-    try:
-        connection = pymysql.connect(
-            host=os.getenv("DB_HOST"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            database=os.getenv("DB_NAME")
-        )
-        if connection:
-            print(f"{timestamp}:   Connection to the database successfull.")
-        else:
-            print(f"{timestamp}:   Connection to the database failed.")
-        
-        return connection
-    except pymysql.MySQLError as error:
-        print(f"{timestamp}:   DATABASE ERROR: {error}")
-        return None
-
+from analysis.attacking_ips.utils import timestamp_util
 
 def get_db_data(connection):
     timestamp = timestamp_util()
