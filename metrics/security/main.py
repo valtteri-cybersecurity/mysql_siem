@@ -1,25 +1,29 @@
-from get_data import get_data
-from database import db_connect, save_metrics_db
+from database.connection import get_connection
+
+from metrics.security.get_data import get_data
+from metrics.security.database import save_metrics_db
+
 
 def main():
     connection = None
 
     try:
-        connection = db_connect()
-        
-        if connection == None:
+        connection = get_connection()
+
+        if not connection:
             print("Database connection failed.")
             return
 
         data = get_data(connection)
         save_metrics_db(connection, data)
- 
-    except Exception as e:
-        print(f"ERROR DURING EXECUTION: {e}")
+
+    except Exception as error:
+        print(f"ERROR DURING EXECUTION: {error}")
 
     finally:
         if connection:
             connection.close()
+
 
 if __name__ == "__main__":
     main()

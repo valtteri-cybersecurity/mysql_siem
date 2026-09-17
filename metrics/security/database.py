@@ -1,26 +1,10 @@
-import os
-import pymysql
-from get_data import get_timestamp
+from datetime import datetime
 
-def db_connect():
-    timestamp = get_timestamp()
-    try:
-        connection = pymysql.connect(
-            host=os.getenv("DB_HOST"),
-            user=os.getenv("DB_USER"),
-            password=os.getenv("DB_PASSWORD"),
-            database=os.getenv("DB_NAME")
-        )
-        print(f"{timestamp}:   Connection to the database has been created")
-        return connection
-    
-    except pymysql.MySQLError as error:
-        print(f"{timestamp}:   Database error: {error}")
-        return None
+import pymysql
 
 
 def save_metrics_db(connection, data):
-    timestamp = get_timestamp()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor = None
 
     try:
@@ -48,11 +32,13 @@ def save_metrics_db(connection, data):
 
         connection.commit()
 
-        print(f"{timestamp}:   Security-metrics successfully written to the database!")
-        print()
+        print(
+            f"{timestamp}:   "
+            "Security-metrics successfully written to the database!"
+        )
 
     except pymysql.MySQLError as error:
-        print(f"{timestamp}DATABASE ERROR: {error}")
+        print(f"{timestamp}:   DATABASE ERROR: {error}")
 
         if connection:
             connection.rollback()

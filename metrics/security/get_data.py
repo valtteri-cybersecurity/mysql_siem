@@ -1,5 +1,4 @@
 from datetime import datetime
-import pymysql
 
 def get_failed_logins():
 
