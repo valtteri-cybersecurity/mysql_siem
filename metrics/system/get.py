@@ -1,90 +1,78 @@
+import glob
 import os
 import time
-import glob
 from datetime import datetime
 
 
 def get_timestamp():
-    date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return date
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
 
 def get_uptime():
-    file = "/proc/uptime"
-    with open(file, 'r') as f:
-        result = float(f.read().strip().split()[0])
+    with open("/proc/uptime", "r") as file:
+        uptime_seconds = float(file.read().strip().split()[0])
 
-    hours = int(result // 3600)
+    return int(uptime_seconds // 3600)
 
-    return hours
 
 def get_cpu_temp():
     for zone in glob.glob("/sys/class/thermal/thermal_zone*"):
         try:
-            with open(f"{zone}/type") as f:
-                sensor_type = f.read().strip().lower()
+            with open(f"{zone}/type", "r") as file:
+                sensor_type = file.read().strip().lower()
 
             if "cpu" in sensor_type or "pkg" in sensor_type or "x86" in sensor_type:
-                with open(f"{zone}/temp") as f:
-                    return round(int(f.read()) / 1000, 1)
+                with open(f"{zone}/temp", "r") as file:
+                    return round(int(file.read()) / 1000, 1)
 
         except OSError:
             continue
 
     return None
 
+
 def get_cpu_load_avg():
-    file = "/proc/loadavg"
-    with open(file, 'r') as f:
-        resultlist = f.read().strip().split()
-        result_1 = resultlist[0]
-        result_2 = resultlist[1]
-        result_3 = resultlist[2]
-        
-    return result_1, result_2, result_3
+    with open("/proc/loadavg", "r") as file:
+        load_average = file.read().strip().split()
+
+    return (
+        float(load_average[0]),
+        float(load_average[1]),
+        float(load_average[2]),
+    )
+
 
 def get_meminfo():
-    file = "/proc/meminfo"
-    
-    memory_dict = {
+    memory = {
         "memtotal": None,
         "memfree": None,
         "memavailable": None,
         "buffers": None,
-        "cached": None
+        "cached": None,
     }
-    
-    with open(file, 'r') as f:
-        result = f.read()
-    
-    # Remove 'kB' and split into tokens
-    result = result.replace("kB", "").strip()
-    resultlist = result.split()
-    
-    # Parse the list (key: value pairs)
-    for i in range(len(resultlist)):
-        item = resultlist[i]
-        
-        if item.startswith("MemTotal:"):
-            kb = int(resultlist[i + 1])
-            memory_dict["memtotal"] = round(kb / 1024, 1)
-        
-        elif item.startswith("MemFree:"):
-            kb = int(resultlist[i + 1])
-            memory_dict["memfree"] = round(kb / 1024, 1)
-            
-        elif item.startswith("MemAvailable:"):
-            kb = int(resultlist[i + 1])
-            memory_dict["memavailable"] = round(kb / 1024, 1)
-            
-        elif item.startswith("Buffers:"):
-            kb = int(resultlist[i + 1])
-            memory_dict["buffers"] = round(kb / 1024, 1)
-            
-        elif item.startswith("Cached:"):
-            kb = int(resultlist[i + 1])
-            memory_dict["cached"] = round(kb / 1024, 1)
-    
-    return memory_dict
+
+    with open("/proc/meminfo", "r") as file:
+        for line in file:
+            key, value = line.split(":", 1)
+            value_kb = int(value.strip().split()[0])
+
+            if key == "MemTotal":
+                memory["memtotal"] = round(value_kb / 1024, 1)
+
+            elif key == "MemFree":
+                memory["memfree"] = round(value_kb / 1024, 1)
+
+            elif key == "MemAvailable":
+                memory["memavailable"] = round(value_kb / 1024, 1)
+
+            elif key == "Buffers":
+                memory["buffers"] = round(value_kb / 1024, 1)
+
+            elif key == "Cached":
+                memory["cached"] = round(value_kb / 1024, 1)
+
+    return memory
+
 
 def get_disk_usage():
     info = os.statvfs("/")
@@ -93,58 +81,51 @@ def get_disk_usage():
     free = info.f_bavail * info.f_frsize
     used = total - free
 
-    # Muutetaan gigatavuiksi
-    used = round(used / (1024 ** 3), 2)
-    free = round(free / (1024 ** 3), 2)
+    used_gb = round(used / (1024 ** 3), 2)
+    free_gb = round(free / (1024 ** 3), 2)
+    usage_percent = round((used / (used + free)) * 100, 1)
 
-    percent = round((used / (used + free)) * 100, 1)
+    return used_gb, free_gb, usage_percent
 
-    return used, free, percent
-
-
-used, free, percent = get_disk_usage()
 
 def get_cpu_usage():
     with open("/proc/stat", "r") as file:
         cpu = file.readline().split()
 
-    idle1 = int(cpu[4])
-    total1 = sum(map(int, cpu[1:]))
+    idle_start = int(cpu[4])
+    total_start = sum(map(int, cpu[1:]))
 
     time.sleep(1)
 
     with open("/proc/stat", "r") as file:
         cpu = file.readline().split()
 
-    idle2 = int(cpu[4])
-    total2 = sum(map(int, cpu[1:]))
+    idle_end = int(cpu[4])
+    total_end = sum(map(int, cpu[1:]))
 
-    idle = idle2 - idle1
-    total = total2 - total1
+    idle = idle_end - idle_start
+    total = total_end - total_start
 
-    usage = round((1 - idle / total) * 100, 1)
+    return round((1 - idle / total) * 100, 1)
 
-    return usage
 
 def get_data():
-    timestamp = get_timestamp()
     uptime = get_uptime()
     cpu_avg = get_cpu_load_avg()
     cpu_usage = get_cpu_usage()
     cpu_temp = get_cpu_temp()
     mem_info = get_meminfo()
     disk_used, disk_free, disk_percent = get_disk_usage()
-    
-    # Palautetaan kaikki yhtenä tasaisena tuplena, joka sopii SQL:ään
+
     return (
-        uptime,                    # uptime_hours
-        float(cpu_avg[0]),         # cpuload1
-        float(cpu_avg[1]),         # cpuload5
-        float(cpu_avg[2]),         # cpuload15
-        cpu_usage,                 # cpu_usage
-        cpu_temp,                  # cpu_temperature
-        mem_info["memavailable"],  # ram_usage (käytettävissä oleva muisti)
-        disk_used,                 # disk_used
-        disk_free,                 # disk_free
-        disk_percent               # disk_usage (%)
+        uptime,
+        cpu_avg[0],
+        cpu_avg[1],
+        cpu_avg[2],
+        cpu_usage,
+        cpu_temp,
+        mem_info["memavailable"],
+        disk_used,
+        disk_free,
+        disk_percent,
     )
