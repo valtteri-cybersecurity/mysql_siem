@@ -1,7 +1,22 @@
+cat > .gitignore <<'EOF'
+# Secrets and local configuration
+/config/mysql.env
+.env
+.env.*
+!.env.example
+
+# Python cache
 __pycache__/
 *.py[cod]
+
+# Runtime logs
 *.log
-.env
+
+# Temporary files and backups
+*.bak
+*.tmp
+
+# Virtual environments
 .venv/
 venv/
-config/mysql.env
+EOF

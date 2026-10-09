@@ -1,4 +1,3 @@
-```python
 import os
 import pymysql
 from utils import timestamp_util, date_util
@@ -82,5 +81,4 @@ def write_data_db(connection, parsed_data):
 
     except pymysql.MySQLError as error:
         print(f"{timestamp}:   DATABASE ERROR: {error}")
-```
 
