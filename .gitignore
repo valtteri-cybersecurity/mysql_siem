@@ -1,6 +1,6 @@
-cat > .gitignore <<'EOF'
 # Secrets and local configuration
 /config/mysql.env
+/config/adguard.env
 .env
 .env.*
 !.env.example
@@ -19,4 +19,3 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
-EOF
