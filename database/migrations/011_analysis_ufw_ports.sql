@@ -1,10 +1,6 @@
--- MySQL 8: create and validate Port Activity Analysis, then retire its predecessor.
--- Stop/remove the old targeted_ports cron job and wait for its running process
--- to finish BEFORE applying this migration. Use an account with DDL/routine rights.
--- Old aggregates are permanently deleted, not copied. Raw UFW events are retained.
--- DDL commits implicitly: this is NOT a transactionally reversible migration.
--- A pre-existing incompatible replacement table is left unchanged; retirement stops.
--- On validation failure, inspect the schema. A rerun replaces any leftover helper.
+-- MySQL 8: additive Port Activity Analysis creation and validation.
+-- DDL commits implicitly. Existing legacy summaries and raw events are retained.
+-- On validation failure inspect the schema; reruns replace any leftover helper.
 
 CREATE TABLE IF NOT EXISTS analysis_ufw_ports (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -32,8 +28,7 @@ CREATE TABLE IF NOT EXISTS analysis_ufw_ports (
     CONSTRAINT chk_ufw_ports_protocol CHECK (protocol IN ('TCP', 'UDP'))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
--- A temporary migration helper validates BEFORE retiring the old table. SIGNAL
--- also protects the old table if a client continues after an SQL error.
+-- A temporary helper validates a pre-existing replacement table without changing it.
 DROP PROCEDURE IF EXISTS mysql_siem_migrate_ufw_ports;
 DELIMITER //
 CREATE PROCEDURE mysql_siem_migrate_ufw_ports()
@@ -46,7 +41,7 @@ BEGIN
         WHERE table_schema = DATABASE() AND table_name = 'analysis_ufw_ports'
           AND table_type = 'BASE TABLE' AND engine = 'InnoDB'
           AND table_collation = 'utf8mb4_bin') <> 1 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'analysis_ufw_ports: wrong table type or engine; legacy table retained';
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'analysis_ufw_ports: wrong table type or engine';
     END IF;
 
     SELECT COUNT(*) INTO valid_columns FROM information_schema.columns
@@ -68,7 +63,7 @@ BEGIN
       );
     IF valid_columns <> 14 OR (SELECT COUNT(*) FROM information_schema.columns
         WHERE table_schema = DATABASE() AND table_name = 'analysis_ufw_ports') <> 14 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'analysis_ufw_ports: column mismatch; legacy table retained';
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'analysis_ufw_ports: column mismatch';
     END IF;
 
     SELECT COUNT(*) INTO valid_indexes FROM (
@@ -88,7 +83,7 @@ BEGIN
     );
     IF valid_indexes <> 3 OR (SELECT COUNT(DISTINCT index_name) FROM information_schema.statistics
         WHERE table_schema = DATABASE() AND table_name = 'analysis_ufw_ports') <> 3 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'analysis_ufw_ports: index mismatch; legacy table retained';
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'analysis_ufw_ports: index mismatch';
     END IF;
 
     SELECT COUNT(*) INTO valid_checks FROM (
@@ -108,11 +103,9 @@ BEGIN
        OR (constraint_name = 'chk_ufw_ports_protocol' AND clause = 'protocolin''tcp'',''udp''');
     IF valid_checks <> 4 OR (SELECT COUNT(*) FROM information_schema.table_constraints
         WHERE table_schema = DATABASE() AND table_name = 'analysis_ufw_ports') <> 6 THEN
-        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'analysis_ufw_ports: constraint mismatch; legacy table retained';
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'analysis_ufw_ports: constraint mismatch';
     END IF;
 
-    -- Only this explicitly replaced table is retired. No raw rows are changed.
-    DROP TABLE IF EXISTS top_targeted_ports;
 END//
 DELIMITER ;
 CALL mysql_siem_migrate_ufw_ports();

@@ -10,6 +10,14 @@ START = datetime(2026, 10, 22, 12)
 END = START + timedelta(hours=1)
 
 
+@pytest.fixture(autouse=True)
+def independent_traffic_runner(monkeypatch):
+    # These pre-existing tests isolate Source IP/Port dispatch. Traffic has its
+    # own CLI and real-SQL tests, and --all now dispatches all three analyses.
+    monkeypatch.setattr(main, "run_traffic_analysis", Mock(return_value={
+        "status": "SUCCESS", "hour_count": 3, "day_count": 2, "total_events": 0}))
+
+
 def test_recent_buckets_have_stable_keys():
     expected = [(START - timedelta(hours=1), START), (START, END)]
     assert main.recent_hour_periods(START + timedelta(minutes=1)) == expected

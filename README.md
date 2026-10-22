@@ -9,7 +9,7 @@ network activity and detecting suspicious behavior with MySQL.
 
 - UFW firewall logs, SSH password-failure events and AdGuard Home DNS queries.
 - CPU, memory, disk, uptime and filesystem metrics.
-- Historical UFW summaries by source IP and destination port.
+- Historical UFW Source IP, Port Activity and Traffic Analysis.
 - Port scan and SSH brute force detection with shared SOC alerts.
 
 Analysis describes activity; detection applies rules and creates alerts.
@@ -33,29 +33,19 @@ Review it before use. DNS requires additional configuration.
 
 ### Update an existing installation
 
-Run from the project root with the updated files available:
+Run the updated installer from the project root:
 
-1. Disable old `attacking_ips` and `targeted_ports` cron jobs and wait for any
-   running instances to finish. Keep unrelated jobs running.
-2. Apply the analysis migrations in order. Do not continue after an error:
+```bash
+sudo bash install.sh
+```
 
-   ```bash
-   sudo mysql mysql_siem < database/migrations/009_analysis_source_ips.sql &&
-   sudo mysql mysql_siem < database/migrations/010_drop_top_attacking_ips.sql &&
-   sudo mysql mysql_siem < database/migrations/011_analysis_ufw_ports.sql
-   ```
-
-3. Run `sudo bash install.sh` to update permissions and managed cron jobs.
-
-These migrations can be repeated. **010 and 011 permanently delete the old
-aggregate tables and their history**; raw events and existing new summaries are
-preserved. Migration 011 checks the replacement schema before deleting the old
-table. MySQL DDL commits implicitly and cannot be undone with rollback.
-
-**Never import `database/schema.sql` into an existing database.** Older deployments
-may also need detection/auth migrations 003, 004, 007 and 008; inspect the current
-schema and [migration files](database/migrations) first. The installer preserves
-existing configuration, passwords and unrelated cron entries.
+The installer creates missing UFW Analysis tables from the current schema and
+validates them before granting permissions and scheduling jobs. No manual
+analysis migrations are required. Existing data, rule settings, configuration,
+passwords and unrelated cron entries are preserved. Incompatible existing tables
+stop setup for inspection; they are never replaced automatically. Stop any old
+analysis processes before updating. Do not manually import `database/schema.sql`
+into an existing database; let the installer select the missing definitions.
 
 ## Configuration
 
@@ -73,43 +63,30 @@ an SSH server. SSH collection skips a missing auth log until it becomes availabl
 
 ## UFW analysis
 
-| Analysis | Results |
-|---|---|
-| Source IP | Event/action/protocol counts, unique destination ports/IPs, first/last seen |
-| Port activity | Counts and unique sources per destination IP, port and TCP/UDP protocol, first/last seen |
-
-Results are stored in `analysis_source_ips` and `analysis_ufw_ports`.
-Source analysis includes private IPv4/IPv6 addresses. Port analysis requires a
-valid destination IP and port 1–65535; missing targets, port 0 and non-TCP/UDP
-traffic are excluded.
-
-Run both analyses, or replace `--all` with `--source-ips` or `--ports`:
+UFW Analysis provides historical source IP, destination port and firewall traffic
+statistics. Hourly and daily summaries support network monitoring, trend analysis
+and future anomaly detection. Counts describe logged events, not connections.
 
 ```bash
 bash config/run_with_env.sh /usr/bin/python3 -m analysis.ufw.main --all --recent-hours 3
 ```
 
-Recalculate a historical interval:
+Select `--source-ips`, `--ports` or `--traffic` individually. Use `--start` and
+`--end` for historical correction (`start <= event_time < end`). Traffic refreshes
+whole hours and days intersecting the range; daily distinct counts use raw data.
+Use the existing naive local UFW timestamps, without offset conversion. The
+host clock must match that basis; repeated DST hours cannot be distinguished by
+the existing raw timestamps. Source/port row limits remain available via `--help`.
+Traffic periods remain of unknown ingestion coverage, including empty closed
+periods, because the collector has no health history. Open periods are provisional.
 
-```bash
-bash config/run_with_env.sh /usr/bin/python3 -m analysis.ufw.main --ports \
-  --start '2026-10-21 00:00:00' --end '2026-10-22 00:00:00'
-```
-
-Bounds are `start <= event_time < end`. Use timestamps in the existing UFW time
-basis, without an offset or UTC conversion; the host clock must match that basis.
-Reruns atomically replace only the exact interval. Each analysis/interval commits
-separately. Distinct IP/port counts cannot be summed across hours to get daily
-unique counts.
-
-The default limit is 100,000 raw rows per interval; use shorter intervals or
-`--max-events` up to 1,000,000 for larger datasets. Inspect results with:
-
-```sql
-SELECT period_start, destination_ip, destination_port, protocol, total_events
-FROM analysis_ufw_ports
-ORDER BY period_start DESC, total_events DESC
-LIMIT 10;
+```text
+analysis/ufw/
+├── __init__.py
+├── source_ips.py
+├── ports.py
+├── traffic.py
+└── main.py
 ```
 
 ## Detection
@@ -133,12 +110,15 @@ detection maintain separate checkpoints. Use each module's `--help` for options.
 |---|---|
 | Every minute | UFW/SSH collection, port scan and SSH detection |
 | Every five minutes | System/filesystem/security metrics, configured DNS collection |
-| Every five minutes | Both UFW analyses: current hour and two previous hours |
-| Daily at 13:02 | Daily UFW counts, covering the day so far |
+| Every five minutes | All three UFW analyses: current hour and two previous hours; traffic daily summaries |
 
-UFW analysis uses `--all --recent-hours 3`. Increase the window up to 24 hours or
+UFW analysis uses `--all --recent-hours 3`; traffic also refreshes today and yesterday. Increase the window up to 24 hours or
 run a historical interval to include older late events; no full-history backfill
 runs automatically. Cron times use the host's timezone.
+
+UFW collection processes at most 5,000 complete log lines per pass with a
+20-second processing budget. Use `--max-lines` and `--max-seconds` on the
+collector to adjust these limits; unfinished work resumes on the next run.
 
 ```bash
 crontab -l

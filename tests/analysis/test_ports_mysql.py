@@ -1,4 +1,4 @@
-"""Port aggregation and destructive migration only in the private test database."""
+"""Port aggregation and additive migration only in the private test database."""
 
 import hashlib
 from datetime import datetime, timedelta
@@ -132,7 +132,7 @@ def test_lock_contention_skips_without_changing_data(mysql, events, analysis_pri
         other.close()
 
 
-def test_migration_retires_legacy_preserves_raw_and_new_results_and_can_repeat(mysql, events, migrate_analysis):
+def test_additive_migration_preserves_legacy_raw_and_new_results_and_can_repeat(mysql, events, migrate_analysis):
     seed(mysql, events)
     ports.run_port_analysis(mysql, START, END)
     before = saved(mysql)
@@ -147,8 +147,8 @@ def test_migration_retires_legacy_preserves_raw_and_new_results_and_can_repeat(m
     migrate_analysis(mysql, MIGRATION)
     assert saved(mysql) == before
     with mysql.cursor() as cursor:
-        cursor.execute("SHOW TABLES LIKE %s", ("top_targeted_ports",))
-        assert cursor.fetchall() == ()
+        cursor.execute("SELECT hits FROM top_targeted_ports")
+        assert cursor.fetchone()[0] == 77
         cursor.execute("SELECT COUNT(*) FROM ufw_log")
         assert cursor.fetchone()[0] == len(events)
         cursor.execute("SELECT source_ip, total_events FROM analysis_source_ips ORDER BY source_ip")
@@ -178,7 +178,7 @@ def test_wrong_existing_schema_aborts_without_retiring_legacy(unmigrated_mysql, 
         cursor.execute("ALTER TABLE analysis_ufw_ports " + alter)
     with pytest.raises(ports.PortAnalysisError):
         ports.validate_ports_schema(connection)
-    with pytest.raises(pymysql.MySQLError, match="legacy table retained"):
+    with pytest.raises(pymysql.MySQLError):
         migrate_analysis(connection, MIGRATION)
     assert saved(connection) == before
     with connection.cursor() as cursor:

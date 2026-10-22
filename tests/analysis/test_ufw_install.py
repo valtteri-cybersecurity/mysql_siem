@@ -20,24 +20,16 @@ def section(start, end):
     return INSTALLER.split(start, 1)[1].split(end, 1)[0]
 
 
-@pytest.mark.parametrize("tables,existing,ready,applied", [("0", "0", "1", True), ("7", "0", "0", False), ("8", "1", "1", False)])
-def test_schema_upgrades_require_review_on_existing_database(tables, existing, ready, applied):
-    block = section("# Source IP Analysis schema:", "# Port Activity Analysis schema:")
-    block = block[block.index("\n") + 1:].replace("/usr/bin/mysql", "mock_mysql")
-    script = r'''set -euo pipefail
-log() { :; }
-warn() { printf '%s\n' "$*" >&2; }
-mock_mysql() {
-    if [[ "$*" == *"SELECT COUNT"* ]]; then printf '%s\n' "$TEST_EXISTING"; else cat; fi
-}
-''' + block + '\nprintf "READY:%s\\n" "$SOURCE_IP_ANALYSIS_READY"'
-    result = subprocess.run(["bash", "-c", script], env={**os.environ, "TABLE_COUNT": tables,
-        "TEST_EXISTING": existing, "PROJECT_DIR": str(ROOT), "EXPECTED_DB_NAME": "mysql_siem"},
-        text=True, capture_output=True, check=True)
-    assert ("CREATE TABLE IF NOT EXISTS analysis_source_ips" in result.stdout) == applied
-    assert f"READY:{ready}" in result.stdout
-    assert ("apply migration 009" in result.stderr) == (ready == "0")
-    assert "DROP TABLE" not in result.stdout
+def test_installer_provisions_analysis_before_schema_validation_and_grants():
+    setup = INSTALLER.index("ensure_schema analysis")
+    guard = INSTALLER.index("# Verify tables and migrate")
+    grants = INSTALLER.index("# Grant privileges only after")
+    schedule = INSTALLER.index("# Schedule UFW Analysis;")
+    assert setup < guard < grants < schedule
+    assert "database/migrations/" not in INSTALLER
+    assert "apply migration" not in INSTALLER.lower()
+    assert "database/schema.py" in INSTALLER
+    assert "SOURCE_IP_ANALYSIS_READY=1" in section("# Source IP Analysis schema:", "# Port Activity Analysis schema:")
 
 
 def cron_command(project, ready="1", ports_ready="0"):
@@ -95,8 +87,9 @@ crontab() {
     assert "--all --recent-hours 3" in first
     assert "analysis/attacking_ips" not in first
     assert "analysis/targeted_ports" not in first
+    assert "analysis/daily_counts" not in first
     for item in ("MAILTO=test-user", "17 * * * * echo keep-external", "keep-portscan", "keep-dns",
-                 "keep-auth", "keep-ssh", "analysis/daily_counts"):
+                 "keep-auth", "keep-ssh"):
         assert item in first
 
 
@@ -121,7 +114,7 @@ def test_new_table_grants_only_when_present_without_legacy_grants(monkeypatch, p
 
 
 @pytest.mark.parametrize("legacy_present", [False, True])
-def test_both_schema_guards_require_legacy_cleanup(legacy_present):
+def test_both_schema_guards_allow_retired_tables_without_dropping_them(legacy_present):
     checked = 0
     for block in re.findall(r"<<'PY'\n(.*?)\nPY", INSTALLER, re.DOTALL):
         tree = ast.parse(block)
@@ -143,11 +136,14 @@ def test_both_schema_guards_require_legacy_cleanup(legacy_present):
             namespace[variable] = namespace["expected"] | {"analysis_source_ips"}
             if legacy_present:
                 namespace[variable].add("top_attacking_ips")
-            # Execute the real optional-table removal, then the whitelist check.
+            # Execute optional/retired-table normalization, then the whitelist check.
             discard = next(item for item in ast.walk(tree) if isinstance(item, ast.Expr)
                            and ast.unparse(item) == f"{variable}.discard('analysis_source_ips')")
-            exec(compile(ast.Module(body=[discard], type_ignores=[]), "schema-removal", "exec"), namespace)  # noqa: S102
-            assert eval(compile(ast.Expression(node.test), "schema-guard", "eval"), namespace) == legacy_present
+            removals = [item for item in ast.walk(tree) if isinstance(item, ast.AugAssign)
+                        and isinstance(item.target, ast.Name) and item.target.id == variable]
+            normalization = ast.Module(body=[discard] + removals, type_ignores=[])
+            exec(compile(normalization, "schema-removal", "exec"), namespace)  # noqa: S102
+            assert eval(compile(ast.Expression(node.test), "schema-guard", "eval"), namespace) is False
             checked += 1
     assert checked == 2
 
@@ -155,16 +151,6 @@ def test_both_schema_guards_require_legacy_cleanup(legacy_present):
 @pytest.mark.parametrize("source,ports,selection", [("1", "1", "--all"), ("0", "1", "--ports")])
 def test_port_cron_refreshes_three_hours(tmp_path, source, ports, selection):
     assert f"{selection} --recent-hours 3" in cron_command(tmp_path, source, ports)
-
-
-def test_schema_validation_requires_new_port_table():
-    for block in re.findall(r"<<'PY'\n(.*?)\nPY", INSTALLER, re.DOTALL):
-        tree = ast.parse(block)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "expected" for target in node.targets):
-                expected = ast.literal_eval(node.value)
-                assert "analysis_ufw_ports" in expected
-                assert "top_targeted_ports" not in expected
 
 
 @pytest.mark.parametrize("wrong_schema", [False, True])
@@ -179,5 +165,80 @@ def test_installer_preflight_closes_connection_and_rejects_wrong_schema(monkeypa
             exec(compile(block, "installer-port-preflight", "exec"), {})  # noqa: S102
     else:
         exec(compile(block, "installer-port-preflight", "exec"), {})  # noqa: S102
+    check.assert_called_once_with(connection)
+    connection.close.assert_called_once()
+
+
+@pytest.mark.parametrize("source,port,options", [
+    ("1", "1", "--all --recent-hours 3"),
+    ("0", "1", "--ports --recent-hours 3 --traffic"),
+    ("1", "0", "--source-ips --recent-hours 3 --traffic"),
+    ("0", "0", "--traffic"),
+])
+def test_ready_traffic_uses_one_shared_job(tmp_path, source, port, options):
+    block = section("# Schedule UFW Analysis;", "# Set application ownership")
+    block = block[block.index("\n") + 1:]
+    result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + block + '\nprintf "%s\\n" "$UFW_ANALYSIS_CRON"'],
+        env={**os.environ, "PROJECT_DIR": str(tmp_path), "SOURCE_IP_ANALYSIS_READY": source,
+             "PORT_ANALYSIS_READY": port, "TRAFFIC_ANALYSIS_READY": "1"},
+        text=True, capture_output=True, check=True)
+    assert result.stdout.count("-m analysis.ufw.main") == 1
+    assert options in result.stdout
+    assert "daily_counts" not in result.stdout
+
+
+def test_standalone_retired_cron_removed_only_for_this_installation(tmp_path):
+    project = tmp_path / "project with spaces"
+    cron = tmp_path / "crontab"
+    keep = '2 13 * * * python /another/project/analysis/daily_counts/daily_counts.py\n'
+    cron.write_text(keep + f'2 13 * * * python "{project}/analysis/daily_counts/daily_counts.py"\n'
+                    + f'2 13 * * * cd "{project}" && python analysis/daily_counts/daily_counts.py\n'
+                    + '19 * * * * echo keep-unrelated\n')
+    block = section("# Update only this installation's marked cron block.", 'log "Installation steps completed.')
+    script = r'''set -euo pipefail
+crontab() {
+    if [[ "$*" == *" -l" ]]; then cat "$TEST_CRONTAB"; else cp "${@: -1}" "$TEST_CRONTAB"; fi
+}
+''' + block
+    env = {**os.environ, "PROJECT_DIR": str(project), "INSTALL_USER": "test-user",
+           "CRON_BEGIN": "# BEGIN mysql_siem managed jobs", "CRON_END": "# END mysql_siem managed jobs",
+           "TEST_CRONTAB": str(cron), "PORT_SCAN_CRON": "", "DNS_CRON": ""}
+    for _ in range(2):
+        subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True)
+        result = cron.read_text()
+        assert keep in result and '19 * * * * echo keep-unrelated' in result
+        assert f'{project}/analysis/daily_counts/' not in result
+        assert f'cd "{project}" && python analysis/daily_counts/' not in result
+    assert result.count("# BEGIN mysql_siem managed jobs") == 1
+
+
+def test_traffic_grants_and_retired_grants(monkeypatch):
+    block = next(block for block in re.findall(r"<<'PY'\n(.*?)\nPY", INSTALLER, re.DOTALL) if "grants = {" in block)
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = []
+    monkeypatch.setattr(pymysql, "connect", Mock(return_value=connection))
+    monkeypatch.setenv("DB_NAME", "private-test")
+    monkeypatch.setenv("DB_USER", "test-user")
+    exec(compile(block, "installer-traffic-grants", "exec"), {})  # noqa: S102
+    queries = [call.args[0] for call in cursor.execute.call_args_list]
+    for table in ("analysis_ufw_traffic", "analysis_ufw_traffic_daily"):
+        assert any(f"GRANT SELECT, INSERT, UPDATE ON `private-test`.`{table}`" in query for query in queries)
+    assert not any("ufw_daily_actions_counts" in query for query in queries)
+
+
+@pytest.mark.parametrize("wrong", [False, True])
+def test_traffic_preflight_closes_connection_and_rejects_incompatible_schema(monkeypatch, connection, wrong):
+    from analysis.ufw import traffic
+    block = section("<<'PY_CHECK_TRAFFIC'\n", "\nPY_CHECK_TRAFFIC")
+    monkeypatch.setenv("DB_NAME", "private-test")
+    monkeypatch.setattr(pymysql, "connect", Mock(return_value=connection))
+    check = Mock(side_effect=traffic.TrafficAnalysisError("wrong schema") if wrong else None)
+    monkeypatch.setattr(traffic, "validate_traffic_schema", check)
+    if wrong:
+        with pytest.raises(SystemExit, match="wrong schema"):
+            exec(compile(block, "installer-traffic-preflight", "exec"), {})  # noqa: S102
+    else:
+        exec(compile(block, "installer-traffic-preflight", "exec"), {})  # noqa: S102
     check.assert_called_once_with(connection)
     connection.close.assert_called_once()

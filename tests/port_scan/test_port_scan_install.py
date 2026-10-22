@@ -117,15 +117,15 @@ crontab() {
         "metrics/filesystem/main.py",
         "metrics.security.main",
         "analysis.ufw.main",
-        "analysis/daily_counts/daily_counts.py",
         "existing-dns",
     ):
         assert job in first
     assert "old managed job" not in first
+    assert "analysis/daily_counts" not in first
 
 
 @pytest.mark.parametrize("new_database", [False, True])
-def test_only_new_database_gets_automatic_detection_migrations(tmp_path, new_database):
+def test_only_new_database_gets_automatic_detection_setup(tmp_path, new_database):
     installer = (ROOT / "install.sh").read_text()
     start = installer.index("# Detection schema:")
     end = installer.index("# Verify tables and migrate", start)
@@ -134,6 +134,7 @@ def test_only_new_database_gets_automatic_detection_migrations(tmp_path, new_dat
         r"""set -euo pipefail
 log() { :; }
 warn() { :; }
+ensure_schema() { printf 'CURRENT_SCHEMA:%s\n' "$1"; }
 mock_mysql() {
     if [[ "$*" == *"SELECT COUNT"* ]]; then
         printf '0\n'
@@ -158,10 +159,8 @@ mock_mysql() {
         capture_output=True,
         check=True,
     )
-    assert (
-        "CREATE TABLE IF NOT EXISTS detection_state" in result.stdout
-    ) is new_database
-    assert result.stdout.count("MIGRATION") == (2 if new_database else 0)
+    assert ("CURRENT_SCHEMA:detection" in result.stdout) is new_database
+    assert "MIGRATION" not in result.stdout
     assert f"READY:{int(new_database)}" in result.stdout
 
 

@@ -86,18 +86,8 @@ id "$INSTALL_USER" >/dev/null 2>&1 || die "User not found: $INSTALL_USER"
 
 for path in \
     database/schema.sql \
+    database/schema.py \
     config/run_with_env.sh \
-    database/migrations/001_ufw_state_file_identity.sql \
-    database/migrations/002_dns_telemetry.sql \
-    database/migrations/003_detection_alerts.sql \
-    database/migrations/004_detection_state.sql \
-    database/migrations/005_dns_client_filters.sql \
-    database/migrations/006_dns_domain_filters.sql \
-    database/migrations/007_auth_events.sql \
-    database/migrations/008_ssh_brute_force_rule.sql \
-    database/migrations/009_analysis_source_ips.sql \
-    database/migrations/010_drop_top_attacking_ips.sql \
-    database/migrations/011_analysis_ufw_ports.sql \
     config/ssh.env.example \
     ingestion/auth/main.py \
     detection/ssh_brute_force/main.py \
@@ -112,7 +102,7 @@ for path in \
     analysis/ufw/source_ips.py \
     analysis/ufw/ports.py \
     analysis/ufw/main.py \
-    analysis/daily_counts/daily_counts.py
+    analysis/ufw/traffic.py
 do
     [[ -f "$PROJECT_DIR/$path" ]] || die "Required file is missing: $path"
 done
@@ -214,8 +204,7 @@ try:
             existing = {row[0] for row in cur.fetchall()}
             expected = {
                 "filesystem_metrics", "security_metrics", "system_metrics",
-                "analysis_ufw_ports",
-                "ufw_daily_actions_counts", "ufw_log", "ufw_state",
+                "ufw_log", "ufw_state",
             }
             dns_tables = {"dns_sources", "dns_events", "dns_collection_state"}
             detection_tables = {"detection_rules", "detection_alerts", "alert_evidence"}
@@ -227,6 +216,8 @@ try:
                 raise SystemExit("The auth schema is incomplete; inspect it manually.")
             existing -= auth_tables
             existing.discard("analysis_source_ips")
+            existing -= {"analysis_ufw_ports", "analysis_ufw_traffic", "analysis_ufw_traffic_daily"}
+            existing -= {"ufw_daily_actions_counts", "top_attacking_ips", "top_targeted_ports"}
             if existing not in (
                 expected, expected | dns_tables,
                 expected | detection_tables, expected | dns_tables | detection_tables,
@@ -245,7 +236,7 @@ try:
                 raise SystemExit(
                     "The database has a partial or unexpected schema. "
                     f"Tables: {sorted(existing)}. Correct the schema manually before continuing. "
-                    "For old analysis schemas, apply migrations 009/010 and 011 first."
+                    "Inspect the current definitions in database/schema.sql; existing legacy tables may remain."
                 )
             print("SCHEMA_EXISTS")
 
@@ -268,6 +259,13 @@ if [[ "$TABLE_COUNT" == "0" ]]; then
     /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/$SCHEMA_REL"
 fi
 
+# Provision current UFW summaries before checking or scheduling them.
+ensure_schema() {
+    PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 -m database.schema "$1"
+}
+log "Checking and creating missing UFW Analysis tables."
+ensure_schema analysis
+
 # Create DNS tables once; preserve existing telemetry and reject partial schemas.
 DNS_TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
     -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name IN ('dns_sources', 'dns_events', 'dns_collection_state')")"
@@ -275,7 +273,7 @@ DNS_TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names 
 case "$DNS_TABLE_COUNT" in
     0)
         log "Creating DNS telemetry tables."
-        /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/002_dns_telemetry.sql"
+        ensure_schema dns
         ;;
     3)
         log "Keeping existing DNS telemetry tables."
@@ -292,7 +290,7 @@ DNS_CLIENT_FILTER_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-colum
 case "$DNS_CLIENT_FILTER_COUNT" in
     0)
         log "Creating DNS client filter table."
-        /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/005_dns_client_filters.sql"
+        ensure_schema dns-client-filters
         ;;
     1)
         log "Keeping existing DNS client filters."
@@ -309,7 +307,7 @@ DNS_DOMAIN_FILTER_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-colum
 case "$DNS_DOMAIN_FILTER_COUNT" in
     0)
         log "Creating DNS domain filter table."
-        /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/006_dns_domain_filters.sql"
+        ensure_schema dns-domain-filters
         ;;
     1)
         log "Keeping existing DNS domain filters."
@@ -320,12 +318,11 @@ case "$DNS_DOMAIN_FILTER_COUNT" in
 esac
 
 # Detection schema: automatic provisioning is restricted to a new database.
-# Existing installations must apply 003/004 explicitly before enabling detection.
+# Existing installations retain their current detection activation policy.
 DETECTION_READY=0
 if [[ "$TABLE_COUNT" == "0" ]]; then
     log "Creating detection tables in the new database."
-    /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/003_detection_alerts.sql"
-    /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/004_detection_state.sql"
+    ensure_schema detection
     DETECTION_READY=1
 else
     DETECTION_TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
@@ -333,20 +330,19 @@ else
     if [[ "$DETECTION_TABLE_COUNT" == "4" ]]; then
         DETECTION_READY=1
     else
-        warn "Detection not scheduled: apply detection migrations 003/004 manually first."
+        warn "Detection not scheduled: its current tables are incomplete; inspect database/schema.sql."
     fi
 fi
 
 # Verify tables and migrate the existing ufw_state tracking columns.
-/usr/bin/python3 - "$PROJECT_DIR/database/migrations/001_ufw_state_file_identity.sql" <<'PY'
+/usr/bin/python3 - <<'PY'
 import os
 import sys
 import pymysql
 
 expected = {
     "filesystem_metrics", "security_metrics", "system_metrics",
-    "analysis_ufw_ports",
-    "ufw_daily_actions_counts", "ufw_log", "ufw_state",
+    "ufw_log", "ufw_state",
 }
 conn = pymysql.connect(
     unix_socket="/run/mysqld/mysqld.sock",
@@ -367,6 +363,8 @@ try:
         raise SystemExit("The auth schema is incomplete; inspect it manually.")
     actual -= auth_tables
     actual.discard("analysis_source_ips")
+    actual -= {"analysis_ufw_ports", "analysis_ufw_traffic", "analysis_ufw_traffic_daily"}
+    actual -= {"ufw_daily_actions_counts", "top_attacking_ips", "top_targeted_ports"}
     if actual not in (
         expected, expected | dns_tables,
         expected | detection_tables, expected | dns_tables | detection_tables,
@@ -385,7 +383,7 @@ try:
         raise SystemExit(
             f"Schema tables do not match. Missing: {sorted(expected-actual)}; "
             f"extra: {sorted(actual-expected)}. "
-            "For old analysis schemas, apply migrations 009/010 and 011 first."
+            "Inspect the current definitions in database/schema.sql; existing legacy tables may remain."
         )
     with conn.cursor() as cur:
         cur.execute("SHOW COLUMNS FROM ufw_state")
@@ -395,8 +393,11 @@ try:
             columns[row[0]] = row
 
         if "file_device" not in columns and "file_inode" not in columns:
-            with open(sys.argv[1], "r", encoding="utf-8") as migration_file:
-                cur.execute(migration_file.read())
+            cur.execute("""ALTER TABLE ufw_state
+                MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+                ADD COLUMN file_device BIGINT UNSIGNED NULL,
+                ADD COLUMN file_inode BIGINT UNSIGNED NULL,
+                ADD UNIQUE KEY uq_ufw_state_file (file_device, file_inode)""")
             print("UFW_STATE_MIGRATED")
         elif "file_device" not in columns or "file_inode" not in columns:
             raise SystemExit("ufw_state: the file-identity schema is incomplete.")
@@ -428,23 +429,10 @@ finally:
     conn.close()
 PY
 
-# Source IP Analysis schema: create the replacement on new installations only.
-SOURCE_IP_ANALYSIS_READY=0
-if [[ "$TABLE_COUNT" == "0" ]]; then
-    log "Creating Source IP Analysis summaries in the new database."
-    /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/009_analysis_source_ips.sql"
-    SOURCE_IP_ANALYSIS_READY=1
-else
-    ANALYSIS_TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
-        -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name='analysis_source_ips'")"
-    if [[ "$ANALYSIS_TABLE_COUNT" == "1" ]]; then
-        SOURCE_IP_ANALYSIS_READY=1
-    else
-        warn "Source IP Analysis not scheduled: apply migration 009 before the approved installer run."
-    fi
-fi
+# Source IP Analysis schema: created and validated before the strict guard.
+SOURCE_IP_ANALYSIS_READY=1
 
-# Port Activity Analysis schema: migration 011 is manual on existing installs.
+# Port Activity Analysis schema: validate before grants and scheduling.
 PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 - <<'PY_CHECK_PORTS'
 import os
 import pymysql
@@ -460,12 +448,27 @@ finally:
 PY_CHECK_PORTS
 PORT_ANALYSIS_READY=1
 
+# Traffic tables are already provisioned from the current schema.
+PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 - <<'PY_CHECK_TRAFFIC'
+import os
+import pymysql
+from analysis.ufw.traffic import TrafficAnalysisError, validate_traffic_schema
+
+conn = pymysql.connect(unix_socket="/run/mysqld/mysqld.sock", user="root", database=os.environ["DB_NAME"])
+try:
+    validate_traffic_schema(conn)
+except TrafficAnalysisError as error:
+    raise SystemExit(str(error))
+finally:
+    conn.close()
+PY_CHECK_TRAFFIC
+TRAFFIC_ANALYSIS_READY=1
+
 # SSH schema: provision new databases only; existing installations opt in manually.
 SSH_READY=0
 if [[ "$TABLE_COUNT" == "0" && "$DETECTION_READY" == "1" ]]; then
     log "Creating SSH telemetry and rule in the new database."
-    /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/007_auth_events.sql"
-    /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/008_ssh_brute_force_rule.sql"
+    ensure_schema auth
     SSH_READY=1
 elif [[ "$DETECTION_READY" == "1" ]]; then
     SSH_TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
@@ -475,10 +478,10 @@ elif [[ "$DETECTION_READY" == "1" ]]; then
     if [[ "$SSH_TABLE_COUNT" == "2" && "$SSH_RULE_COUNT" == "1" ]]; then
         SSH_READY=1
     else
-        warn "SSH jobs not scheduled: apply migrations 007/008 manually after approval."
+        warn "SSH jobs not scheduled: its auth tables or rule are missing; inspect database/schema.sql."
     fi
 else
-    warn "SSH jobs not scheduled: detection migrations 003/004 are required."
+    warn "SSH jobs not scheduled: the shared detection schema is required."
 fi
 
 # Grant privileges only after the tables have been created.
@@ -495,7 +498,8 @@ grants = {
     "security_metrics": "SELECT, INSERT, UPDATE",
     "system_metrics": "SELECT, INSERT",
     "analysis_ufw_ports": "SELECT, INSERT, DELETE",
-    "ufw_daily_actions_counts": "SELECT, INSERT, UPDATE",
+    "analysis_ufw_traffic": "SELECT, INSERT, UPDATE",
+    "analysis_ufw_traffic_daily": "SELECT, INSERT, UPDATE",
     "ufw_log": "SELECT, INSERT",
     "ufw_state": "SELECT, INSERT, UPDATE",
 }
@@ -596,7 +600,7 @@ if [[ "${SSH_READY:-0}" == "1" ]]; then
     SSH_DETECTION_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh /usr/bin/python3 -m detection.ssh_brute_force.main --automatic --log-file \"$PROJECT_DIR/detection/ssh_brute_force/cron.log\""
 fi
 
-# Schedule UFW Analysis; a single job runs both ready analyses with bounded logs.
+# Schedule UFW Analysis; a single job runs the ready analyses with bounded logs.
 UFW_ANALYSIS_CRON=""
 UFW_ANALYSIS_OPTIONS=""
 if [[ "${SOURCE_IP_ANALYSIS_READY:-0}" == "1" && "${PORT_ANALYSIS_READY:-0}" == "1" ]]; then
@@ -605,6 +609,15 @@ elif [[ "${PORT_ANALYSIS_READY:-0}" == "1" ]]; then
     UFW_ANALYSIS_OPTIONS="--ports --recent-hours 3"
 elif [[ "${SOURCE_IP_ANALYSIS_READY:-0}" == "1" ]]; then
     UFW_ANALYSIS_OPTIONS="--recent-hours 2"
+fi
+if [[ "${TRAFFIC_ANALYSIS_READY:-0}" == "1" ]]; then
+    if [[ "$UFW_ANALYSIS_OPTIONS" != "--all --recent-hours 3" ]]; then
+        # --traffic combines with an explicitly selected legacy-compatible analysis.
+        if [[ "$UFW_ANALYSIS_OPTIONS" == "--recent-hours 2" ]]; then
+            UFW_ANALYSIS_OPTIONS="--source-ips --recent-hours 3"
+        fi
+        UFW_ANALYSIS_OPTIONS="${UFW_ANALYSIS_OPTIONS:+$UFW_ANALYSIS_OPTIONS }--traffic"
+    fi
 fi
 if [[ -n "$UFW_ANALYSIS_OPTIONS" ]]; then
     mkdir -p "$PROJECT_DIR/analysis/ufw"
@@ -652,9 +665,11 @@ CRON_TMP="$(mktemp)"
 trap 'rm -f "$CRON_TMP"' EXIT
 
 (crontab -u "$INSTALL_USER" -l 2>/dev/null || true) |
-    awk -v begin="$CRON_BEGIN" -v end="$CRON_END" '
+    awk -v begin="$CRON_BEGIN" -v end="$CRON_END" -v project="$PROJECT_DIR" '
         $0 == begin { skip=1; next }
         $0 == end   { skip=0; next }
+        !skip && index($0, project "/analysis/daily_counts/") && $0 !~ /^[[:space:]]*#/ { next }
+        !skip && index($0, "cd \"" project "\"") && $0 ~ /analysis\/daily_counts\// && $0 !~ /^[[:space:]]*#/ { next }
         !skip { print }
     ' > "$CRON_TMP"
 
@@ -665,7 +680,6 @@ $CRON_BEGIN
 */5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/metrics/filesystem/main.py" >> "$PROJECT_DIR/metrics/filesystem/cron.log" 2>&1
 */5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 -m metrics.security.main >> "$PROJECT_DIR/metrics/security/cron.log" 2>&1
 ${UFW_ANALYSIS_CRON:-}
-2 13 * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/analysis/daily_counts/daily_counts.py" >> "$PROJECT_DIR/analysis/daily_counts/cron.log" 2>&1
 $PORT_SCAN_CRON
 ${SSH_AUTH_CRON:-}
 ${SSH_DETECTION_CRON:-}

@@ -1,4 +1,4 @@
-"""Shared CLI for UFW source-IP and destination-port activity summaries."""
+"""Shared CLI for UFW source-IP, destination-port and traffic history."""
 
 import argparse
 import io
@@ -15,6 +15,7 @@ from analysis.ufw.source_ips import (
     run_source_ip_analysis,
     validate_time_range,
 )
+from analysis.ufw.traffic import TrafficAnalysisError, run_traffic_analysis
 from config.run_logging import close_log, open_log, report
 from database.connection import get_connection
 
@@ -31,17 +32,19 @@ def recent_hour_periods(now, hours=2):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Build descriptive UFW source-IP and port summaries.")
+    parser = argparse.ArgumentParser(description="Build descriptive UFW source-IP, port and traffic summaries.")
     selection = parser.add_mutually_exclusive_group()
     selection.add_argument("--source-ips", action="store_true", help="Source IP Analysis (legacy default).")
     selection.add_argument("--ports", action="store_true", help="Port Activity Analysis only.")
-    selection.add_argument("--all", action="store_true", help="Run both analyses; each interval saves independently.")
+    selection.add_argument("--all", action="store_true", help="Run all three analyses; each bucket saves independently.")
+    parser.add_argument("--traffic", action="store_true", help="Traffic history: whole hours/days intersecting the range; may combine with --ports or --source-ips.")
     parser.add_argument("--start", type=datetime.fromisoformat, help="Inclusive start in the naive UFW time basis.")
     parser.add_argument("--end", type=datetime.fromisoformat, help="Exclusive end in the same time basis.")
-    parser.add_argument("--recent-hours", type=int, help="Refresh 1..24 hourly buckets; default: 2 for source IPs, 3 for ports/all.")
-    parser.add_argument("--max-events", type=int, default=MAX_EVENTS, help="Raw-row limit per interval; default: 100000.")
+    parser.add_argument("--recent-hours", type=int, help="Refresh 1..24 hourly buckets; default: 2 for source IPs, 3 for ports/traffic/all.")
+    parser.add_argument("--max-events", type=int, default=MAX_EVENTS, help="Source IP/Port raw-row limit per interval; default: 100000. Traffic SQL counts all rows.")
     parser.add_argument("--log-file", help="Rotate at 1 MB with three backups.")
     args = parser.parse_args(argv)
+    now = datetime.now()
     try:
         if not 1 <= args.max_events <= 1000000:
             raise ValueError("--max-events must be within 1..1000000.")
@@ -51,7 +54,7 @@ def main(argv=None):
             validate_time_range(args.start, args.end)
             periods = [(args.start, args.end)]
         else:
-            periods = recent_hour_periods(datetime.now(), args.recent_hours if args.recent_hours is not None else (3 if args.ports or args.all else 2))
+            periods = recent_hour_periods(now, args.recent_hours if args.recent_hours is not None else (3 if args.ports or args.traffic or args.all else 2))
     except (ValueError, OverflowError) as error:
         parser.error(str(error))
     try:
@@ -60,7 +63,7 @@ def main(argv=None):
         print("Cannot open the UFW analysis log.", file=sys.stderr)
         return 1
     analyses = []
-    if args.source_ips or args.all or not args.ports:
+    if args.source_ips or args.all or not (args.ports or args.traffic):
         analyses.append(("Source IP Analysis", run_source_ip_analysis))
     if args.ports or args.all:
         analyses.append(("Port Activity Analysis", run_port_analysis))
@@ -86,10 +89,19 @@ def main(argv=None):
                 if summary.get("reason"):
                     report(logger, summary["reason"])
                     break
+        if args.traffic or args.all:
+            report(logger, "Analysis: Firewall Traffic Analysis")
+            report(logger, "Whole intersecting hours and days; ingestion coverage: UNKNOWN.")
+            summary = run_traffic_analysis(connection, periods[0][0], periods[-1][1], now=now,
+                                           previous_day=args.start is None)
+            report(logger, f"Hours: {summary['hour_count']}; days: {summary['day_count']}; events: {summary['total_events']}")
+            report(logger, f"Status: {summary['status']}")
+            if summary.get("reason"):
+                report(logger, summary["reason"])
         return 0
-    except (pymysql.MySQLError, SourceIPAnalysisError, PortAnalysisError) as error:
-        message = "UFW analysis failed. Check migrations 009/011, permissions and the row limit."
-        if isinstance(error, (SourceIPAnalysisError, PortAnalysisError)):
+    except (pymysql.MySQLError, SourceIPAnalysisError, PortAnalysisError, TrafficAnalysisError) as error:
+        message = "UFW analysis failed. Check the current database schema, permissions and the row limit."
+        if isinstance(error, (SourceIPAnalysisError, PortAnalysisError, TrafficAnalysisError)):
             message = str(error)
         report(logger, message, error=True)
         report(logger, "Status: FAILED; uncommitted changes were rolled back. Completed intervals may be committed.")

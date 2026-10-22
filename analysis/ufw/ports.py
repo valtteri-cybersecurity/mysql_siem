@@ -21,17 +21,17 @@ class PortAnalysisError(RuntimeError):
 
 
 def validate_ports_schema(connection):
-    """Read-only installer preflight, matching migration 011's required schema.
+    """Read-only installer preflight, matching the current database/schema.sql.
 
     Never repair or drop a table here. A mismatch requires explicit review of
-    the migration before grants or scheduling can proceed.
+    the current schema before grants or scheduling can proceed.
     """
     table = "analysis_ufw_ports"
     with connection.cursor() as cursor:
         cursor.execute("""SELECT engine, table_type, table_collation FROM information_schema.tables
                        WHERE table_schema = DATABASE() AND table_name = %s""", (table,))
         if cursor.fetchone() != ("InnoDB", "BASE TABLE", "utf8mb4_bin"):
-            raise PortAnalysisError("analysis_ufw_ports: missing table or wrong engine; inspect migration 011.")
+            raise PortAnalysisError("analysis_ufw_ports: missing table or wrong engine; inspect database/schema.sql.")
         cursor.execute("""SELECT column_name, column_type, is_nullable, collation_name, column_default, extra
                        FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = %s""", (table,))
         actual = {name: (kind.lower(), nullable, collation, default.lower() if isinstance(default, str) else default, extra.lower())
@@ -49,21 +49,21 @@ def validate_ports_schema(connection):
             "updated_at": ("timestamp(6)", "NO", None, "current_timestamp(6)", "default_generated on update current_timestamp(6)"),
         })
         if actual != expected:
-            raise PortAnalysisError("analysis_ufw_ports: column mismatch; inspect migration 011.")
+            raise PortAnalysisError("analysis_ufw_ports: column mismatch; inspect database/schema.sql.")
         cursor.execute("""SELECT index_name, non_unique, column_name, sub_part, index_type, is_visible
                        FROM information_schema.statistics WHERE table_schema = DATABASE() AND table_name = %s
                        ORDER BY index_name, seq_in_index""", (table,))
         indexes = {}
         for name, non_unique, column, prefix, kind, visible in cursor.fetchall():
             if prefix is not None or kind != "BTREE" or visible != "YES":
-                raise PortAnalysisError("analysis_ufw_ports: invalid index; inspect migration 011.")
+                raise PortAnalysisError("analysis_ufw_ports: invalid index; inspect database/schema.sql.")
             indexes.setdefault(name, (non_unique, []))[1].append(column)
         if indexes != {
             "PRIMARY": (0, ["id"]),
             "uq_ufw_ports_period": (0, ["period_start", "period_end", "destination_ip", "destination_port", "protocol"]),
             "idx_ufw_ports_history": (1, ["destination_port", "protocol", "destination_ip", "period_start", "period_end"]),
         }:
-            raise PortAnalysisError("analysis_ufw_ports: index mismatch; inspect migration 011.")
+            raise PortAnalysisError("analysis_ufw_ports: index mismatch; inspect database/schema.sql.")
         cursor.execute("""SELECT tc.constraint_name, tc.constraint_type, tc.enforced, cc.check_clause
                        FROM information_schema.table_constraints AS tc
                        LEFT JOIN information_schema.check_constraints AS cc
@@ -84,7 +84,7 @@ def validate_ports_schema(connection):
             "chk_ufw_ports_port": ("CHECK", "YES", "destination_portbetween1and65535"),
             "chk_ufw_ports_protocol": ("CHECK", "YES", "protocolin'tcp','udp'"),
         }:
-            raise PortAnalysisError("analysis_ufw_ports: constraint mismatch; inspect migration 011.")
+            raise PortAnalysisError("analysis_ufw_ports: constraint mismatch; inspect database/schema.sql.")
 
 def aggregate_ports(events, start_time, end_time, *, max_events=MAX_EVENTS):
     """Summarize [start, end); skip invalid targets, ports and non-TCP/UDP rows.

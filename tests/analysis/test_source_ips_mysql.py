@@ -160,29 +160,6 @@ def test_real_unique_key_prevents_duplicate_period_and_ip(mysql, events):
     assert len(saved(mysql)) == 1
 
 
-def test_cleanup_removes_only_legacy_history_and_is_repeatable(mysql, events, migrate_analysis):
-    insert_events(mysql, events)
-    run_source_ip_analysis(mysql, START, END)
-    before = saved(mysql)
-    # Reproduce the retired schema only in this private test database.
-    with mysql.cursor() as cursor:
-        cursor.execute("""CREATE TABLE top_attacking_ips (
-                       metric_date DATE NOT NULL, src_ip VARCHAR(45) NOT NULL,
-                       hits BIGINT UNSIGNED NOT NULL DEFAULT 0,
-                       PRIMARY KEY (metric_date, src_ip)) ENGINE=InnoDB""")
-        cursor.execute("INSERT INTO top_attacking_ips (metric_date, src_ip, hits) VALUES (%s, %s, %s)",
-                       ("2025-01-01", "192.0.2.99", 77))
-    mysql.commit()
-    migrate_analysis(mysql, "010_drop_top_attacking_ips.sql")
-    migrate_analysis(mysql, "010_drop_top_attacking_ips.sql")
-    assert saved(mysql) == before
-    with mysql.cursor() as cursor:
-        cursor.execute("SHOW TABLES LIKE %s", ("top_attacking_ips",))
-        assert cursor.fetchall() == ()
-        cursor.execute("SELECT COUNT(*) FROM ufw_log")
-        assert cursor.fetchone()[0] == len(events)
-
-
 def test_bootstrap_schema_never_recreates_retired_table(mysql, migrate_analysis):
     root = Path(__file__).resolve().parents[2]
     schema = (root / "database/schema.sql").read_text()
@@ -198,5 +175,7 @@ def test_bootstrap_schema_never_recreates_retired_table(mysql, migrate_analysis)
         cursor.execute("SHOW TABLES")
         assert {row[0] for row in cursor.fetchall()} == {
             "filesystem_metrics", "security_metrics", "system_metrics", "analysis_ufw_ports",
-            "ufw_daily_actions_counts", "ufw_log", "ufw_state", "analysis_source_ips",
+            "analysis_ufw_traffic", "analysis_ufw_traffic_daily", "ufw_log", "ufw_state", "analysis_source_ips",
+            "dns_sources", "dns_events", "dns_collection_state", "dns_client_filters", "dns_domain_filters",
+            "detection_rules", "detection_alerts", "alert_evidence", "detection_state", "auth_events", "auth_ingestion_state",
         }

@@ -320,6 +320,7 @@ def test_installer_creates_only_absent_dns_schema(table_count):
 set -euo pipefail
 log() { printf '%s\n' "$*"; }
 die() { printf '%s\n' "$*" >&2; exit 1; }
+ensure_schema() { printf 'CURRENT_SCHEMA:%s\n' "$1"; }
 mock_mysql() {
     if [[ "$*" == *"SELECT COUNT"* ]]; then
         printf '%s\n' "$TEST_TABLE_COUNT"
@@ -345,12 +346,10 @@ mock_mysql() {
     )
     assert (result.returncode == 0) == (table_count in (0, 3))
     if table_count == 0:
-        assert "MIGRATION_INPUT" in result.stdout
-        for table in ("dns_sources", "dns_events", "dns_collection_state"):
-            assert f"CREATE TABLE {table}" in result.stdout
+        assert "CURRENT_SCHEMA:dns" in result.stdout
         assert "DROP TABLE" not in result.stdout
     else:
-        assert "MIGRATION_INPUT" not in result.stdout
+        assert "CURRENT_SCHEMA:" not in result.stdout
         if table_count != 3:
             assert "incomplete" in result.stderr
 
@@ -409,6 +408,7 @@ def test_installer_adds_filter_table_once_without_overwriting(count, kind):
 set -euo pipefail
 log() { :; }
 die() { printf '%s\n' "$*" >&2; exit 1; }
+ensure_schema() { printf 'CURRENT_SCHEMA:%s\n' "$1"; }
 mock_mysql() {
     if [[ "$*" == *"SELECT COUNT"* ]]; then
         printf '%s\n' "$TEST_COUNT"
@@ -432,7 +432,7 @@ mock_mysql() {
         check=False,
     )
     assert (result.returncode == 0) == (count in ("0", "1"))
-    assert (f"CREATE TABLE dns_{kind}_filters" in result.stdout) == (count == "0")
+    assert (f"CURRENT_SCHEMA:dns-{kind}-filters" in result.stdout) == (count == "0")
     assert "DROP TABLE" not in result.stdout
     assert "DELETE FROM" not in result.stdout
     assert "ALTER USER" not in installer

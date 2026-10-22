@@ -82,12 +82,14 @@ def test_only_new_database_provisions_ssh_schema(ready):
     end = installer.index("# Grant privileges only after", start)
     block = installer[start:end].replace("/usr/bin/mysql", "fake_mysql")
     script = ("set -euo pipefail\nlog() { :; }\nwarn() { :; }\n"
+              "ensure_schema() { printf 'CURRENT_SCHEMA:%s\\n' \"$1\"; }\n"
               "fake_mysql() { if [[ \"$*\" == *'SELECT COUNT'* ]]; then echo 0; else echo MIGRATION; cat; fi; }\n"
               + block + '\nprintf "READY:%s\\n" "$SSH_READY"')
     result = subprocess.run(["bash", "-c", script], check=True, text=True, capture_output=True,
                             env={**os.environ, "PROJECT_DIR": str(ROOT), "TABLE_COUNT": "0" if ready else "8",
                                  "DETECTION_READY": "1", "EXPECTED_DB_NAME": "test"})
-    assert result.stdout.count("MIGRATION") == (2 if ready else 0)
+    assert ("CURRENT_SCHEMA:auth" in result.stdout) == ready
+    assert "MIGRATION" not in result.stdout
     assert f"READY:{int(ready)}" in result.stdout
 
 
