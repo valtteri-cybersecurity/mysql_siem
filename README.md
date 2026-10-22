@@ -1,46 +1,29 @@
-# MySQL SIEM
+# mysql_siem
 
-A Python and MySQL project for collecting Linux host metrics and firewall events, exploring SQL-based analysis, and developing security detection logic.
+A Python and MySQL project for collecting Linux security telemetry and exploring
+SQL-based analysis. It combines UFW firewall events, host metrics and AdGuard
+Home DNS query logs in one database.
 
-**Work in progress.** This is an educational Blue Team project, not a complete or production-ready SIEM. The current version provides collection and aggregation scripts with an Ubuntu installation script. Detection, portability, testing, and operational hardening remain under development.
+Built as a hands-on Blue Team project. Collection and basic summaries are
+implemented; detection and operational hardening are still under development.
 
-## Current features
+## Features
 
-- UFW ingestion from /var/log/ufw.log: event time, action, source and destination addresses, protocol, ports, raw log line, and SHA-256 event hash.
-- Incremental ingestion using a saved file position and a unique event-hash constraint.
-- System metrics: uptime, CPU usage and load averages, CPU temperature where available, available memory, and root filesystem usage.
-- Filesystem metrics: file counts under /home and recently modified files under /etc.
-- Security metrics: authentication-failure counts from /var/log/auth.log, UFW block counts, unique blocked source addresses, and uptime.
-- Aggregations for blocked source IPs, targeted destination ports, and daily UFW actions.
-- An initial detection entry point that retrieves today's BLOCK and AUDIT events. It does not yet implement an operational port-scan detector or alert pipeline.
+- Incremental UFW log ingestion with file-position tracking and duplicate handling.
+- System metrics: CPU, memory, disk usage and uptime.
+- Filesystem and security metrics, including authentication-failure counts.
+- Summaries of blocked source addresses, destination ports and daily UFW actions.
+- AdGuard Home integration using the official `/control/querylog` API over verified HTTPS.
+- Separate DNS adapter and storage layers, with pagination, checkpoints and replay handling.
+- Configurable DNS retention, defaulting to 30 days.
+- Cron-based collection managed by the installation script.
 
-Process monitoring, service monitoring, DNS integration, sudo-command ingestion, an API, and a GUI are not included in the current source snapshot. They may exist in separate local work or be added later.
-
-## Structure
-
-| Path | Responsibility |
-| --- | --- |
-| ingestion/ | UFW parsing and incremental ingestion |
-| metrics/system/ | System measurements |
-| metrics/filesystem/ | Filesystem counts |
-| metrics/security/ | Authentication and firewall counters |
-| analysis/ | Source-IP, destination-port, and daily aggregations |
-| detection/port_scan/ | Preliminary event retrieval for future detection |
-| database/connection.py | Shared environment-based MySQL connection |
-| database/schema.sql | Database schema dump |
-| install.sh | Ubuntu installation and cron configuration |
-
-## Requirements
-
-The installer targets Ubuntu with apt, systemd, and local MySQL root authentication through /run/mysqld/mysqld.sock.
-
-It installs Python 3, the distribution's PyMySQL package, MySQL Server, rsyslog, cron, CA certificates, and OpenSSL. Collectors also depend on normal Linux facilities such as /proc, /sys, and find.
-
-The host must provide readable /var/log/ufw.log and /var/log/auth.log files for the corresponding collectors. Installing rsyslog does not by itself guarantee that both files exist or that the scheduled user can read them. Configure logging and appropriate read permissions separately. Do not make sensitive logs world-readable.
+Only the AdGuard Home DNS adapter is currently implemented. There is no dashboard,
+API or complete detection and alerting pipeline yet.
 
 ## Installation
 
-Use a disposable VM or dedicated lab host first. Read install.sh and the cautions below before running it.
+Designed for Ubuntu and Linux Mint with Python 3.10+ and local MySQL 8.
 
 ```bash
 git clone https://github.com/valtteri-cybersecurity/mysql_siem.git
@@ -48,103 +31,115 @@ cd mysql_siem
 sudo bash install.sh
 ```
 
-The installer:
+The installer installs dependencies, configures the local `mysql_siem` database
+and `pythonuser` account, creates the tables, and adds collection jobs to the
+installing user's crontab. Existing configuration files are preserved.
 
-1. Installs dependencies and enables MySQL, cron, and rsyslog.
-2. Creates config/mysql.env if absent, using a randomly generated database password.
-3. Restricts that file to mode 600 and assigns ownership to the installation user.
-4. Creates the local ufw_monitor database and imports the schema if it contains no tables.
-5. Creates or updates pythonuser@localhost and grants table-specific SELECT, INSERT, and UPDATE privileges as needed.
-6. Generates a path-independent config/run_with_env.sh wrapper.
-7. Checks Python syntax and writes a marked block into the installation user's crontab.
-8. Checks the application database connection.
+The installer changes services, database account settings and its managed cron
+block. Review it before running on a shared host. UFW and authentication metrics
+also require readable `/var/log/ufw.log` and `/var/log/auth.log` files; their logging
+and access permissions must be configured for the collection user.
 
-Installation success does not establish that every collector has working log access or that analysis results are correct.
+Database settings are stored in `config/mysql.env`. Keep credentials private and
+never import `database/schema.sql` over data you want to retain.
 
-### Installation cautions
+## Connect AdGuard Home
 
-- Names are currently fixed: DB_HOST=localhost, DB_NAME=ufw_monitor, and DB_USER=pythonuser.
-- The installer changes the password of an existing pythonuser@localhost account. This can break other applications using that account. Prefer a dedicated project account in a future revision and avoid running this installer against a shared account.
-- Existing privileges on that account are not revoked. Table-specific grants do not remove privileges previously assigned elsewhere.
-- The installer rejects nonempty databases whose table-name set differs from the expected eight tables. It does not verify existing column definitions or migrate schemas.
-- database/schema.sql contains DROP TABLE IF EXISTS statements. Do not import it directly into a database containing data you need to keep. The installer only imports it when the database has no tables.
-- config/mysql.env is sourced as shell code, including during privileged installation. Treat it and the project directory as trusted input; do not use configuration from an untrusted source.
-- Installation changes services, file ownership, and cron configuration. It is not an atomic deployment or migration process.
+### 1. Configure your server
 
-## Configuration
-
-The shared Python connection helper reads environment variables; it does not load configuration files automatically.
-
-```text
-DB_HOST=localhost
-DB_USER=pythonuser
-DB_PASSWORD=<private password generated during installation>
-DB_NAME=ufw_monitor
-```
-
-Keep config/mysql.env, config/adguard.env, logs, and local credentials out of Git. Never paste real passwords into documentation.
-
-## Manual execution
-
-Run from the repository root after installation:
+Before installation, or before rerunning the installer for an existing setup:
 
 ```bash
-bash config/run_with_env.sh /usr/bin/python3 -m metrics.system.main
-bash config/run_with_env.sh /usr/bin/python3 -m metrics.filesystem.main
-bash config/run_with_env.sh /usr/bin/python3 -m metrics.security.main
-bash config/run_with_env.sh /usr/bin/python3 -m ingestion.ufw_to_mysql
-bash config/run_with_env.sh /usr/bin/python3 -m analysis.attacking_ips.main
+test -f config/adguard.env || cp config/adguard.env.example config/adguard.env
+chmod 600 config/adguard.env
+nano config/adguard.env
 ```
 
-The targeted-port scripts currently rely on local imports. Their scheduled entry point runs from analysis/targeted_ports rather than using a package-qualified module command.
+Set your HTTPS management URL, credentials and source name:
 
-## Scheduled collection
+```ini
+ADGUARD_URL=https://adguard.example.org
+ADGUARD_USERNAME=your-user
+ADGUARD_PASSWORD=your-password
+ADGUARD_SOURCE_NAME=adguard-home
+```
 
-The installer manages only the block between its mysql_siem cron markers and preserves other crontab entries.
+Use literal values without shell quotes. For a private CA or self-signed
+certificate, also set `ADGUARD_CA_BUNDLE` to the absolute path of the trusted
+public PEM certificate. TLS verification remains enabled. AdGuard query logging
+must be enabled and its HTTPS interface reachable from the collector.
 
-| Job | Schedule |
-| --- | --- |
-| UFW ingestion | Every minute |
-| System, filesystem, and security metrics | Every five minutes |
-| Source-IP aggregation | Every five minutes |
-| Daily UFW counts | Daily at 13:02 |
-| Targeted-port aggregation | Daily at 13:03 |
-
-Times follow the host's cron configuration. Output is appended to cron.log files beside the corresponding scripts. Log rotation, retention, and prevention of overlapping jobs are not configured by the installer.
-
-Inspect the current user's jobs with:
+### 2. Install the integration
 
 ```bash
+sudo bash install.sh
+```
+
+With `config/adguard.env` present, the installer registers the source and adds a
+five-minute DNS job alongside the other collectors. New sources are disabled
+until explicitly enabled; existing enablement is preserved.
+
+### 3. Enable the source and test collection
+
+For the default source name configured above:
+
+```bash
+sudo mysql mysql_siem -e "
+SELECT source_name, base_url, enabled FROM dns_sources;
+"
+```
+
+Confirm the registered URL is your server, then enable the source and run once:
+
+```bash
+sudo mysql mysql_siem -e "
+UPDATE dns_sources SET enabled = TRUE WHERE source_name = 'adguard-home';
+"
+bash config/run_with_env.sh --dns /usr/bin/python3 -m ingestion.dns.main
+```
+
+Check stored events and subsequent scheduled runs:
+
+```bash
+sudo mysql mysql_siem -e "SELECT COUNT(*) AS dns_events FROM dns_events;"
 crontab -l
+tail -n 20 ingestion/dns/cron.log
 ```
 
-## Database tables
+A successful run reports `DNS collection complete`. DNS replay handling is best
+effort: the API does not provide an event identity used by this collector, so
+perfect duplicate detection and lossless collection are not guaranteed.
 
-The supplied schema defines filesystem_metrics, security_metrics, system_metrics, top_attacking_ips, top_targeted_ports, ufw_daily_actions_counts, ufw_log, and ufw_state.
+## Project structure
 
-UFW event values are inserted with parameterized SQL. The unique event_hash index supports duplicate suppression. Aggregated blocked traffic is not proof of an attack, despite the historical top_attacking_ips table name.
+| Directory | Purpose |
+| --- | --- |
+| `ingestion/` | UFW ingestion and the modular DNS collector |
+| `metrics/` | System, filesystem and security measurements |
+| `analysis/` | SQL-based summaries |
+| `detection/` | Early detection experiments |
+| `database/` | Shared connection, schema and migrations |
+| `config/` | Environment loader and configuration examples |
+| `tests/` | Automated tests, primarily for DNS and its integration |
 
-## Known limitations
+## Development
 
-- Detection currently retrieves events only; there is no complete detector, alert delivery, API, or dashboard.
-- The UFW parser treats the first whitespace-separated field as a timestamp. Traditional syslog formats need additional parsing.
-- Log rotation is handled only by resetting the saved offset when the current file becomes smaller. File replacement and rotated-log recovery require more work.
-- INSERT IGNORE can suppress database warnings as well as duplicates; malformed input needs stronger validation.
-- Authentication-failure matching depends on date format and case-sensitive message strings.
-- Daily counting opens matching rotated UFW files as plain text, including potential compressed files. Its seven-day average covers days represented by BLOCK rows, not necessarily seven calendar days including zero-event days.
-- Source-IP exclusions contain environment-specific address prefixes.
-- Filesystem metrics are counts, not file-integrity monitoring.
-- Some scripts still have inconsistent import and connection patterns. Errors are often printed without a nonzero exit status.
-- Automated tests, retention policies, schema migrations, robust scheduling, and production security hardening remain incomplete.
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest
+```
 
-## Development priorities
+Optional MySQL integration tests use a temporary isolated server and require
+`mysqld` to be available:
 
-- Use an isolated project database account without modifying shared credentials.
-- Improve parser validation, timestamps, log rotation, and failure reporting.
-- Standardize module imports and database access.
-- Add automated tests and schema migration support.
-- Implement and validate detection rules.
-- Integrate DNS data, starting with AdGuard Home and potentially Unbound.
-- Introduce an API and user interface after collection and analysis are established.
+```bash
+DNS_TEST_MYSQL=1 .venv/bin/python -m pytest tests/dns/test_mysql.py
+```
 
-This roadmap describes future work, not completed functionality.
+## Current limitations
+
+This is a lab project, not a production-ready SIEM. Older collectors still need
+more consistent parsing, error handling and database access. Log rotation and
+retention outside DNS require separate configuration. Blocked traffic alone is
+not proof of an attack, and detection experiments do not yet generate alerts.

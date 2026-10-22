@@ -1,6 +1,6 @@
 -- MySQL dump 10.13  Distrib 8.4.11, for Linux (x86_64)
 --
--- Host: localhost    Database: ufw_monitor
+-- Host: localhost    Database: mysql_siem
 -- ------------------------------------------------------
 -- Server version	8.4.11-0ubuntu0.26.04.1
 
@@ -156,10 +156,13 @@ DROP TABLE IF EXISTS `ufw_state`;
 /*!40101 SET @saved_cs_client     = @@character_set_client */;
 /*!50503 SET character_set_client = utf8mb4 */;
 CREATE TABLE `ufw_state` (
-  `id` tinyint unsigned NOT NULL,
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
   `logfile` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
   `last_position` bigint unsigned NOT NULL DEFAULT '0',
-  PRIMARY KEY (`id`)
+  `file_device` bigint unsigned DEFAULT NULL,
+  `file_inode` bigint unsigned DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_ufw_state_file` (`file_device`,`file_inode`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 /*!40101 SET character_set_client = @saved_cs_client */;
 /*!40103 SET TIME_ZONE=@OLD_TIME_ZONE */;

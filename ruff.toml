@@ -1,0 +1,2 @@
+# Support Ubuntu 22.04 Python as documented for the DNS adapter.
+target-version = "py310"

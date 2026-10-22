@@ -1,0 +1,5 @@
+# Reference only: install.sh generates this entry in its managed cron block
+# when config/adguard.env exists. New sources require explicit enablement.
+# Uses the system Python and distribution packages installed by install.sh.
+# Do not add a second DNS entry manually when using the installer.
+# */5 * * * * cd "/path/to/mysql_siem" && PYTHONPATH="/path/to/mysql_siem" /usr/bin/timeout --signal=TERM 270s "/path/to/mysql_siem/config/run_with_env.sh" --dns /usr/bin/python3 -m ingestion.dns.main >> "/path/to/mysql_siem/ingestion/dns/cron.log" 2>&1
