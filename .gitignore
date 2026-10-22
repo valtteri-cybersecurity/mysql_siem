@@ -23,3 +23,6 @@ venv/
 # Detection configuration and rotated logs
 /config/port_scan.env
 *.log.[0-9]*
+
+# SSH runtime configuration
+/config/ssh.env

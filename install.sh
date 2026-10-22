@@ -93,6 +93,11 @@ for path in \
     database/migrations/004_detection_state.sql \
     database/migrations/005_dns_client_filters.sql \
     database/migrations/006_dns_domain_filters.sql \
+    database/migrations/007_auth_events.sql \
+    database/migrations/008_ssh_brute_force_rule.sql \
+    config/ssh.env.example \
+    ingestion/auth/main.py \
+    detection/ssh_brute_force/main.py \
     config/port_scan.env.example \
     detection/port_scan/main.py \
     ingestion/dns/main.py \
@@ -212,6 +217,10 @@ try:
             state_tables = {"detection_state"}
             client_filter_tables = {"dns_client_filters"}
             domain_filter_tables = {"dns_domain_filters"}
+            auth_tables = {"auth_events", "auth_ingestion_state"}
+            if existing & auth_tables not in (set(), auth_tables):
+                raise SystemExit("The auth schema is incomplete; inspect it manually.")
+            existing -= auth_tables
             if existing not in (
                 expected, expected | dns_tables,
                 expected | detection_tables, expected | dns_tables | detection_tables,
@@ -346,6 +355,10 @@ try:
     state_tables = {"detection_state"}
     client_filter_tables = {"dns_client_filters"}
     domain_filter_tables = {"dns_domain_filters"}
+    auth_tables = {"auth_events", "auth_ingestion_state"}
+    if actual & auth_tables not in (set(), auth_tables):
+        raise SystemExit("The auth schema is incomplete; inspect it manually.")
+    actual -= auth_tables
     if actual not in (
         expected, expected | dns_tables,
         expected | detection_tables, expected | dns_tables | detection_tables,
@@ -406,6 +419,27 @@ finally:
     conn.close()
 PY
 
+# SSH schema: provision new databases only; existing installations opt in manually.
+SSH_READY=0
+if [[ "$TABLE_COUNT" == "0" && "$DETECTION_READY" == "1" ]]; then
+    log "Creating SSH telemetry and rule in the new database."
+    /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/007_auth_events.sql"
+    /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/008_ssh_brute_force_rule.sql"
+    SSH_READY=1
+elif [[ "$DETECTION_READY" == "1" ]]; then
+    SSH_TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
+        -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name IN ('auth_events', 'auth_ingestion_state')")"
+    SSH_RULE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names "$EXPECTED_DB_NAME" \
+        -e "SELECT COUNT(*) FROM detection_rules WHERE rule_key='SSH_BRUTE_FORCE_001'")"
+    if [[ "$SSH_TABLE_COUNT" == "2" && "$SSH_RULE_COUNT" == "1" ]]; then
+        SSH_READY=1
+    else
+        warn "SSH jobs not scheduled: apply migrations 007/008 manually after approval."
+    fi
+else
+    warn "SSH jobs not scheduled: detection migrations 003/004 are required."
+fi
+
 # Grant privileges only after the tables have been created.
 # Do not grant global privileges to the database user.
 /usr/bin/python3 - <<'PY'
@@ -452,6 +486,11 @@ try:
                 "alert_evidence": "SELECT, INSERT",
                 "detection_state": "SELECT, INSERT, UPDATE",
             })
+        if {"auth_events", "auth_ingestion_state"} <= actual:
+            grants.update({
+                "auth_events": "SELECT, INSERT",
+                "auth_ingestion_state": "SELECT, INSERT, UPDATE",
+            })
         for table, privileges in grants.items():
             cur.execute(
                 f"GRANT {privileges} ON `{db_name}`.`{table}` "
@@ -491,6 +530,28 @@ if [[ -f "$PROJECT_DIR/config/adguard.env" ]]; then
     log "DNS cron configured; new sources must be explicitly enabled before collection."
 else
     log "DNS cron skipped: configure config/adguard.env to enable integration."
+fi
+
+# Schedule the SSH jobs independently; missing auth.log is a logged skip.
+SSH_AUTH_CRON=""
+SSH_DETECTION_CRON=""
+if [[ "${SSH_READY:-0}" == "1" ]]; then
+    if [[ ! -f "$PROJECT_DIR/config/ssh.env" ]]; then
+        cp "$PROJECT_DIR/config/ssh.env.example" "$PROJECT_DIR/config/ssh.env"
+    fi
+    chmod 600 "$PROJECT_DIR/config/ssh.env"
+    chown "$INSTALL_USER:$(id -gn "$INSTALL_USER")" "$PROJECT_DIR/config/ssh.env"
+    SSH_LOG_SOURCE="$("$PROJECT_DIR/config/run_with_env.sh" --ssh /usr/bin/python3 -c 'import os; print(os.getenv("SSH_AUTH_LOGFILE", "/var/log/auth.log"))')"
+    if [[ ! -e "$SSH_LOG_SOURCE" ]]; then
+        warn "SSH log source absent; collection will report SKIPPED until it appears."
+    elif ! runuser -u "$INSTALL_USER" -- test -r "$SSH_LOG_SOURCE"; then
+        warn "SSH log source is not readable by the application user. Review log-group access separately."
+    fi
+    mkdir -p "$PROJECT_DIR/ingestion/auth" "$PROJECT_DIR/detection/ssh_brute_force"
+    touch "$PROJECT_DIR/ingestion/auth/cron.log" "$PROJECT_DIR/detection/ssh_brute_force/cron.log"
+    chmod 600 "$PROJECT_DIR/ingestion/auth/cron.log" "$PROJECT_DIR/detection/ssh_brute_force/cron.log"
+    SSH_AUTH_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh /usr/bin/python3 -m ingestion.auth.main --allow-missing-source --log-file \"$PROJECT_DIR/ingestion/auth/cron.log\""
+    SSH_DETECTION_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh /usr/bin/python3 -m detection.ssh_brute_force.main --automatic --log-file \"$PROJECT_DIR/detection/ssh_brute_force/cron.log\""
 fi
 
 # Set application ownership without changing ownership of .git.
@@ -548,6 +609,8 @@ $CRON_BEGIN
 2 13 * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/analysis/daily_counts/daily_counts.py" >> "$PROJECT_DIR/analysis/daily_counts/cron.log" 2>&1
 3 13 * * * cd "$PROJECT_DIR/analysis/targeted_ports" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 main.py >> "$PROJECT_DIR/analysis/targeted_ports/cron.log" 2>&1
 $PORT_SCAN_CRON
+${SSH_AUTH_CRON:-}
+${SSH_DETECTION_CRON:-}
 $DNS_CRON
 $CRON_END
 CRON

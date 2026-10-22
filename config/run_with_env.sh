@@ -125,6 +125,25 @@ load_port_scan_env() {
     done < "$env_file"
 }
 
+load_ssh_env() {
+    local env_file="$PROJECT_DIR/config/ssh.env"
+    local line key value
+    unset SSH_AUTH_LOGFILE SSH_AUTH_COLLECTOR_ID
+    unset SSH_BRUTE_FORCE_BATCH_SIZE SSH_BRUTE_FORCE_LATE_SECONDS SSH_BRUTE_FORCE_MAX_BUFFER_EVENTS
+    [[ -f "$env_file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" == *=* ]] || { printf 'Invalid SSH configuration.\n' >&2; return 1; }
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "$key" in
+            SSH_AUTH_LOGFILE|SSH_AUTH_COLLECTOR_ID|SSH_BRUTE_FORCE_BATCH_SIZE|SSH_BRUTE_FORCE_LATE_SECONDS|SSH_BRUTE_FORCE_MAX_BUFFER_EVENTS)
+                export "$key=$value" ;;
+            *) printf 'Unknown SSH configuration key.\n' >&2; return 1 ;;
+        esac
+    done < "$env_file"
+}
+
 # Explicit opt-in keeps unrelated collectors independent of DNS configuration.
 if [[ "${1:-}" == "--dns" ]]; then
     shift
@@ -133,6 +152,10 @@ fi
 if [[ "${1:-}" == "--port-scan" ]]; then
     shift
     load_port_scan_env
+fi
+if [[ "${1:-}" == "--ssh" ]]; then
+    shift
+    load_ssh_env
 fi
 if [[ "$#" == "0" ]]; then
     printf 'A command is required.\n' >&2
