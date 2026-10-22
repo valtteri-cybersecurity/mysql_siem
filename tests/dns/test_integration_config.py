@@ -107,6 +107,64 @@ def test_installer_embedded_python_compiles():
         ({"dns_sources", "dns_events", "dns_collection_state"}, True),
         ({"dns_sources"}, False),
         ({"unexpected"}, False),
+        ({"dns_domain_filters"}, False),
+        ({"dns_sources", "dns_domain_filters"}, False),
+        (
+            {"dns_sources", "dns_events", "dns_collection_state", "dns_domain_filters"},
+            True,
+        ),
+        (
+            {
+                "dns_sources",
+                "dns_events",
+                "dns_collection_state",
+                "dns_client_filters",
+                "dns_domain_filters",
+            },
+            True,
+        ),
+        (
+            {
+                "dns_sources",
+                "dns_events",
+                "dns_collection_state",
+                "dns_client_filters",
+                "dns_domain_filters",
+                "detection_rules",
+                "detection_alerts",
+                "alert_evidence",
+                "detection_state",
+            },
+            True,
+        ),
+        ({"dns_client_filters"}, False),
+        (
+            {"dns_sources", "dns_events", "dns_collection_state", "dns_client_filters"},
+            True,
+        ),
+        ({"dns_sources", "dns_client_filters"}, False),
+        (
+            {
+                "detection_rules",
+                "detection_alerts",
+                "alert_evidence",
+                "dns_client_filters",
+            },
+            False,
+        ),
+        (
+            {
+                "dns_sources",
+                "dns_events",
+                "dns_collection_state",
+                "dns_client_filters",
+                "detection_rules",
+                "detection_alerts",
+                "alert_evidence",
+                "detection_state",
+            },
+            True,
+        ),
         ({"detection_rules", "detection_alerts", "alert_evidence"}, True),
         (
             {
@@ -150,7 +208,14 @@ def test_both_installer_schema_guards_accept_only_complete_dns(extra, allowed):
                 if isinstance(assignment, ast.Assign) and any(
                     isinstance(target, ast.Name)
                     and target.id
-                    in {"expected", "dns_tables", "detection_tables", "state_tables"}
+                    in {
+                        "expected",
+                        "dns_tables",
+                        "detection_tables",
+                        "state_tables",
+                        "client_filter_tables",
+                        "domain_filter_tables",
+                    }
                     for target in assignment.targets
                 ):
                     for target in assignment.targets:
@@ -165,8 +230,21 @@ def test_both_installer_schema_guards_accept_only_complete_dns(extra, allowed):
     assert checked == 2
 
 
-@pytest.mark.parametrize("dns", [False, True])
-def test_installer_grants_dns_only_when_tables_exist(monkeypatch, dns):
+@pytest.mark.parametrize(
+    "dns,client_filters,domain_filters",
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (False, True, False),
+        (True, True, True),
+        (True, False, True),
+        (False, False, True),
+    ],
+)
+def test_installer_grants_dns_only_when_tables_exist(
+    monkeypatch, dns, client_filters, domain_filters
+):
     block = next(block for block in python_blocks() if "grants = {" in block)
     connection = MagicMock()
     cursor = connection.cursor.return_value.__enter__.return_value
@@ -176,6 +254,10 @@ def test_installer_grants_dns_only_when_tables_exist(monkeypatch, dns):
             ("dns_sources", "dns_events", "dns_collection_state") if dns else ()
         )
     ]
+    if client_filters:
+        cursor.fetchall.return_value.append(("dns_client_filters",))
+    if domain_filters:
+        cursor.fetchall.return_value.append(("dns_domain_filters",))
     import pymysql
 
     monkeypatch.setattr(pymysql, "connect", MagicMock(return_value=connection))
@@ -184,13 +266,27 @@ def test_installer_grants_dns_only_when_tables_exist(monkeypatch, dns):
     exec(compile(block, "installer-grants", "exec"), {})  # noqa: S102 - trusted repository block with mocked MySQL
     queries = [call.args[0] for call in cursor.execute.call_args_list]
     dns_grants = [query for query in queries if "GRANT" in query and "`dns_" in query]
-    assert len(dns_grants) == (3 if dns else 0)
+    assert len(dns_grants) == (
+        3 + int(client_filters) + int(domain_filters) if dns else 0
+    )
     if dns:
         assert any(
             "SELECT, INSERT, DELETE" in query and "dns_events" in query
             for query in dns_grants
         )
         assert not any("CREATE" in query or "DROP" in query for query in dns_grants)
+        if domain_filters:
+            assert any(
+                "SELECT, INSERT, UPDATE, DELETE" in query
+                and "`dns_domain_filters`" in query
+                for query in dns_grants
+            )
+        if client_filters:
+            assert any(
+                "SELECT, INSERT, UPDATE, DELETE" in query
+                and "`dns_client_filters`" in query
+                for query in dns_grants
+            )
 
 
 def test_dns_collector_limits_are_loaded_as_data(project):
@@ -217,7 +313,7 @@ def test_dns_cron_template_is_inactive():
 def test_installer_creates_only_absent_dns_schema(table_count):
     installer = (ROOT / "install.sh").read_text()
     start = installer.index("# Create DNS tables once;")
-    end = installer.index("# Detection schema:", start)
+    end = installer.index("# DNS client filters:", start)
     block = installer[start:end].replace("/usr/bin/mysql", "mock_mysql")
     script = (
         r"""
@@ -297,3 +393,46 @@ def test_installer_dns_setup_uses_existing_cron_model(project, configured):
         assert settings.read_text() == "private fixture settings\n"
         assert settings.stat().st_mode & 0o777 == 0o600
         assert (dns / "cron.log").stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("count", ["0", "1", "unexpected"])
+@pytest.mark.parametrize("kind", ["client", "domain"])
+def test_installer_adds_filter_table_once_without_overwriting(count, kind):
+    installer = (ROOT / "install.sh").read_text()
+    start = installer.index(f"# DNS {kind} filters:")
+    end = installer.index(
+        "# DNS domain filters:" if kind == "client" else "# Detection schema:", start
+    )
+    block = installer[start:end].replace("/usr/bin/mysql", "mock_mysql")
+    script = (
+        r"""
+set -euo pipefail
+log() { :; }
+die() { printf '%s\n' "$*" >&2; exit 1; }
+mock_mysql() {
+    if [[ "$*" == *"SELECT COUNT"* ]]; then
+        printf '%s\n' "$TEST_COUNT"
+    else
+        cat
+    fi
+}
+"""
+        + block
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env={
+            **os.environ,
+            "PROJECT_DIR": str(ROOT),
+            "EXPECTED_DB_NAME": "mysql_siem",
+            "TEST_COUNT": count,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert (result.returncode == 0) == (count in ("0", "1"))
+    assert (f"CREATE TABLE dns_{kind}_filters" in result.stdout) == (count == "0")
+    assert "DROP TABLE" not in result.stdout
+    assert "DELETE FROM" not in result.stdout
+    assert "ALTER USER" not in installer

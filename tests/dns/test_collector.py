@@ -2,6 +2,7 @@ import copy
 from contextlib import nullcontext
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from unittest.mock import Mock
 
 import pytest
 
@@ -14,6 +15,7 @@ from ingestion.dns.collector import (
     replay_keys,
 )
 from ingestion.dns.config import CollectorConfig
+from ingestion.dns.db import DNSStorageError
 from ingestion.dns.models import DNSPage
 from ingestion.dns.timestamps import timestamp_ns
 
@@ -89,6 +91,12 @@ def store(monkeypatch):
         lambda connection, source_id: copy.deepcopy(store.state),
     )
     monkeypatch.setattr(collector, "save_events", store.save)
+    monkeypatch.setattr(
+        collector, "get_active_domain_filters", lambda connection, source_id: []
+    )
+    monkeypatch.setattr(
+        collector, "get_active_client_filters", lambda connection, source_id: []
+    )
     return store
 
 
@@ -273,3 +281,288 @@ def test_backwards_clock_does_not_resume_a_future_pending_window(store):
     with pytest.raises(DNSCollectionError, match="clock moved backwards"):
         run(log)
     assert store.state == original and not log.calls and store.calls == 0
+
+
+@pytest.fixture
+def exclusions(store, monkeypatch):
+    loader = Mock(
+        return_value=[{"client_ip": "192.0.2.1", "exclude_from_collection": True}]
+    )
+    monkeypatch.setattr(collector, "get_active_client_filters", loader)
+    return loader
+
+
+def test_excludes_only_collection_flag_and_loads_rules_once(store, exclusions):
+    exclusions.return_value.append(
+        {
+            "client_ip": "192.0.2.2",
+            "exclude_from_collection": False,
+            "hide_from_query_log": True,
+        }
+    )
+    records = [event(), replace(event(), client_ip="192.0.2.2")]
+    log = QueryLog(records)
+    result = run(log, page_size=1)
+    assert result["inserted"] == 1 and result["excluded"] == 1
+    assert result["fetched"] == 2
+    assert [row.client_ip for row in store.rows.values()] == ["192.0.2.2"]
+    exclusions.assert_called_once()
+    assert exclusions.call_args.args[1] == 7
+
+
+@pytest.mark.parametrize("value", ["2001:db8::1", "2001:0DB8:0:0:0:0:0:1"])
+def test_ipv6_exclusion_normalizes_event_client_for_lookup(store, exclusions, value):
+    exclusions.return_value = [
+        {"client_ip": "2001:db8::1", "exclude_from_collection": True}
+    ]
+    result = run(QueryLog([replace(event(), client_ip=value)]))
+    assert result["excluded"] == 1 and result["inserted"] == 0
+    assert store.state["pending"] is None
+
+
+@pytest.mark.parametrize("value", [None, "", "unknown", "192.0.2.0/24", "fe80::1%eth0"])
+def test_untrusted_or_missing_client_never_matches_fallback_ip(
+    store, exclusions, value
+):
+    exclusions.return_value = [
+        {"client_ip": "0.0.0.0", "exclude_from_collection": True}
+    ]
+    result = run(QueryLog([replace(event(), client_ip=value)]))
+    assert result["excluded"] == 0 and result["inserted"] == 1
+
+
+def test_all_excluded_timestamp_ties_page_and_complete_with_no_rows(store, exclusions):
+    records = [event()] * 5 + [event("2026-10-21T11:58:00Z")]
+    log = QueryLog(records)
+    result = run(log, page_size=2)
+    assert result["inserted"] == 0 and result["excluded"] == 6
+    assert result["fetched"] == 6
+    assert store.state["completed_until"] == "2026-10-21T11:59:30.000000+00:00"
+    assert store.state["pending"] is None and not store.rows
+    assert len(log.calls) < 10
+    result = run(QueryLog(records), page_size=2, now=NOW + timedelta(minutes=5))
+    assert result["inserted"] == 0 and store.state["pending"] is None
+    assert store.state["completed_until"] == "2026-10-21T12:04:30.000000+00:00"
+
+
+def test_excluded_groups_preserve_safe_cursor_across_budget_restart(store, exclusions):
+    records = [event(f"2026-10-21T11:5{minute}:00Z") for minute in (9, 8, 7)]
+    with pytest.raises(DNSCollectionIncomplete):
+        run(QueryLog(records), page_size=2, settings=CollectorConfig(max_pages=1))
+    assert store.state["completed_until"] is None
+    assert store.state["pending"]["cursor"] == records[0].raw_timestamp
+    assert not store.rows
+    log = QueryLog(records)
+    result = run(log, page_size=2)
+    assert result["excluded"] == 2 and result["inserted"] == 0
+    assert log.calls[0] == (records[0].raw_timestamp, 0)
+    assert store.state["pending"] is None
+
+
+def test_filter_read_failure_leaves_api_and_checkpoint_untouched(store, exclusions):
+    exclusions.side_effect = DNSStorageError("DNS database operation failed.")
+    log = QueryLog([event()])
+    with pytest.raises(DNSStorageError):
+        run(log)
+    assert not log.calls and store.state is None and store.calls == 0
+
+
+def test_failed_all_excluded_checkpoint_is_not_advanced(store, exclusions, monkeypatch):
+    def fail_group(connection, source_id, events, *, state=None, dedup_keys=None):
+        if dedup_keys is not None:
+            raise DNSStorageError("DNS database operation failed.")
+        return store.save(
+            connection, source_id, events, state=state, dedup_keys=dedup_keys
+        )
+
+    monkeypatch.setattr(collector, "save_events", fail_group)
+    log = QueryLog([event()])
+    with pytest.raises(DNSStorageError):
+        run(log)
+    assert store.state["completed_until"] is None
+    assert store.state["pending"]["cursor"] == store.state["pending"]["upper"]
+    assert not store.rows
+    monkeypatch.setattr(collector, "save_events", store.save)
+    assert run(QueryLog(log.events))["excluded"] == 1
+    assert store.state["pending"] is None
+
+
+def test_disabling_exclusion_keeps_existing_checkpoint_and_bounded_overlap(
+    store, exclusions
+):
+    old = event("2026-10-21T11:00:00Z")
+    recent = event()
+    assert run(QueryLog([old, recent]))["excluded"] == 2
+    exclusions.return_value = []
+    new = event("2026-10-21T12:04:00Z")
+    result = run(QueryLog([old, recent, new]), now=NOW + timedelta(minutes=5))
+    assert result["excluded"] == 0 and result["inserted"] == 2
+    assert old not in store.rows.values()
+    assert recent in store.rows.values() and new in store.rows.values()
+    assert store.state["pending"] is None
+
+
+def test_filter_snapshot_is_used_for_whole_run(store, exclusions):
+    class ChangingRulesLog(QueryLog):
+        def fetch_page(self, **kwargs):
+            exclusions.return_value = []
+            return super().fetch_page(**kwargs)
+
+    result = run(ChangingRulesLog([event()] * 4), page_size=1)
+    assert result["excluded"] == 4 and not store.rows
+    exclusions.assert_called_once()
+
+
+def test_replay_keys_remain_stable_after_partial_filtered_group(store, exclusions):
+    records = [event()] * 1000 + [replace(event(), client_ip="192.0.2.2")] * 1001
+    # Initial state, excluded first chunk, 1000 kept rows, final kept row fails.
+    store.failure_at = 4
+    with pytest.raises(RuntimeError):
+        run(QueryLog(records), page_size=1000)
+    assert len(store.rows) == 1000
+    assert store.state["pending"]["cursor"] == store.state["pending"]["upper"]
+    store.failure_at = None
+    result = run(QueryLog(records), page_size=1000)
+    assert result["inserted"] == 1 and result["excluded"] == 1000
+    assert len(store.rows) == 1001 and store.state["pending"] is None
+
+
+def test_replay_keeps_multiplicity_when_exclusion_changes_between_runs(
+    store, exclusions
+):
+    items = [event()] * 3 + [replace(event(), client_ip="192.0.2.2")] * 3
+    assert run(QueryLog(items), page_size=2)["inserted"] == 3
+    exclusions.return_value = []
+    assert (
+        run(QueryLog(items), page_size=2, now=NOW + timedelta(minutes=5))["inserted"]
+        == 3
+    )
+    assert len(store.rows) == 6
+    assert (
+        run(QueryLog(items), page_size=2, now=NOW + timedelta(minutes=10))["inserted"]
+        == 0
+    )
+
+
+def test_empty_filtered_final_chunk_commits_checkpoint_after_replay(store, exclusions):
+    records = [replace(event(), client_ip="192.0.2.2")] + [event()] * 1000
+    store.failure_at = 3
+    with pytest.raises(RuntimeError):
+        run(QueryLog(records), page_size=1000)
+    assert len(store.rows) == 1
+    assert store.state["pending"]["cursor"] == store.state["pending"]["upper"]
+    store.failure_at = None
+    result = run(QueryLog(records), page_size=1000)
+    assert result["inserted"] == 0 and result["excluded"] == 1000
+    assert len(store.rows) == 1 and store.state["pending"] is None
+
+
+@pytest.fixture
+def domain_exclusions(store, monkeypatch):
+    loader = Mock(return_value=[{"domain": "scs.samsungqbe.com"}])
+    monkeypatch.setattr(collector, "get_active_domain_filters", loader)
+    return loader
+
+
+@pytest.mark.parametrize("domain", ["scs.samsungqbe.com", "SCS.SamsungQBE.COM."])
+def test_exact_domain_exclusion_applies_after_normalization(
+    store, domain_exclusions, domain
+):
+    result = run(QueryLog([replace(event(), domain=domain)]))
+    assert result["inserted"] == 0 and result["excluded"] == 1
+    assert store.state["pending"] is None
+    domain_exclusions.assert_called_once()
+    assert domain_exclusions.call_args.args[1] == 7
+
+
+@pytest.mark.parametrize(
+    "domain",
+    [
+        "sub.scs.samsungqbe.com",
+        "otherscs.samsungqbe.com",
+        "samsungqbe.com",
+        "scs.samsungqbe.com.evil.example",
+        "example.org",
+        "unknown domain",
+        "https://scs.samsungqbe.com",
+        "K.example",
+    ],
+)
+def test_domain_rule_does_not_match_other_names_or_untrusted_values(
+    store, domain_exclusions, domain
+):
+    result = run(QueryLog([replace(event(), domain=domain)]))
+    assert result["excluded"] == 0 and result["inserted"] == 1
+
+
+def test_ip_and_domain_exclusion_count_event_only_once(
+    store, exclusions, domain_exclusions
+):
+    result = run(QueryLog([replace(event(), domain="scs.samsungqbe.com")]))
+    assert result["excluded"] == 1 and not store.rows
+
+
+def test_domain_only_rule_preserves_other_queries_from_same_client(
+    store, domain_exclusions
+):
+    skipped = replace(event(), domain="scs.samsungqbe.com")
+    allowed = replace(event(), domain="example.org")
+    result = run(QueryLog([skipped, allowed]), page_size=1)
+    assert result["inserted"] == 1 and result["excluded"] == 1
+    assert list(store.rows.values()) == [allowed]
+
+
+def test_all_domain_excluded_pages_resume_and_advance_checkpoint(
+    store, domain_exclusions
+):
+    records = [
+        replace(event(f"2026-10-21T11:5{minute}:00Z"), domain="scs.samsungqbe.com")
+        for minute in (9, 8, 7)
+    ]
+    with pytest.raises(DNSCollectionIncomplete):
+        run(QueryLog(records), page_size=2, settings=CollectorConfig(max_pages=1))
+    assert store.state["pending"]["cursor"] == records[0].raw_timestamp
+    assert not store.rows
+    log = QueryLog(records)
+    result = run(log, page_size=2)
+    assert result["inserted"] == 0 and result["excluded"] == 2
+    assert log.calls[0] == (records[0].raw_timestamp, 0)
+    assert store.state["pending"] is None
+
+
+def test_domain_rule_read_failure_leaves_checkpoint_and_api_untouched(
+    store, domain_exclusions
+):
+    domain_exclusions.side_effect = DNSStorageError("DNS database operation failed.")
+    log = QueryLog([event()])
+    with pytest.raises(DNSStorageError):
+        run(log)
+    assert not log.calls and store.state is None and store.calls == 0
+
+
+def test_disabling_domain_rule_restores_new_queries_without_history_reset(
+    store, domain_exclusions
+):
+    records = [
+        replace(event(stamp), domain="scs.samsungqbe.com")
+        for stamp in ("2026-10-21T11:00:00Z", "2026-10-21T11:59:00Z")
+    ]
+    assert run(QueryLog(records))["excluded"] == 2
+    domain_exclusions.return_value = []
+    new = replace(event("2026-10-21T12:04:00Z"), domain="scs.samsungqbe.com")
+    result = run(QueryLog(records + [new]), now=NOW + timedelta(minutes=5))
+    assert result["inserted"] == 2
+    assert records[0] not in store.rows.values()
+
+
+def test_domain_filtered_group_replays_after_partial_commit(store, domain_exclusions):
+    records = [replace(event(), domain="scs.samsungqbe.com")] * 1000 + [event()] * 1001
+    store.failure_at = 4
+    with pytest.raises(RuntimeError):
+        run(QueryLog(records), page_size=1000)
+    assert len(store.rows) == 1000
+    assert store.state["pending"]["cursor"] == store.state["pending"]["upper"]
+    store.failure_at = None
+    result = run(QueryLog(records), page_size=1000)
+    assert result["inserted"] == 1 and result["excluded"] == 1000
+    assert len(store.rows) == 1001 and store.state["pending"] is None

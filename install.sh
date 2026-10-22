@@ -91,6 +91,8 @@ for path in \
     database/migrations/002_dns_telemetry.sql \
     database/migrations/003_detection_alerts.sql \
     database/migrations/004_detection_state.sql \
+    database/migrations/005_dns_client_filters.sql \
+    database/migrations/006_dns_domain_filters.sql \
     config/port_scan.env.example \
     detection/port_scan/main.py \
     ingestion/dns/main.py \
@@ -208,11 +210,22 @@ try:
             dns_tables = {"dns_sources", "dns_events", "dns_collection_state"}
             detection_tables = {"detection_rules", "detection_alerts", "alert_evidence"}
             state_tables = {"detection_state"}
+            client_filter_tables = {"dns_client_filters"}
+            domain_filter_tables = {"dns_domain_filters"}
             if existing not in (
                 expected, expected | dns_tables,
                 expected | detection_tables, expected | dns_tables | detection_tables,
                 expected | detection_tables | state_tables,
                 expected | dns_tables | detection_tables | state_tables,
+                expected | dns_tables | client_filter_tables,
+                expected | dns_tables | detection_tables | client_filter_tables,
+                expected | dns_tables | detection_tables | state_tables | client_filter_tables,
+                expected | dns_tables | domain_filter_tables,
+                expected | dns_tables | detection_tables | domain_filter_tables,
+                expected | dns_tables | detection_tables | state_tables | domain_filter_tables,
+                expected | dns_tables | client_filter_tables | domain_filter_tables,
+                expected | dns_tables | detection_tables | client_filter_tables | domain_filter_tables,
+                expected | dns_tables | detection_tables | state_tables | client_filter_tables | domain_filter_tables,
             ):
                 raise SystemExit(
                     "The database has a partial or unexpected schema. "
@@ -253,6 +266,40 @@ case "$DNS_TABLE_COUNT" in
         ;;
     *)
         die "The DNS schema is incomplete. Inspect it manually before retrying."
+        ;;
+esac
+
+# DNS client filters: create once after the source tables exist.
+DNS_CLIENT_FILTER_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
+    -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name='dns_client_filters'")"
+
+case "$DNS_CLIENT_FILTER_COUNT" in
+    0)
+        log "Creating DNS client filter table."
+        /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/005_dns_client_filters.sql"
+        ;;
+    1)
+        log "Keeping existing DNS client filters."
+        ;;
+    *)
+        die "Cannot verify the DNS client filter table. Inspect the schema before retrying."
+        ;;
+esac
+
+# DNS domain filters: exact-name exclusions, independent of client rules.
+DNS_DOMAIN_FILTER_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
+    -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name='dns_domain_filters'")"
+
+case "$DNS_DOMAIN_FILTER_COUNT" in
+    0)
+        log "Creating DNS domain filter table."
+        /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/006_dns_domain_filters.sql"
+        ;;
+    1)
+        log "Keeping existing DNS domain filters."
+        ;;
+    *)
+        die "Cannot verify the DNS domain filter table. Inspect the schema before retrying."
         ;;
 esac
 
@@ -297,11 +344,22 @@ try:
     dns_tables = {"dns_sources", "dns_events", "dns_collection_state"}
     detection_tables = {"detection_rules", "detection_alerts", "alert_evidence"}
     state_tables = {"detection_state"}
+    client_filter_tables = {"dns_client_filters"}
+    domain_filter_tables = {"dns_domain_filters"}
     if actual not in (
         expected, expected | dns_tables,
         expected | detection_tables, expected | dns_tables | detection_tables,
         expected | detection_tables | state_tables,
         expected | dns_tables | detection_tables | state_tables,
+        expected | dns_tables | client_filter_tables,
+        expected | dns_tables | detection_tables | client_filter_tables,
+        expected | dns_tables | detection_tables | state_tables | client_filter_tables,
+        expected | dns_tables | domain_filter_tables,
+        expected | dns_tables | detection_tables | domain_filter_tables,
+        expected | dns_tables | detection_tables | state_tables | domain_filter_tables,
+        expected | dns_tables | client_filter_tables | domain_filter_tables,
+        expected | dns_tables | detection_tables | client_filter_tables | domain_filter_tables,
+        expected | dns_tables | detection_tables | state_tables | client_filter_tables | domain_filter_tables,
     ):
         raise SystemExit(
             f"Schema tables do not match. Missing: {sorted(expected-actual)}; "
@@ -382,6 +440,10 @@ try:
                 "dns_events": "SELECT, INSERT, DELETE",
                 "dns_collection_state": "SELECT, INSERT, UPDATE",
             })
+        if dns_tables <= actual and "dns_client_filters" in actual:
+            grants["dns_client_filters"] = "SELECT, INSERT, UPDATE, DELETE"
+        if dns_tables <= actual and "dns_domain_filters" in actual:
+            grants["dns_domain_filters"] = "SELECT, INSERT, UPDATE, DELETE"
         detection_tables = {"detection_rules", "detection_alerts", "alert_evidence", "detection_state"}
         if detection_tables <= actual:
             grants.update({

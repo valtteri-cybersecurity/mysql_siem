@@ -6,7 +6,9 @@ import time
 from collections import Counter
 from datetime import datetime, timedelta, timezone
 
+from ingestion.dns.client_filters import get_active_client_filters, normalize_client_ip
 from ingestion.dns.db import load_state, save_events, source_lock
+from ingestion.dns.domain_filters import get_active_domain_filters, normalize_domain
 from ingestion.dns.timestamps import parse_timestamp, timestamp_ns
 
 
@@ -83,23 +85,53 @@ def validate_state(state):
     return state
 
 
-def save_group(connection, source_id, events, state, deadline):
+def save_group(
+    connection,
+    source_id,
+    events,
+    state,
+    deadline,
+    excluded_client_ips,
+    excluded_domains,
+):
     keys = replay_keys(events)
-    inserted = 0
+    inserted = excluded = 0
     for start in range(0, len(events), 1000):
         if time.monotonic() >= deadline:
             raise DNSCollectionIncomplete(
                 "DNS run time budget reached; recovery remains pending."
             )
         end = start + 1000
+        kept_events = []
+        kept_keys = []
+        # Keep paging, group boundaries and replay ordinals based on source data.
+        for event, key in zip(events[start:end], keys[start:end]):
+            client_ip = None
+            if excluded_client_ips:
+                try:
+                    client_ip = normalize_client_ip(event.client_ip)
+                except ValueError:
+                    pass
+            skip = client_ip is not None and client_ip in excluded_client_ips
+            if not skip and excluded_domains:
+                try:
+                    skip = normalize_domain(event.domain) in excluded_domains
+                except ValueError:
+                    pass
+            if skip:
+                excluded += 1
+            else:
+                kept_events.append(event)
+                kept_keys.append(key)
+        # Even an entirely excluded final chunk must commit its safe checkpoint.
         inserted += save_events(
             connection,
             source_id,
-            events[start:end],
-            dedup_keys=keys[start:end],
+            kept_events,
+            dedup_keys=kept_keys,
             state=state if end >= len(events) else None,
         )
-    return inserted
+    return inserted, excluded
 
 
 def collect(adapter, connection, source_id, settings, *, page_size=1000, now=None):
@@ -117,6 +149,15 @@ def collect(adapter, connection, source_id, settings, *, page_size=1000, now=Non
     now = now.astimezone(timezone.utc)
     deadline = time.monotonic() + settings.max_seconds
     with source_lock(connection, source_id):
+        # Load each source-scoped rule set once; failure precedes fetching/state updates.
+        excluded_client_ips = {
+            rule["client_ip"]
+            for rule in get_active_client_filters(connection, source_id)
+            if rule["exclude_from_collection"]
+        }
+        excluded_domains = {
+            rule["domain"] for rule in get_active_domain_filters(connection, source_id)
+        }
         state = validate_state(load_state(connection, source_id))
         retention_start = now - timedelta(days=settings.retention_days)
         if (
@@ -155,7 +196,7 @@ def collect(adapter, connection, source_id, settings, *, page_size=1000, now=Non
         pending = state["pending"]
         anchor = pending["cursor"]
         anchor_ns, lower_ns = timestamp_ns(anchor), timestamp_ns(pending["lower"])
-        offset = inserted = pages = 0
+        offset = inserted = excluded = fetched = pages = 0
         group = []
         group_time = None
         previous = None
@@ -174,6 +215,7 @@ def collect(adapter, connection, source_id, settings, *, page_size=1000, now=Non
                 deadline=deadline,
             )
             pages += 1
+            fetched += len(page.events)
             ready = []
             if not page.events:
                 if page.oldest is not None:
@@ -211,7 +253,17 @@ def collect(adapter, connection, source_id, settings, *, page_size=1000, now=Non
                         )
             if ready:
                 pending["cursor"] = ready[-1].raw_timestamp
-                inserted += save_group(connection, source_id, ready, state, deadline)
+                saved, skipped = save_group(
+                    connection,
+                    source_id,
+                    ready,
+                    state,
+                    deadline,
+                    excluded_client_ips,
+                    excluded_domains,
+                )
+                inserted += saved
+                excluded += skipped
             if finished:
                 break
             # Re-anchor after complete groups, keeping offsets bounded to the
@@ -229,4 +281,9 @@ def collect(adapter, connection, source_id, settings, *, page_size=1000, now=Non
             "pending": None,
         }
         save_events(connection, source_id, [], state=completed_state)
-        return {"inserted": inserted, "pages": pages}
+        return {
+            "inserted": inserted,
+            "pages": pages,
+            "fetched": fetched,
+            "excluded": excluded,
+        }

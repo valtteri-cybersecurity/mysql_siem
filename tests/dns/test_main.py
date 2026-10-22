@@ -5,7 +5,7 @@ import pytest
 from ingestion.dns import main as entrypoint
 from ingestion.dns.collector import DNSCollectionError, DNSCollectionIncomplete
 from ingestion.dns.config import AdGuardConfig, CollectorConfig
-from ingestion.dns.db import DNSCollectionBusy
+from ingestion.dns.db import DNSCollectionBusy, DNSStorageError
 
 
 @pytest.fixture
@@ -28,14 +28,21 @@ def runtime(monkeypatch):
         monkeypatch.setattr(entrypoint, name, mocks[name])
     mocks["get_connection"].return_value = MagicMock()
     mocks["find_source"].return_value = 7
-    mocks["collect"].return_value = {"inserted": 2, "pages": 3}
+    mocks["collect"].return_value = {
+        "inserted": 2,
+        "pages": 3,
+        "fetched": 7,
+        "excluded": 4,
+    }
     mocks["purge_events"].return_value = 0
     return mocks
 
 
 def test_cli_success_cleans_up_and_reports_counts(runtime, capsys):
     assert entrypoint.main([]) == 0
-    assert "inserted=2" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    for text in ("inserted=2", "fetched=7", "excluded=4", "status=SUCCESS"):
+        assert text in output
     runtime["get_connection"].return_value.close.assert_called_once()
     runtime["purge_events"].assert_called_once()
 
@@ -46,6 +53,7 @@ def test_cli_success_cleans_up_and_reports_counts(runtime, capsys):
         (DNSCollectionBusy("busy"), 0),
         (DNSCollectionIncomplete("pending"), 2),
         (DNSCollectionError("invalid checkpoint"), 1),
+        (DNSStorageError("DNS database operation failed."), 1),
         (RuntimeError("secret-value"), 1),
     ],
 )
@@ -54,7 +62,9 @@ def test_cli_failure_codes_and_no_purge(runtime, capsys, error, status):
     assert entrypoint.main([]) == status
     runtime["purge_events"].assert_not_called()
     runtime["get_connection"].return_value.close.assert_called_once()
-    assert "secret-value" not in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "secret-value" not in output
+    assert "status=SUCCESS" not in output
 
 
 def test_register_command_does_not_fetch_or_enable(runtime):

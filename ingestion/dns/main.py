@@ -68,7 +68,9 @@ def main(argv=None):
             if count < 10000:
                 break
         log(
-            f"DNS collection complete: inserted={result['inserted']}, pages={result['pages']}, expired_deleted={deleted}."
+            f"DNS collection complete: fetched={result['fetched']}, "
+            f"inserted={result['inserted']}, excluded={result['excluded']}, "
+            f"pages={result['pages']}, expired_deleted={deleted}, status=SUCCESS."
         )
         return 0
     except DNSCollectionBusy:
