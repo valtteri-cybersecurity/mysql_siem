@@ -19,3 +19,7 @@ __pycache__/
 # Virtual environments
 .venv/
 venv/
+
+# Detection configuration and rotated logs
+/config/port_scan.env
+*.log.[0-9]*

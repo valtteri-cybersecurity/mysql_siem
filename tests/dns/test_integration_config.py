@@ -107,6 +107,30 @@ def test_installer_embedded_python_compiles():
         ({"dns_sources", "dns_events", "dns_collection_state"}, True),
         ({"dns_sources"}, False),
         ({"unexpected"}, False),
+        ({"detection_rules", "detection_alerts", "alert_evidence"}, True),
+        (
+            {
+                "detection_rules",
+                "detection_alerts",
+                "alert_evidence",
+                "detection_state",
+            },
+            True,
+        ),
+        (
+            {
+                "dns_sources",
+                "dns_events",
+                "dns_collection_state",
+                "detection_rules",
+                "detection_alerts",
+                "alert_evidence",
+                "detection_state",
+            },
+            True,
+        ),
+        ({"detection_rules"}, False),
+        ({"detection_state"}, False),
     ],
 )
 def test_both_installer_schema_guards_accept_only_complete_dns(extra, allowed):
@@ -125,7 +149,8 @@ def test_both_installer_schema_guards_accept_only_complete_dns(extra, allowed):
             for assignment in ast.walk(tree):
                 if isinstance(assignment, ast.Assign) and any(
                     isinstance(target, ast.Name)
-                    and target.id in {"expected", "dns_tables"}
+                    and target.id
+                    in {"expected", "dns_tables", "detection_tables", "state_tables"}
                     for target in assignment.targets
                 ):
                     for target in assignment.targets:
@@ -192,7 +217,7 @@ def test_dns_cron_template_is_inactive():
 def test_installer_creates_only_absent_dns_schema(table_count):
     installer = (ROOT / "install.sh").read_text()
     start = installer.index("# Create DNS tables once;")
-    end = installer.index("# Verify tables and migrate", start)
+    end = installer.index("# Detection schema:", start)
     block = installer[start:end].replace("/usr/bin/mysql", "mock_mysql")
     script = (
         r"""

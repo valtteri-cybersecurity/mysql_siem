@@ -1,0 +1,3 @@
+# Replace /absolute/path/mysql_siem with the project directory.
+# Apply migrations and permissions first. This example does not activate cron.
+# * * * * * cd "/absolute/path/mysql_siem" && PYTHONPATH="/absolute/path/mysql_siem" "/absolute/path/mysql_siem/config/run_with_env.sh" --port-scan /usr/bin/python3 -m detection.port_scan.main --log-file "/absolute/path/mysql_siem/detection/port_scan/cron.log"

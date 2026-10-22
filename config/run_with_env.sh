@@ -107,10 +107,32 @@ load_adguard_env() {
 
 load_mysql_env "$PROJECT_DIR/config/mysql.env"
 
+load_port_scan_env() {
+    local env_file="$PROJECT_DIR/config/port_scan.env"
+    local line key value
+    [[ -f "$env_file" ]] || return 0
+    unset PORT_SCAN_BATCH_SIZE PORT_SCAN_LATE_SECONDS PORT_SCAN_MAX_BUFFER_EVENTS
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" == *=* ]] || { printf 'Invalid port-scan configuration.\n' >&2; return 1; }
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "$key" in
+            PORT_SCAN_BATCH_SIZE|PORT_SCAN_LATE_SECONDS|PORT_SCAN_MAX_BUFFER_EVENTS)
+                export "$key=$value" ;;
+            *) printf 'Unknown port-scan configuration key.\n' >&2; return 1 ;;
+        esac
+    done < "$env_file"
+}
+
 # Explicit opt-in keeps unrelated collectors independent of DNS configuration.
 if [[ "${1:-}" == "--dns" ]]; then
     shift
     load_adguard_env
+fi
+if [[ "${1:-}" == "--port-scan" ]]; then
+    shift
+    load_port_scan_env
 fi
 if [[ "$#" == "0" ]]; then
     printf 'A command is required.\n' >&2

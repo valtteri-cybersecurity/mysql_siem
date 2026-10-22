@@ -89,6 +89,10 @@ for path in \
     config/run_with_env.sh \
     database/migrations/001_ufw_state_file_identity.sql \
     database/migrations/002_dns_telemetry.sql \
+    database/migrations/003_detection_alerts.sql \
+    database/migrations/004_detection_state.sql \
+    config/port_scan.env.example \
+    detection/port_scan/main.py \
     ingestion/dns/main.py \
     ingestion/ufw_to_mysql.py \
     metrics/system/main.py \
@@ -202,7 +206,14 @@ try:
                 "ufw_daily_actions_counts", "ufw_log", "ufw_state",
             }
             dns_tables = {"dns_sources", "dns_events", "dns_collection_state"}
-            if existing not in (expected, expected | dns_tables):
+            detection_tables = {"detection_rules", "detection_alerts", "alert_evidence"}
+            state_tables = {"detection_state"}
+            if existing not in (
+                expected, expected | dns_tables,
+                expected | detection_tables, expected | dns_tables | detection_tables,
+                expected | detection_tables | state_tables,
+                expected | dns_tables | detection_tables | state_tables,
+            ):
                 raise SystemExit(
                     "The database has a partial or unexpected schema. "
                     f"Tables: {sorted(existing)}. Correct the schema manually before continuing."
@@ -213,10 +224,6 @@ try:
         escaped_password = conn.escape(password)
         cur.execute(
             f"CREATE USER IF NOT EXISTS '{db_user}'@'localhost' "
-            f"IDENTIFIED BY {escaped_password}"
-        )
-        cur.execute(
-            f"ALTER USER '{db_user}'@'localhost' "
             f"IDENTIFIED BY {escaped_password}"
         )
 finally:
@@ -249,6 +256,24 @@ case "$DNS_TABLE_COUNT" in
         ;;
 esac
 
+# Detection schema: automatic provisioning is restricted to a new database.
+# Existing installations must apply 003/004 explicitly before enabling detection.
+DETECTION_READY=0
+if [[ "$TABLE_COUNT" == "0" ]]; then
+    log "Creating detection tables in the new database."
+    /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/003_detection_alerts.sql"
+    /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/004_detection_state.sql"
+    DETECTION_READY=1
+else
+    DETECTION_TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
+        -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name IN ('detection_rules', 'detection_alerts', 'alert_evidence', 'detection_state')")"
+    if [[ "$DETECTION_TABLE_COUNT" == "4" ]]; then
+        DETECTION_READY=1
+    else
+        warn "Detection not scheduled: apply detection migrations 003/004 manually first."
+    fi
+fi
+
 # Verify tables and migrate the existing ufw_state tracking columns.
 /usr/bin/python3 - "$PROJECT_DIR/database/migrations/001_ufw_state_file_identity.sql" <<'PY'
 import os
@@ -270,7 +295,14 @@ try:
         cur.execute("SHOW TABLES")
         actual = {row[0] for row in cur.fetchall()}
     dns_tables = {"dns_sources", "dns_events", "dns_collection_state"}
-    if actual not in (expected, expected | dns_tables):
+    detection_tables = {"detection_rules", "detection_alerts", "alert_evidence"}
+    state_tables = {"detection_state"}
+    if actual not in (
+        expected, expected | dns_tables,
+        expected | detection_tables, expected | dns_tables | detection_tables,
+        expected | detection_tables | state_tables,
+        expected | dns_tables | detection_tables | state_tables,
+    ):
         raise SystemExit(
             f"Schema tables do not match. Missing: {sorted(expected-actual)}; "
             f"extra: {sorted(actual-expected)}"
@@ -350,6 +382,14 @@ try:
                 "dns_events": "SELECT, INSERT, DELETE",
                 "dns_collection_state": "SELECT, INSERT, UPDATE",
             })
+        detection_tables = {"detection_rules", "detection_alerts", "alert_evidence", "detection_state"}
+        if detection_tables <= actual:
+            grants.update({
+                "detection_rules": "SELECT",
+                "detection_alerts": "SELECT, INSERT, UPDATE",
+                "alert_evidence": "SELECT, INSERT",
+                "detection_state": "SELECT, INSERT, UPDATE",
+            })
         for table, privileges in grants.items():
             cur.execute(
                 f"GRANT {privileges} ON `{db_name}`.`{table}` "
@@ -364,6 +404,18 @@ PY
 chmod 750 "$PROJECT_DIR/config/run_with_env.sh"
 chown "$INSTALL_USER:$(id -gn "$INSTALL_USER")" \
     "$PROJECT_DIR/config/run_with_env.sh"
+
+# Schedule one bounded detection pass; the application holds a database lock.
+PORT_SCAN_CRON=""
+if [[ "$DETECTION_READY" == "1" ]]; then
+    if [[ ! -f "$PROJECT_DIR/config/port_scan.env" ]]; then
+        cp "$PROJECT_DIR/config/port_scan.env.example" "$PROJECT_DIR/config/port_scan.env"
+    fi
+    chmod 600 "$PROJECT_DIR/config/port_scan.env"
+    touch "$PROJECT_DIR/detection/port_scan/cron.log"
+    chmod 600 "$PROJECT_DIR/detection/port_scan/cron.log"
+    PORT_SCAN_CRON="* * * * * cd \"$PROJECT_DIR\" && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --port-scan /usr/bin/python3 -m detection.port_scan.main --log-file \"$PROJECT_DIR/detection/port_scan/cron.log\""
+fi
 
 # DNS is optional: configured installations use the same interpreter and cron block.
 DNS_CRON=""
@@ -433,6 +485,7 @@ $CRON_BEGIN
 */5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/analysis/attacking_ips/main.py" >> "$PROJECT_DIR/analysis/attacking_ips/cron.log" 2>&1
 2 13 * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/analysis/daily_counts/daily_counts.py" >> "$PROJECT_DIR/analysis/daily_counts/cron.log" 2>&1
 3 13 * * * cd "$PROJECT_DIR/analysis/targeted_ports" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 main.py >> "$PROJECT_DIR/analysis/targeted_ports/cron.log" 2>&1
+$PORT_SCAN_CRON
 $DNS_CRON
 $CRON_END
 CRON
