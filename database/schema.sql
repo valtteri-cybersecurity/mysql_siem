@@ -72,34 +72,34 @@ CREATE TABLE `system_metrics` (
 /*!40101 SET character_set_client = @saved_cs_client */;
 
 --
--- Table structure for table `top_attacking_ips`
+-- Table structure for table `analysis_ufw_ports`
 --
 
-DROP TABLE IF EXISTS `top_attacking_ips`;
-/*!40101 SET @saved_cs_client     = @@character_set_client */;
-/*!50503 SET character_set_client = utf8mb4 */;
-CREATE TABLE `top_attacking_ips` (
-  `metric_date` date NOT NULL,
-  `src_ip` varchar(45) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `hits` bigint unsigned NOT NULL DEFAULT '0',
-  PRIMARY KEY (`metric_date`,`src_ip`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-/*!40101 SET character_set_client = @saved_cs_client */;
-
---
--- Table structure for table `top_targeted_ports`
---
-
-DROP TABLE IF EXISTS `top_targeted_ports`;
-/*!40101 SET @saved_cs_client     = @@character_set_client */;
-/*!50503 SET character_set_client = utf8mb4 */;
-CREATE TABLE `top_targeted_ports` (
-  `metric_date` date NOT NULL,
-  `dst_port` int unsigned NOT NULL,
-  `hits` bigint unsigned NOT NULL DEFAULT '0',
-  PRIMARY KEY (`metric_date`,`dst_port`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-/*!40101 SET character_set_client = @saved_cs_client */;
+CREATE TABLE IF NOT EXISTS analysis_ufw_ports (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    period_start DATETIME(6) NOT NULL,
+    period_end DATETIME(6) NOT NULL,
+    destination_ip VARCHAR(45) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    destination_port SMALLINT UNSIGNED NOT NULL,
+    protocol VARCHAR(3) CHARACTER SET ascii COLLATE ascii_bin NOT NULL,
+    total_events BIGINT UNSIGNED NOT NULL,
+    blocked_events BIGINT UNSIGNED NOT NULL,
+    allowed_events BIGINT UNSIGNED NOT NULL,
+    audited_events BIGINT UNSIGNED NOT NULL,
+    unique_source_ips BIGINT UNSIGNED NOT NULL,
+    first_seen DATETIME(6) NOT NULL,
+    last_seen DATETIME(6) NOT NULL,
+    updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+    PRIMARY KEY (id),
+    UNIQUE KEY uq_ufw_ports_period (period_start, period_end, destination_ip, destination_port, protocol),
+    KEY idx_ufw_ports_history (destination_port, protocol, destination_ip, period_start, period_end),
+    CONSTRAINT chk_ufw_ports_period CHECK (period_start < period_end),
+    CONSTRAINT chk_ufw_ports_seen CHECK (
+        first_seen >= period_start AND first_seen <= last_seen AND last_seen < period_end
+    ),
+    CONSTRAINT chk_ufw_ports_port CHECK (destination_port BETWEEN 1 AND 65535),
+    CONSTRAINT chk_ufw_ports_protocol CHECK (protocol IN ('TCP', 'UDP'))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
 --
 -- Table structure for table `ufw_daily_actions_counts`

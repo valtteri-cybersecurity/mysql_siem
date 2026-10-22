@@ -95,6 +95,9 @@ for path in \
     database/migrations/006_dns_domain_filters.sql \
     database/migrations/007_auth_events.sql \
     database/migrations/008_ssh_brute_force_rule.sql \
+    database/migrations/009_analysis_source_ips.sql \
+    database/migrations/010_drop_top_attacking_ips.sql \
+    database/migrations/011_analysis_ufw_ports.sql \
     config/ssh.env.example \
     ingestion/auth/main.py \
     detection/ssh_brute_force/main.py \
@@ -105,9 +108,11 @@ for path in \
     metrics/system/main.py \
     metrics/filesystem/main.py \
     metrics/security/main.py \
-    analysis/attacking_ips/main.py \
-    analysis/daily_counts/daily_counts.py \
-    analysis/targeted_ports/main.py
+    analysis/ufw/__init__.py \
+    analysis/ufw/source_ips.py \
+    analysis/ufw/ports.py \
+    analysis/ufw/main.py \
+    analysis/daily_counts/daily_counts.py
 do
     [[ -f "$PROJECT_DIR/$path" ]] || die "Required file is missing: $path"
 done
@@ -209,7 +214,7 @@ try:
             existing = {row[0] for row in cur.fetchall()}
             expected = {
                 "filesystem_metrics", "security_metrics", "system_metrics",
-                "top_attacking_ips", "top_targeted_ports",
+                "analysis_ufw_ports",
                 "ufw_daily_actions_counts", "ufw_log", "ufw_state",
             }
             dns_tables = {"dns_sources", "dns_events", "dns_collection_state"}
@@ -221,6 +226,7 @@ try:
             if existing & auth_tables not in (set(), auth_tables):
                 raise SystemExit("The auth schema is incomplete; inspect it manually.")
             existing -= auth_tables
+            existing.discard("analysis_source_ips")
             if existing not in (
                 expected, expected | dns_tables,
                 expected | detection_tables, expected | dns_tables | detection_tables,
@@ -238,7 +244,8 @@ try:
             ):
                 raise SystemExit(
                     "The database has a partial or unexpected schema. "
-                    f"Tables: {sorted(existing)}. Correct the schema manually before continuing."
+                    f"Tables: {sorted(existing)}. Correct the schema manually before continuing. "
+                    "For old analysis schemas, apply migrations 009/010 and 011 first."
                 )
             print("SCHEMA_EXISTS")
 
@@ -338,7 +345,7 @@ import pymysql
 
 expected = {
     "filesystem_metrics", "security_metrics", "system_metrics",
-    "top_attacking_ips", "top_targeted_ports",
+    "analysis_ufw_ports",
     "ufw_daily_actions_counts", "ufw_log", "ufw_state",
 }
 conn = pymysql.connect(
@@ -359,6 +366,7 @@ try:
     if actual & auth_tables not in (set(), auth_tables):
         raise SystemExit("The auth schema is incomplete; inspect it manually.")
     actual -= auth_tables
+    actual.discard("analysis_source_ips")
     if actual not in (
         expected, expected | dns_tables,
         expected | detection_tables, expected | dns_tables | detection_tables,
@@ -376,7 +384,8 @@ try:
     ):
         raise SystemExit(
             f"Schema tables do not match. Missing: {sorted(expected-actual)}; "
-            f"extra: {sorted(actual-expected)}"
+            f"extra: {sorted(actual-expected)}. "
+            "For old analysis schemas, apply migrations 009/010 and 011 first."
         )
     with conn.cursor() as cur:
         cur.execute("SHOW COLUMNS FROM ufw_state")
@@ -419,6 +428,38 @@ finally:
     conn.close()
 PY
 
+# Source IP Analysis schema: create the replacement on new installations only.
+SOURCE_IP_ANALYSIS_READY=0
+if [[ "$TABLE_COUNT" == "0" ]]; then
+    log "Creating Source IP Analysis summaries in the new database."
+    /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/database/migrations/009_analysis_source_ips.sql"
+    SOURCE_IP_ANALYSIS_READY=1
+else
+    ANALYSIS_TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
+        -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name='analysis_source_ips'")"
+    if [[ "$ANALYSIS_TABLE_COUNT" == "1" ]]; then
+        SOURCE_IP_ANALYSIS_READY=1
+    else
+        warn "Source IP Analysis not scheduled: apply migration 009 before the approved installer run."
+    fi
+fi
+
+# Port Activity Analysis schema: migration 011 is manual on existing installs.
+PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 - <<'PY_CHECK_PORTS'
+import os
+import pymysql
+from analysis.ufw.ports import PortAnalysisError, validate_ports_schema
+
+conn = pymysql.connect(unix_socket="/run/mysqld/mysqld.sock", user="root", database=os.environ["DB_NAME"])
+try:
+    validate_ports_schema(conn)
+except PortAnalysisError as error:
+    raise SystemExit(str(error))
+finally:
+    conn.close()
+PY_CHECK_PORTS
+PORT_ANALYSIS_READY=1
+
 # SSH schema: provision new databases only; existing installations opt in manually.
 SSH_READY=0
 if [[ "$TABLE_COUNT" == "0" && "$DETECTION_READY" == "1" ]]; then
@@ -453,8 +494,7 @@ grants = {
     "filesystem_metrics": "SELECT, INSERT, UPDATE",
     "security_metrics": "SELECT, INSERT, UPDATE",
     "system_metrics": "SELECT, INSERT",
-    "top_attacking_ips": "SELECT, INSERT, UPDATE",
-    "top_targeted_ports": "SELECT, INSERT, UPDATE",
+    "analysis_ufw_ports": "SELECT, INSERT, DELETE",
     "ufw_daily_actions_counts": "SELECT, INSERT, UPDATE",
     "ufw_log": "SELECT, INSERT",
     "ufw_state": "SELECT, INSERT, UPDATE",
@@ -491,6 +531,8 @@ try:
                 "auth_events": "SELECT, INSERT",
                 "auth_ingestion_state": "SELECT, INSERT, UPDATE",
             })
+        if "analysis_source_ips" in actual:
+            grants["analysis_source_ips"] = "SELECT, INSERT, DELETE"
         for table, privileges in grants.items():
             cur.execute(
                 f"GRANT {privileges} ON `{db_name}`.`{table}` "
@@ -554,6 +596,23 @@ if [[ "${SSH_READY:-0}" == "1" ]]; then
     SSH_DETECTION_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh /usr/bin/python3 -m detection.ssh_brute_force.main --automatic --log-file \"$PROJECT_DIR/detection/ssh_brute_force/cron.log\""
 fi
 
+# Schedule UFW Analysis; a single job runs both ready analyses with bounded logs.
+UFW_ANALYSIS_CRON=""
+UFW_ANALYSIS_OPTIONS=""
+if [[ "${SOURCE_IP_ANALYSIS_READY:-0}" == "1" && "${PORT_ANALYSIS_READY:-0}" == "1" ]]; then
+    UFW_ANALYSIS_OPTIONS="--all --recent-hours 3"
+elif [[ "${PORT_ANALYSIS_READY:-0}" == "1" ]]; then
+    UFW_ANALYSIS_OPTIONS="--ports --recent-hours 3"
+elif [[ "${SOURCE_IP_ANALYSIS_READY:-0}" == "1" ]]; then
+    UFW_ANALYSIS_OPTIONS="--recent-hours 2"
+fi
+if [[ -n "$UFW_ANALYSIS_OPTIONS" ]]; then
+    mkdir -p "$PROJECT_DIR/analysis/ufw"
+    touch "$PROJECT_DIR/analysis/ufw/cron.log"
+    chmod 600 "$PROJECT_DIR/analysis/ufw/cron.log"
+    UFW_ANALYSIS_CRON="*/5 * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" /usr/bin/python3 -m analysis.ufw.main $UFW_ANALYSIS_OPTIONS --log-file \"$PROJECT_DIR/analysis/ufw/cron.log\""
+fi
+
 # Set application ownership without changing ownership of .git.
 find "$PROJECT_DIR" -path "$PROJECT_DIR/.git" -prune -o \
     -type f ! -path "$ENV_FILE" -exec chown "$INSTALL_USER:$(id -gn "$INSTALL_USER")" {} +
@@ -605,9 +664,8 @@ $CRON_BEGIN
 */5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/metrics/system/main.py" >> "$PROJECT_DIR/metrics/system/cron.log" 2>&1
 */5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/metrics/filesystem/main.py" >> "$PROJECT_DIR/metrics/filesystem/cron.log" 2>&1
 */5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 -m metrics.security.main >> "$PROJECT_DIR/metrics/security/cron.log" 2>&1
-*/5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/analysis/attacking_ips/main.py" >> "$PROJECT_DIR/analysis/attacking_ips/cron.log" 2>&1
+${UFW_ANALYSIS_CRON:-}
 2 13 * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/analysis/daily_counts/daily_counts.py" >> "$PROJECT_DIR/analysis/daily_counts/cron.log" 2>&1
-3 13 * * * cd "$PROJECT_DIR/analysis/targeted_ports" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 main.py >> "$PROJECT_DIR/analysis/targeted_ports/cron.log" 2>&1
 $PORT_SCAN_CRON
 ${SSH_AUTH_CRON:-}
 ${SSH_DETECTION_CRON:-}

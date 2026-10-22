@@ -11,7 +11,8 @@ The project combines Linux system monitoring, firewall logs, and DNS activity in
 - **System Monitoring** — Collects CPU, memory, disk usage, uptime, and filesystem metrics.
 - **Firewall Monitoring** — Collects and analyzes UFW firewall events, blocked connections, and network activity.
 - **DNS Monitoring** — Integrates with AdGuard Home to collect and analyze DNS queries, with configurable filtering and data retention.
-- **Security Analysis** — Uses Python and SQL to identify patterns in collected security events.
+- **Port Activity Analysis** — Summarizes UFW activity by destination device, port, protocol and historical interval. See [usage and migration](#ufw-port-activity-analysis).
+- **Source IP Analysis** — Stores interval-based UFW activity summaries, including internal and IPv6 sources, for future behavior analysis. See [usage and migration](#ufw-source-ip-analysis).
 - **SSH Brute Force Detection** — Collects SSH password failures and supports scheduled SOC detection with durable checkpoints. See [configuration and deployment](#ssh-brute-force-detection).
 - **Threat Detection** — Detects potential port-scanning activity and stores security alerts with supporting event data.
 - **Automated Collection** — Uses scheduled background tasks to collect and process data.
@@ -61,6 +62,219 @@ Run the installation script in a dedicated test environment after reviewing it:
 The installation script prepares the database, required dependencies, and scheduled monitoring tasks.
 
 Additional configuration is required for integrations such as AdGuard Home.
+
+## UFW Source IP Analysis
+
+`analysis/ufw/main.py` is the shared entry point for UFW analysis. `source_ips.py` describes activity without labeling sources as attackers. Detection
+applies security rules and produces SOC alerts; this analysis produces neither alerts
+nor anomaly scores. Daily counts, SSH and port scan logic remain independent. Port summaries are
+provided by the separate `ports.py` analysis in the same entry point.
+
+For each valid source IP and explicit interval, `analysis_source_ips` stores:
+
+- Total events and separate BLOCK, ALLOW and AUDIT counts.
+- Unique destination ports and destination IPs.
+- First/last event times and separate TCP/UDP counts.
+
+All fields come from `ufw_log`; its raw schema is unchanged. Private, loopback,
+link-local and IPv6 sources are included. IP spellings are normalized. Missing or
+invalid sources are skipped. Unknown actions/protocols still contribute to totals;
+only the named counters are selective. Missing/invalid destinations do not discard
+the source event, but do not contribute to distinct counts. Port 0 means missing.
+
+### Manual runs and stored results
+
+Run from the project root after schema preparation:
+
+```bash
+bash config/run_with_env.sh /usr/bin/python3 -m analysis.ufw.main \
+  --start '2026-10-21 00:00:00' --end '2026-10-22 00:00:00'
+bash config/run_with_env.sh /usr/bin/python3 -m analysis.ufw.main --recent-hours 2
+```
+
+Intervals use `start <= event_time < end`. Supply naive timestamps in the **existing
+UFW `event_time` time basis**, without UTC conversion or an offset. This differs
+from the UTC convention used by SSH. Automatic runs use the host's naive clock;
+ensure it matches the UFW timestamps before scheduling. The API accepts any valid
+historical interval, including hourly, daily, 7/30/90-day and calendar-month ranges,
+without a current-day or 30-day cutoff:
+
+```python
+from analysis.ufw.source_ips import analyze_source_ips, run_source_ip_analysis
+
+# Use the project's get_connection() and naive datetime bounds.
+metrics = analyze_source_ips(connection, start_time, end_time)  # Read-only dictionaries.
+summary = run_source_ip_analysis(connection, start_time, end_time)  # Save atomically.
+```
+
+The read-only caller owns its transaction; saving requires a dedicated connection.
+Queries stream only the necessary fields from the indexed raw time range. Python
+keeps counters and sets of distinct destinations. The default safety limit is
+100,000 raw rows per interval, including invalid-source rows; exceeding it fails
+without saving a partial result. Split large intervals or set `--max-events`
+within 1..1000000. No full-history backfill runs automatically.
+
+The primary key is `(period_start, period_end, source_ip)`. Each successful save
+replaces **only the exact interval** in one transaction, including removing stale
+sources or clearing an interval that is now empty. Other periods and raw events
+remain unchanged. A named MySQL lock serializes analysis runs; contention reports
+`SKIPPED`. Failed writes roll back. Detection locks/state are independent.
+
+```sql
+SELECT source_ip, total_events, blocked_events, allowed_events, audited_events,
+       unique_destination_ports, unique_destination_ips, first_seen, last_seen,
+       tcp_events, udp_events
+FROM analysis_source_ips
+WHERE period_start = '2026-10-21 00:00:00'
+  AND period_end = '2026-10-22 00:00:00'
+ORDER BY total_events DESC, source_ip;
+```
+
+The source-history index supports comparisons over time. Use one consistent
+interval size for future baselines; overlapping hourly/daily summaries describe
+some of the same events. Distinct counts cannot be summed to obtain a larger
+interval's distinct count: recompute that interval from raw events. Missing raw
+history cannot be reconstructed from summaries.
+
+### Migration and scheduling
+
+On an existing installation, apply [migration 009](database/migrations/009_analysis_source_ips.sql)
+and then [migration 010](database/migrations/010_drop_top_attacking_ips.sql) before
+switching the deployed code and managed cron job:
+
+```bash
+sudo mysql mysql_siem < database/migrations/009_analysis_source_ips.sql
+sudo mysql mysql_siem < database/migrations/010_drop_top_attacking_ips.sql
+```
+
+Migration 009 creates the new `analysis_source_ips` table and indexes. Migration
+010 **permanently deletes `top_attacking_ips` and its old history**. No legacy
+summaries are copied. Both migrations can be repeated; existing new summaries
+and UFW raw events are preserved. Rebuild any desired historical intervals from
+retained raw events using the manual command above. MySQL DDL commits implicitly;
+inspect pre-existing definitions or a partially applied migration before retrying.
+Do not import `database/schema.sql` as an upgrade: it is for new databases only.
+
+After schema preparation, an installer run provisions table-scoped
+SELECT/INSERT/DELETE permissions and replaces the old `analysis/attacking_ips/main.py`
+job in this installation's managed cron block. Other user jobs are preserved;
+review any manually added legacy job outside that block separately. Existing
+passwords and already granted permissions are preserved. The installer requires
+legacy-table cleanup, gives no grants on that table and never creates it on new
+installations. New empty databases receive migration 009 during installation.
+Existing installations require the migration commands above; the installer does
+not automatically run those migrations on an existing database. Current installers
+also require the Port Activity migration described below.
+
+The shared job runs **every five minutes** with `--all --recent-hours 3`, refreshing
+the current provisional hour and two previous hours for both analyses.
+`--recent-hours` supports 1..24. The original command without a selection flag
+still runs Source IP Analysis only and defaults to 2 hours; `--ports` and `--all`
+default to 3 hours. Delayed events outside those buckets
+need an explicit historical rerun. The job uses the project directory, environment
+loader, `/usr/bin/python3`, `PYTHONPATH` and `umask 077`. Logs go to
+`analysis/ufw/cron.log` with 1 MB rotation and three backups. They include interval,
+source/event counts, status and start/finish times. Use `--log-file PATH` for manual
+file output; set `umask 077`. Exit codes are 0 for success/expected skip, 1 for
+operational failure and 2 for invalid arguments. `--help` needs no database.
+
+### History and future analysis
+
+The future project retention target is **at least six calendar months** of DNS,
+UFW and SSH raw events, and **at least 12 months** of analysis summaries. This
+analysis adds no raw-event purge or rolling historical cutoff. No runtime UFW-history deletion was
+found in the current code. DNS retains its existing mechanism (30 days by default),
+so it does not yet meet the new target. A common retention policy, bounded history
+backfill, daily/longer-term scheduling, normal-behavior models and anomaly scoring
+remain separate future work.
+
+## UFW Port Activity Analysis
+
+`analysis/ufw/ports.py` describes activity for each **destination IP, destination
+port, protocol and explicit time interval**. It replaces `analysis/targeted_ports/`
+and `top_targeted_ports`. TCP and UDP on the same port, and different destination
+devices, remain separate. It stores total/BLOCK/ALLOW/AUDIT event counts, unique
+source IPs and first/last event times in `analysis_ufw_ports`.
+
+Accepted targets have a valid IPv4/IPv6 address, a port in 1..65535 and the recorded
+protocol TCP or UDP. Port 0 is the raw table's missing-port marker. Missing/invalid
+targets, missing ports and unsupported protocols are skipped; no sentinel IP or
+NULL is put in the unique key. All actions contribute to totals, including unknown
+actions. Missing/invalid source IPs count as target activity but not as unique
+sources. Valid source IPs include private addresses; equivalent IP spellings merge.
+The existing UFW raw schema and its naive time basis are unchanged.
+
+Run from the project root with the usual environment loader:
+
+```bash
+bash config/run_with_env.sh /usr/bin/python3 -m analysis.ufw.main --ports
+bash config/run_with_env.sh /usr/bin/python3 -m analysis.ufw.main --source-ips
+bash config/run_with_env.sh /usr/bin/python3 -m analysis.ufw.main --all --recent-hours 6
+bash config/run_with_env.sh /usr/bin/python3 -m analysis.ufw.main --ports \
+  --start '2026-10-21 00:00:00' --end '2026-10-22 00:00:00'
+```
+
+`aggregate_ports(events, start_time, end_time)` is the pure function;
+`analyze_ports(connection, start_time, end_time)` returns read-only dictionaries;
+`run_port_analysis(connection, start_time, end_time)` atomically saves them with a
+dedicated connection. Bounds are `[start, end)`. Streaming, raw-row limits and
+historical-range support follow Source IP Analysis. A save replaces only the exact
+interval, including removing vanished groups on empty/corrected reruns. Port runs
+have their own MySQL lock. `--all` saves analyses/intervals separately: completed
+intervals remain committed if a later one fails. No SOC alerts or anomaly scores
+are produced; Port Scan Detection continues reading raw UFW events independently.
+
+The unique key is `(period_start, period_end, destination_ip, destination_port,
+protocol)`. A port/protocol/destination/time index supports history lookups. The
+numeric `id` is internal and can change on recomputation. Explicit period bounds
+allow hourly, daily, 7/30/90/180-day and longer comparisons with at least 12 months
+of stored history; no rolling deletion is added. Compare one consistent interval
+size. **Do not sum hourly `unique_source_ips` to obtain daily unique sources**;
+recompute the required interval from raw events instead.
+
+### Existing installation upgrade
+
+1. Disable the old targeted_ports cron line, including any manually added copy,
+   and wait for its running process to finish. Keep unrelated jobs running. If
+   Source IP migration 009/010 has not been applied, complete that upgrade first.
+2. Apply [migration 011](database/migrations/011_analysis_ufw_ports.sql) using the
+   MySQL client and an account with DDL/routine privileges:
+
+   ```bash
+   sudo mysql mysql_siem < database/migrations/011_analysis_ufw_ports.sql
+   ```
+
+3. Deploy the updated files and run the reviewed installer as the existing app
+   owner through sudo. It grants SELECT/INSERT/DELETE on the new table, replaces
+   its managed UFW job with `--all --recent-hours 3`, and removes its old port job.
+   Unrelated cron entries and the daily-count job are preserved.
+
+The migration creates and validates the replacement's columns, engine, keys and
+constraints **before permanently dropping `top_targeted_ports`**. A wrong existing
+replacement aborts without changing its data or retiring the old table. Inspect
+and correct that schema before retrying. MySQL DDL commits implicitly; the whole
+migration cannot be undone with rollback. Old aggregates are not copied and are
+irrecoverable without a prior backup or corresponding raw events. Repeated runs
+preserve existing new results and raw UFW/Source IP data. Only the explicitly
+replaced old table is dropped. A fresh installation contains only the new port
+table and does not execute this destructive upgrade. Never import the bootstrap
+`database/schema.sql` into an existing database.
+
+Logs share `analysis/ufw/cron.log` (1 MB, three backups), with analysis name, period,
+accepted-event/group counts and status. The default three-hour refresh revisits
+late events in those buckets only. Older late arrivals require an explicit manual
+range; increase `--recent-hours` up to 24 when needed. No automatic long-history
+backfill runs. Inspect a specific interval without mixing aggregation sizes:
+
+```sql
+SELECT destination_ip, destination_port, protocol, total_events,
+       blocked_events, allowed_events, audited_events, unique_source_ips,
+       first_seen, last_seen
+FROM analysis_ufw_ports
+WHERE period_start = '2026-10-21 12:00:00'
+  AND period_end = '2026-10-21 13:00:00'
+ORDER BY total_events DESC;
+```
 
 ## SSH Brute Force Detection
 
@@ -161,15 +375,15 @@ UPDATE detection_rules SET enabled = FALSE WHERE rule_key = 'SSH_BRUTE_FORCE_001
 
 ## Testing
 
-SSH tests use synthetic events. Optional MySQL tests start private servers with temporary data directories, Unix sockets and networking disabled; they do not use the collection database or perform real SSH attacks.
+Analysis and SSH tests use synthetic events. Optional MySQL tests start private servers with temporary data directories, Unix sockets and networking disabled; they do not use the collection database or perform real SSH attacks.
 
 ```bash
 .venv/bin/python -m pytest -q
-SSH_TEST_MYSQL=1 PORT_SCAN_TEST_MYSQL=1 .venv/bin/python -m pytest -q
-.venv/bin/ruff check --no-cache detection/ssh_brute_force ingestion/auth config/run_logging.py tests/ssh_brute_force
+ANALYSIS_TEST_MYSQL=1 SSH_TEST_MYSQL=1 PORT_SCAN_TEST_MYSQL=1 .venv/bin/python -m pytest -q
+.venv/bin/ruff check --no-cache detection/ssh_brute_force ingestion/auth config/run_logging.py analysis/ufw tests/ssh_brute_force tests/analysis
 ```
 
-The suite covers parser/rotation behavior, bounded collection, cross-run windows, late IDs, restart recovery, atomic rollback, lock contention, rule isolation, repeatable installer cron generation and port scan regressions. Installer tests execute isolated sections with substituted database/cron commands; they never run a real installation.
+The suite covers source-IP/port/protocol metrics, migration schema guards and retirement, historical interval boundaries, repeatable recomputation, legacy-table removal and raw-data preservation, installer cron replacement, parser/rotation behavior, bounded collection, cross-run windows, late IDs, restart recovery, atomic rollback, lock contention, rule isolation, repeatable installer cron generation and port scan regressions. Installer tests execute isolated sections with substituted database/cron commands; they never run a real installation.
 
 ## Development Roadmap
 

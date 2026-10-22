@@ -101,6 +101,7 @@ crontab() {
         "CRON_END": "# END mysql_siem managed jobs",
         "PORT_SCAN_CRON": command,
         "DNS_CRON": "*/5 * * * * echo existing-dns",
+        "UFW_ANALYSIS_CRON": "*/5 * * * * /usr/bin/python3 -m analysis.ufw.main --all --recent-hours 3",
         "TEST_CRONTAB": str(cron_file),
     }
     subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True)
@@ -115,9 +116,8 @@ crontab() {
         "metrics/system/main.py",
         "metrics/filesystem/main.py",
         "metrics.security.main",
-        "analysis/attacking_ips/main.py",
+        "analysis.ufw.main",
         "analysis/daily_counts/daily_counts.py",
-        "analysis/targeted_ports",
         "existing-dns",
     ):
         assert job in first
