@@ -54,6 +54,11 @@ getent() {
         [[ -f "$STATE" ]] || return 2
         printf 'mysql_siem:x:%s:%s::%s:%s\n' "${ACCOUNT_UID:-111}" "${ACCOUNT_GID:-222}" "${ACCOUNT_HOME:-$APP_HOME}" "${ACCOUNT_SHELL:-/usr/sbin/nologin}"
     elif [[ "$1" == group ]]; then
+        if [[ "${2:-}" == adm ]]; then
+            [[ -n "${ADM_GID:-}" ]] || return 2
+            printf 'adm:x:%s:\n' "$ADM_GID"
+            return 0
+        fi
         [[ -f "$GROUP_STATE" ]] || return 2
         printf 'mysql_siem:x:%s:%s\n' "${GROUP_GID:-222}" "${GROUP_MEMBERS:-}"
     else
@@ -187,3 +192,16 @@ def test_existing_account_gets_only_its_missing_home(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "useradd" not in calls and "groupadd" not in calls
     assert "install -d -m 750 -o mysql_siem -g mysql_siem" in calls
+
+
+@pytest.mark.parametrize("groups,adm_gid,accepted", [
+    ("222", "", True),
+    ("222 4567", "4567", True),
+    ("222 4567 9876", "4567", False),
+])
+def test_only_primary_and_optional_adm_groups_are_allowed(tmp_path, groups, adm_gid, accepted):
+    result, calls = account_setup(tmp_path, exists=True, ACCOUNT_GROUPS=groups, ADM_GID=adm_gid)
+    assert (result.returncode == 0) == accepted, result.stderr
+    if not accepted:
+        assert "supplementary groups" in result.stderr
+    assert "useradd" not in calls and "groupadd" not in calls and "install" not in calls

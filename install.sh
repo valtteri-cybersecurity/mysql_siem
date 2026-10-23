@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 # mysql_siem - Debian 13, Ubuntu and Linux Mint installation
 set -Eeuo pipefail
@@ -15,6 +14,8 @@ readonly CRON_END="# END mysql_siem managed jobs"
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly INSTALL_USER="$APP_NAME"
 readonly APP_HOME="/var/lib/mysql_siem"
+readonly VENV_DIR="/opt/mysql_siem-venv"
+readonly APP_PYTHON="$VENV_DIR/bin/python"
 ENV_FILE="$PROJECT_DIR/config/mysql.env"
 
 log()  { printf '[INFO] %s\n' "$*"; }
@@ -23,8 +24,14 @@ die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
 # Installation role selection (before any installation changes).
 select_installation_role() {
-    local selection
-    if [[ $# -eq 0 ]]; then
+    local selection stored_role=""
+    [[ ! -L "$PROJECT_DIR/config" ]] || die "Configuration directory must not be a symbolic link."
+    if [[ -e "$PROJECT_DIR/config/role.env" || -L "$PROJECT_DIR/config/role.env" ]]; then
+        stored_role="$(role_configuration read)" || die "Cannot validate the stored installation role; no installation changes were made."
+    fi
+    if [[ $# -eq 0 && -n "$stored_role" ]]; then
+        INSTALL_ROLE="$stored_role"
+    elif [[ $# -eq 0 ]]; then
         printf '%s\n' 'mysql_siem Installation
 
 1. SIEM Server
@@ -51,6 +58,56 @@ select_installation_role() {
     case "$INSTALL_ROLE" in
         server|collector) ;;
         *) die "Invalid installation role; use server or collector." ;;
+    esac
+    if [[ -n "$stored_role" && "$INSTALL_ROLE" != "$stored_role" ]]; then
+        die "Installation role conflict; the stored role will not be changed."
+    fi
+    if [[ -z "$stored_role" && "$INSTALL_ROLE" == server ]]; then
+        printf 'No persistent role exists. Confirm Server role for this new or existing installation [yes]: '
+        IFS= read -r selection || die "Server role confirmation required; no changes were made."
+        [[ "$selection" == yes ]] || die "Server role not confirmed; no changes were made."
+    fi
+}
+
+role_configuration() {
+    local action="$1"
+    if [[ "$action" == initialize ]]; then
+        runuser -u "$INSTALL_USER" -- /usr/bin/python3 -B - "$PROJECT_DIR" "$action" "$INSTALL_USER" "$INSTALL_ROLE" <<'PY_ROLE'
+import sys
+sys.path.insert(0, sys.argv[1])
+from config.installation_role_setup import main
+main(sys.argv[2:])
+PY_ROLE
+    else
+        /usr/bin/python3 -B - "$PROJECT_DIR" "$action" "$INSTALL_USER" <<'PY_ROLE'
+import sys
+sys.path.insert(0, sys.argv[1])
+from config.installation_role_setup import main
+main(sys.argv[2:])
+PY_ROLE
+    fi
+}
+
+persist_installation_role() {
+    if [[ -e "$PROJECT_DIR/config/role.env" || -L "$PROJECT_DIR/config/role.env" ]]; then
+        local stored_role
+        stored_role="$(role_configuration read)" || die "Cannot validate role ownership or permissions."
+        [[ "$stored_role" == "$INSTALL_ROLE" ]] || die "Installation role conflict."
+    else
+        role_configuration initialize || die "Role initialization failed. Check config/role.env before retrying; a complete file may exist. Installation stopped."
+    fi
+    runuser -u "$INSTALL_USER" -- test -r "$PROJECT_DIR/config/role.env" || die "Application user cannot read role.env; ownership was not changed."
+}
+
+select_role_cron_jobs() {
+    case "$INSTALL_ROLE" in
+        server) ;;
+        collector)
+            UFW_ANALYSIS_CRON=""
+            PORT_SCAN_CRON=""
+            SSH_DETECTION_CRON=""
+            ;;
+        *) die "Invalid cron installation role." ;;
     esac
 }
 # End installation role selection.
@@ -105,7 +162,7 @@ select_mysql_package() {
 
 install_dependencies() {
     local packages=(
-        python3 python3-pymysql python3-requests python3-cryptography
+        python3 python3-venv
         rsyslog cron ca-certificates openssl coreutils
     )
     if [[ -n "$MYSQL_PACKAGE" ]]; then
@@ -116,6 +173,47 @@ install_dependencies() {
     apt-get update
     log "Installing dependencies."
     apt-get install -y "${packages[@]}"
+}
+# Keep packages outside the application-owned project tree.
+validate_virtualenv_location() {
+    /usr/bin/python3 -I - "$VENV_DIR" "$PROJECT_DIR" <<'PY_VENV'
+import os
+import stat
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+if root.is_relative_to(Path(sys.argv[2]).resolve()):
+    raise SystemExit("Virtual environment must be outside the application-owned project tree.")
+paths = [Path("/"), root.parent]
+if root.exists() or root.is_symlink():
+    paths.append(root)
+    for directory, names, files in os.walk(root, followlinks=False):
+        for name in names + files:
+            paths.append(Path(directory) / name)
+for path in paths:
+    info = path.lstat()
+    if info.st_uid != 0:
+        raise SystemExit("Virtual environment paths must be root-owned.")
+    if stat.S_ISLNK(info.st_mode):
+        if path == root or path in (Path("/"), root.parent) or not path.resolve().is_relative_to(root):
+            raise SystemExit("Unsafe virtual environment symbolic link.")
+    elif info.st_mode & 0o022:
+        raise SystemExit("Virtual environment paths must not be group/other writable.")
+PY_VENV
+}
+
+install_virtualenv() {
+    validate_virtualenv_location
+    # Copies avoid external interpreter symlinks; normal users need read access.
+    (
+        umask 022
+        cd /
+        /usr/bin/python3 -I -m venv --copies "$VENV_DIR"
+        "$APP_PYTHON" -I -m pip install -r "$PROJECT_DIR/requirements-dns.txt"
+    )
+    validate_virtualenv_location
+    runuser -u "$INSTALL_USER" -- "$APP_PYTHON" -I -c 'import pymysql, requests, cryptography'
 }
 # End platform and dependency checks.
 
@@ -150,10 +248,19 @@ validate_application_user() {
         fi
     done <<< "$accounts"
     groups="$(id -G "$INSTALL_USER")" || die "Cannot check mysql_siem groups."
+    local adm_record adm_name adm_password adm_gid="" adm_members
+    if adm_record="$(getent group adm)"; then
+        IFS=: read -r adm_name adm_password adm_gid adm_members <<< "$adm_record"
+        [[ "$adm_name" == adm && "$adm_gid" =~ ^[0-9]+$ && "$adm_gid" != 0 ]] ||
+            die "Cannot validate the optional adm group."
+    else
+        status=$?
+        [[ "$status" == 2 ]] || die "Cannot look up the optional adm group."
+    fi
     local -a account_groups
     IFS=' ' read -r -a account_groups <<< "$groups"
     for group_id in "${account_groups[@]}"; do
-        [[ "$group_id" == "$group_gid" ]] ||
+        [[ "$group_id" == "$group_gid" || ( -n "$adm_gid" && "$group_id" == "$adm_gid" ) ]] ||
             die "mysql_siem has supplementary groups; review them manually instead of granting broad access."
     done
     status="$(LC_ALL=C passwd -S "$INSTALL_USER")" || die "Cannot verify mysql_siem password status."
@@ -212,6 +319,108 @@ ensure_application_user() {
         die "mysql_siem home requires owner mysql_siem:mysql_siem and mode 750; review it manually."
     log "mysql_siem account verified (created=$created)."
 }
+# Grant the service account read access to Debian/Ubuntu system logs.
+ensure_log_access() {
+    local adm_record adm_name adm_password adm_gid adm_members account_groups source
+    adm_record="$(getent group adm)" || die "The adm log-reader group is required."
+    IFS=: read -r adm_name adm_password adm_gid adm_members <<< "$adm_record"
+    [[ "$adm_name" == adm && "$adm_gid" =~ ^[0-9]+$ && "$adm_gid" != 0 ]] ||
+        die "Invalid adm group; log access was not changed."
+
+    account_groups="$(id -G "$INSTALL_USER")" || die "Cannot inspect application groups."
+    if [[ " $account_groups " != *" $adm_gid "* ]]; then
+        usermod -aG adm "$INSTALL_USER" || die "Could not grant mysql_siem adm log access."
+    fi
+    validate_application_user
+
+    for source in /var/log/auth.log /var/log/ufw.log; do
+        if [[ -e "$source" ]]; then
+            runuser -u "$INSTALL_USER" -- test -r "$source" ||
+                die "mysql_siem cannot read $source even with adm membership."
+        else
+            warn "Log source does not exist yet: $source"
+        fi
+    done
+}
+
+# Keep executable source files out of the service account's control.
+# The config directory is locked only AFTER the initial role has been written.
+secure_project_sources() {
+    local link
+    link="$(find "$PROJECT_DIR" -path "$PROJECT_DIR/.git" -prune -o -type l -print -quit)"
+    [[ -z "$link" ]] || die "Project contains an unsafe symbolic link: $link"
+    find "$PROJECT_DIR" -path "$PROJECT_DIR/.git" -prune -o \
+        -type f ! -path "$PROJECT_DIR/config/*.env" ! -name cron.log \
+        -exec chown "root:$INSTALL_USER" {} + \
+        -exec chmod 'g+rX,go-w' {} +
+    find "$PROJECT_DIR" -path "$PROJECT_DIR/.git" -prune -o \
+        -type d -exec chown "root:$INSTALL_USER" {} + \
+        -exec chmod 'g+rX,go-w' {} +
+    # root owns the directory: mysql_siem may read config, but cannot
+    # replace trusted scripts by renaming files in their parent directory.
+    chown "root:$INSTALL_USER" "$PROJECT_DIR/config"
+    chmod 750 "$PROJECT_DIR/config"
+}
+
+# Writable logs are individual files, never writable source directories.
+prepare_runtime_log() {
+    local path="$1"
+    [[ ! -L "$path" && ( ! -e "$path" || -f "$path" ) ]] ||
+        die "Invalid application log path: $path"
+    touch -- "$path" || die "Cannot create application log: $path"
+    chown "$INSTALL_USER:$INSTALL_USER" "$path"
+    chmod 600 "$path"
+}
+
+# Use file-descriptor operations so chmod/chown never follow mysql.env links.
+prepare_mysql_env() {
+    local action=existing password=""
+    if [[ ! -e "$ENV_FILE" && ! -L "$ENV_FILE" ]]; then
+        action=create
+        password="$(openssl rand -hex 32)" || die "Could not generate database password."
+    fi
+    if ! DB_PASSWORD="$password" /usr/bin/python3 -I - "$ENV_FILE" "$INSTALL_USER" "$action" <<'PY_SECURE_ENV'
+import os
+import pwd
+import stat
+import sys
+
+path, username, action = sys.argv[1:]
+account = pwd.getpwnam(username)
+if action == "create":
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+else:
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError("mysql.env must be a regular file with one hard link")
+    os.fchown(fd, account.pw_uid, account.pw_gid)
+    os.fchmod(fd, 0o600)
+    if action == "create":
+        with os.fdopen(os.dup(fd), "w") as output:
+            output.write(
+                "DB_HOST=localhost\n"
+                "DB_USER=pythonuser\n"
+                f"DB_PASSWORD={os.environ['DB_PASSWORD']}\n"
+                "DB_NAME=mysql_siem\n"
+            )
+            output.flush()
+            os.fsync(output.fileno())
+finally:
+    os.close(fd)
+PY_SECURE_ENV
+    then
+        die "Could not securely prepare mysql.env; inspect it before retrying."
+    fi
+    unset DB_PASSWORD
+    if [[ "$action" == create ]]; then
+        log "Created a new database environment file."
+    else
+        log "Keeping the existing mysql.env file."
+    fi
+}
+
 # End application account management.
 
 load_mysql_env() {
@@ -290,6 +499,8 @@ for path in \
     database/migrations/014_host_registry.sql \
     database/migrations/017_ufw_datetime_precision.sql \
     config/run_with_env.sh \
+    config/installation_role.py \
+    config/installation_role_setup.py \
     config/ssh.env.example \
     ingestion/auth/main.py \
     detection/ssh_brute_force/main.py \
@@ -312,37 +523,27 @@ done
 detect_distribution
 select_mysql_package
 ensure_application_user
+ensure_log_access
 runuser -u "$INSTALL_USER" -- test -r "$PROJECT_DIR/install.sh" || \
     die "mysql_siem cannot access the project; use an accessible path such as /opt/mysql_siem."
+[[ ! -L "$PROJECT_DIR/config" ]] || die "Configuration directory must not be a symbolic link."
+if [[ ! -e "$PROJECT_DIR/config/role.env" && ! -L "$PROJECT_DIR/config/role.env" ]]; then
+    install -d -m 750 -o "$INSTALL_USER" -g "$(id -gn "$INSTALL_USER")" "$PROJECT_DIR/config"
+fi
+persist_installation_role
+secure_project_sources
 install_dependencies
+install_virtualenv
 
 log "Starting services."
 systemctl enable --now mysql
 systemctl enable --now cron
 systemctl enable --now rsyslog
 
-/usr/bin/python3 -c 'import pymysql; print("PyMySQL OK")'
+"$APP_PYTHON" -c 'import pymysql; print("PyMySQL OK")'
 
-install -d -o "$INSTALL_USER" -g "$(id -gn "$INSTALL_USER")" \
-    "$PROJECT_DIR/config"
-
-# Create the secrets file only if it does not exist.
-if [[ ! -f "$ENV_FILE" ]]; then
-    DB_PASSWORD="$(openssl rand -hex 32)"
-    {
-        printf 'DB_HOST=localhost\n'
-        printf 'DB_USER=%s\n' "$EXPECTED_DB_USER"
-        printf 'DB_PASSWORD=%s\n' "$DB_PASSWORD"
-        printf 'DB_NAME=%s\n' "$EXPECTED_DB_NAME"
-    } > "$ENV_FILE"
-    unset DB_PASSWORD
-    log "Created a new database environment file."
-else
-    log "Keeping the existing mysql.env file."
-fi
-
-chmod 600 "$ENV_FILE"
-chown "$INSTALL_USER:$(id -gn "$INSTALL_USER")" "$ENV_FILE"
+# Create or validate the database secrets file without following symbolic links.
+prepare_mysql_env
 
 # Read configuration as data without executing its contents.
 load_mysql_env "$ENV_FILE"
@@ -359,7 +560,7 @@ load_mysql_env "$ENV_FILE"
 # Do not reimport existing tables when rerunning the installer.
 log "Checking database and schema."
 
-/usr/bin/python3 - "$ENV_FILE" "$PROJECT_DIR/$SCHEMA_REL" <<'PY'
+DB_SETUP_RESULT="$("$APP_PYTHON" - "$ENV_FILE" "$PROJECT_DIR/$SCHEMA_REL" <<'PY'
 import os
 import sys
 import pymysql
@@ -380,10 +581,14 @@ conn = pymysql.connect(
 )
 try:
     with conn.cursor() as cur:
-        cur.execute(
-            f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
-            "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-        )
+        cur.execute("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name=%s", (db_name,))
+        if cur.fetchone()[0] == 0:
+            # No IF NOT EXISTS: a concurrent creator must make this attempt fail.
+            cur.execute(
+                f"CREATE DATABASE `{db_name}` "
+                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+            )
+            print("DATABASE_CREATED_THIS_RUN")
         cur.execute(
             "SELECT COUNT(*) FROM information_schema.tables "
             "WHERE table_schema=%s",
@@ -452,6 +657,8 @@ try:
 finally:
     conn.close()
 PY
+)"
+printf '%s\n' "$DB_SETUP_RESULT"
 
 # Import the DDL schema if the database is new.
 TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
@@ -464,12 +671,19 @@ fi
 
 # Provision current UFW summaries before checking or scheduling them.
 ensure_schema() {
-    PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 -m database.schema "$1"
+    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m database.schema "$1"
 }
 
-# Read-only preflight: all migrations, including 017, must already be applied.
+# Only a database exclusively created by this attempt may migrate automatically.
+# An existing empty or partially initialized database never enters this branch.
+if [[ "$DB_SETUP_RESULT" == *$'DATABASE_CREATED_THIS_RUN\n'* && "$TABLE_COUNT" == "0" ]]; then
+    log "Initializing migrations in the database created by this installation."
+    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m database.migrate apply --admin-socket /run/mysqld/mysqld.sock
+fi
+
+# Final preflight: all migrations, including 017, must be applied.
 # The administrator uses database.migrate to make changes during maintenance.
-PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 -m database.migrate check --admin-socket /run/mysqld/mysqld.sock || \
+PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m database.migrate check --admin-socket /run/mysqld/mysqld.sock || \
     die "Database migration 013-017 required. Stop jobs, back up, and apply the versioned migrations through database.migrate before retrying."
 
 log "Checking and creating missing UFW Analysis tables."
@@ -544,7 +758,7 @@ else
 fi
 
 # Verify tables and migrate the existing ufw_state tracking columns.
-/usr/bin/python3 - <<'PY'
+"$APP_PYTHON" - <<'PY'
 import os
 import sys
 import pymysql
@@ -646,7 +860,7 @@ PY
 SOURCE_IP_ANALYSIS_READY=1
 
 # Port Activity Analysis schema: validate before grants and scheduling.
-PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 - <<'PY_CHECK_PORTS'
+PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" - <<'PY_CHECK_PORTS'
 import os
 import pymysql
 from analysis.ufw.ports import PortAnalysisError, validate_ports_schema
@@ -662,7 +876,7 @@ PY_CHECK_PORTS
 PORT_ANALYSIS_READY=1
 
 # Traffic tables are already provisioned from the current schema.
-PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 - <<'PY_CHECK_TRAFFIC'
+PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" - <<'PY_CHECK_TRAFFIC'
 import os
 import pymysql
 from analysis.ufw.traffic import TrafficAnalysisError, validate_traffic_schema
@@ -699,7 +913,7 @@ fi
 
 # Grant privileges only after the tables have been created.
 # Do not grant global privileges to the database user.
-/usr/bin/python3 - <<'PY'
+"$APP_PYTHON" - <<'PY'
 import os
 import pymysql
 
@@ -769,8 +983,6 @@ PY
 # Use the shipped environment loader; keep one implementation of DNS loading.
 
 chmod 750 "$PROJECT_DIR/config/run_with_env.sh"
-chown "$INSTALL_USER:$(id -gn "$INSTALL_USER")" \
-    "$PROJECT_DIR/config/run_with_env.sh"
 
 # Schedule one bounded detection pass; the application holds a database lock.
 PORT_SCAN_CRON=""
@@ -779,20 +991,20 @@ if [[ "$DETECTION_READY" == "1" ]]; then
         cp "$PROJECT_DIR/config/port_scan.env.example" "$PROJECT_DIR/config/port_scan.env"
     fi
     chmod 600 "$PROJECT_DIR/config/port_scan.env"
-    touch "$PROJECT_DIR/detection/port_scan/cron.log"
-    chmod 600 "$PROJECT_DIR/detection/port_scan/cron.log"
-    PORT_SCAN_CRON="* * * * * cd \"$PROJECT_DIR\" && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --port-scan /usr/bin/python3 -m detection.port_scan.main --log-file \"$PROJECT_DIR/detection/port_scan/cron.log\""
+    chown "$INSTALL_USER:$INSTALL_USER" "$PROJECT_DIR/config/port_scan.env"
+    prepare_runtime_log "$PROJECT_DIR/detection/port_scan/cron.log"
+    PORT_SCAN_CRON="* * * * * cd \"$PROJECT_DIR\" && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --port-scan \"$APP_PYTHON\" -m detection.port_scan.main --log-file \"$PROJECT_DIR/detection/port_scan/cron.log\""
 fi
 
 # DNS is optional: configured installations use the same interpreter and cron block.
 DNS_CRON=""
 if [[ -f "$PROJECT_DIR/config/adguard.env" ]]; then
     chmod 600 "$PROJECT_DIR/config/adguard.env"
+    chown "$INSTALL_USER:$INSTALL_USER" "$PROJECT_DIR/config/adguard.env"
     log "Validating DNS settings and registering the configured source."
-    "$PROJECT_DIR/config/run_with_env.sh" --dns /usr/bin/python3 -m ingestion.dns.main --register-source
-    DNS_CRON="*/5 * * * * cd \"$PROJECT_DIR\" && PYTHONPATH=\"$PROJECT_DIR\" /usr/bin/timeout --signal=TERM 270s \"$PROJECT_DIR/config/run_with_env.sh\" --dns /usr/bin/python3 -m ingestion.dns.main >> \"$PROJECT_DIR/ingestion/dns/cron.log\" 2>&1"
-    touch "$PROJECT_DIR/ingestion/dns/cron.log"
-    chmod 600 "$PROJECT_DIR/ingestion/dns/cron.log"
+    "$PROJECT_DIR/config/run_with_env.sh" --dns "$APP_PYTHON" -m ingestion.dns.main --register-source
+    DNS_CRON="*/5 * * * * cd \"$PROJECT_DIR\" && PYTHONPATH=\"$PROJECT_DIR\" /usr/bin/timeout --signal=TERM 270s \"$PROJECT_DIR/config/run_with_env.sh\" --dns \"$APP_PYTHON\" -m ingestion.dns.main >> \"$PROJECT_DIR/ingestion/dns/cron.log\" 2>&1"
+    prepare_runtime_log "$PROJECT_DIR/ingestion/dns/cron.log"
     log "DNS cron configured; new sources must be explicitly enabled before collection."
 else
     log "DNS cron skipped: configure config/adguard.env to enable integration."
@@ -807,17 +1019,17 @@ if [[ "${SSH_READY:-0}" == "1" ]]; then
     fi
     chmod 600 "$PROJECT_DIR/config/ssh.env"
     chown "$INSTALL_USER:$(id -gn "$INSTALL_USER")" "$PROJECT_DIR/config/ssh.env"
-    SSH_LOG_SOURCE="$("$PROJECT_DIR/config/run_with_env.sh" --ssh /usr/bin/python3 -c 'import os; print(os.getenv("SSH_AUTH_LOGFILE", "/var/log/auth.log"))')"
+    SSH_LOG_SOURCE="$("$PROJECT_DIR/config/run_with_env.sh" --ssh "$APP_PYTHON" -c 'import os; print(os.getenv("SSH_AUTH_LOGFILE", "/var/log/auth.log"))')"
     if [[ ! -e "$SSH_LOG_SOURCE" ]]; then
         warn "SSH log source absent; collection will report SKIPPED until it appears."
     elif ! runuser -u "$INSTALL_USER" -- test -r "$SSH_LOG_SOURCE"; then
         warn "SSH log source is not readable by the application user. Review log-group access separately."
     fi
     mkdir -p "$PROJECT_DIR/ingestion/auth" "$PROJECT_DIR/detection/ssh_brute_force"
-    touch "$PROJECT_DIR/ingestion/auth/cron.log" "$PROJECT_DIR/detection/ssh_brute_force/cron.log"
-    chmod 600 "$PROJECT_DIR/ingestion/auth/cron.log" "$PROJECT_DIR/detection/ssh_brute_force/cron.log"
-    SSH_AUTH_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh /usr/bin/python3 -m ingestion.auth.main --allow-missing-source --log-file \"$PROJECT_DIR/ingestion/auth/cron.log\""
-    SSH_DETECTION_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh /usr/bin/python3 -m detection.ssh_brute_force.main --automatic --log-file \"$PROJECT_DIR/detection/ssh_brute_force/cron.log\""
+    prepare_runtime_log "$PROJECT_DIR/ingestion/auth/cron.log"
+    prepare_runtime_log "$PROJECT_DIR/detection/ssh_brute_force/cron.log"
+    SSH_AUTH_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh \"$APP_PYTHON\" -m ingestion.auth.main --allow-missing-source --log-file \"$PROJECT_DIR/ingestion/auth/cron.log\""
+    SSH_DETECTION_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh \"$APP_PYTHON\" -m detection.ssh_brute_force.main --automatic --log-file \"$PROJECT_DIR/detection/ssh_brute_force/cron.log\""
 fi
 
 # Schedule UFW Analysis; a single job runs the ready analyses with bounded logs.
@@ -841,26 +1053,25 @@ if [[ "${TRAFFIC_ANALYSIS_READY:-0}" == "1" ]]; then
 fi
 if [[ -n "$UFW_ANALYSIS_OPTIONS" ]]; then
     mkdir -p "$PROJECT_DIR/analysis/ufw"
-    touch "$PROJECT_DIR/analysis/ufw/cron.log"
-    chmod 600 "$PROJECT_DIR/analysis/ufw/cron.log"
-    UFW_ANALYSIS_CRON="*/5 * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" /usr/bin/python3 -m analysis.ufw.main $UFW_ANALYSIS_OPTIONS --log-file \"$PROJECT_DIR/analysis/ufw/cron.log\""
+    prepare_runtime_log "$PROJECT_DIR/analysis/ufw/cron.log"
+    UFW_ANALYSIS_CRON="*/5 * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" \"$APP_PYTHON\" -m analysis.ufw.main $UFW_ANALYSIS_OPTIONS --log-file \"$PROJECT_DIR/analysis/ufw/cron.log\""
 fi
 
-# Set application ownership without changing ownership of .git.
-find "$PROJECT_DIR" -path "$PROJECT_DIR/.git" -prune -o \
-    -type f ! -path "$ENV_FILE" -exec chown "$INSTALL_USER:$(id -gn "$INSTALL_USER")" {} +
-find "$PROJECT_DIR" -path "$PROJECT_DIR/.git" -prune -o \
-    -type d ! -path "$PROJECT_DIR/config" -exec chown "$INSTALL_USER:$(id -gn "$INSTALL_USER")" {} +
+# Cron output files must remain writable after the source tree is locked down.
+prepare_runtime_log "$PROJECT_DIR/ingestion/cron.log"
+prepare_runtime_log "$PROJECT_DIR/metrics/system/cron.log"
+prepare_runtime_log "$PROJECT_DIR/metrics/filesystem/cron.log"
+prepare_runtime_log "$PROJECT_DIR/metrics/security/cron.log"
 
 log "Checking Python syntax."
 while IFS= read -r -d '' pyfile; do
-    /usr/bin/python3 -m py_compile "$pyfile"
+    "$APP_PYTHON" -m py_compile "$pyfile"
 done < <(find "$PROJECT_DIR" -type f -name '*.py' \
     -not -path '*/.git/*' -not -path '*/__pycache__/*' \
     -not -path '*/.venv/*' -not -path '*/venv/*' -print0)
 
 log "Testing the application database connection."
-"$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 - <<'PY'
+"$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" - <<'PY'
 import os
 import pymysql
 
@@ -880,11 +1091,18 @@ finally:
     conn.close()
 PY
 
+select_role_cron_jobs
+
 # Update only this installation's marked cron block.
 CRON_TMP="$(mktemp)"
 trap 'rm -f "$CRON_TMP"' EXIT
 
-(crontab -u "$INSTALL_USER" -l 2>/dev/null || true) |
+if ! CRON_EXISTING="$(LC_ALL=C crontab -u "$INSTALL_USER" -l 2>"$CRON_TMP")"; then
+    [[ "$(<"$CRON_TMP")" == "no crontab for $INSTALL_USER" ]] ||
+        die "Cannot read the existing crontab; no cron changes were made."
+    CRON_EXISTING=""
+fi
+printf '%s\n' "$CRON_EXISTING" |
     awk -v begin="$CRON_BEGIN" -v end="$CRON_END" -v project="$PROJECT_DIR" '
         $0 == begin { skip=1; next }
         $0 == end   { skip=0; next }
@@ -895,10 +1113,10 @@ trap 'rm -f "$CRON_TMP"' EXIT
 
 cat >> "$CRON_TMP" <<CRON
 $CRON_BEGIN
-* * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/ingestion/ufw_to_mysql.py" >> "$PROJECT_DIR/ingestion/cron.log" 2>&1
-*/5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/metrics/system/main.py" >> "$PROJECT_DIR/metrics/system/cron.log" 2>&1
-*/5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 "$PROJECT_DIR/metrics/filesystem/main.py" >> "$PROJECT_DIR/metrics/filesystem/cron.log" 2>&1
-*/5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" /usr/bin/python3 -m metrics.security.main >> "$PROJECT_DIR/metrics/security/cron.log" 2>&1
+* * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" "$PROJECT_DIR/ingestion/ufw_to_mysql.py" >> "$PROJECT_DIR/ingestion/cron.log" 2>&1
+*/5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" "$PROJECT_DIR/metrics/system/main.py" >> "$PROJECT_DIR/metrics/system/cron.log" 2>&1
+*/5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" "$PROJECT_DIR/metrics/filesystem/main.py" >> "$PROJECT_DIR/metrics/filesystem/cron.log" 2>&1
+*/5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" -m metrics.security.main >> "$PROJECT_DIR/metrics/security/cron.log" 2>&1
 ${UFW_ANALYSIS_CRON:-}
 $PORT_SCAN_CRON
 ${SSH_AUTH_CRON:-}

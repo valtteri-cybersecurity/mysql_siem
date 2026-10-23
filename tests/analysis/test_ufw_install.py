@@ -27,17 +27,38 @@ def test_installer_provisions_analysis_before_schema_validation_and_grants():
     schedule = INSTALLER.index("# Schedule UFW Analysis;")
     assert setup < guard < grants < schedule
     assert "-m database.migrate check" in INSTALLER
-    assert "-m database.migrate apply" not in INSTALLER
+    migration = section('# Only a database exclusively created', '# Final preflight:')
+    assert '"$TABLE_COUNT" == "0"' in migration
+    assert 'DATABASE_CREATED_THIS_RUN' in migration
+    assert "-m database.migrate apply" in migration
+    assert 'CREATE DATABASE IF NOT EXISTS' not in INSTALLER
     assert "database/schema.py" in INSTALLER
     assert "SOURCE_IP_ANALYSIS_READY=1" in section("# Source IP Analysis schema:", "# Port Activity Analysis schema:")
 
 
-def cron_command(project, ready="1", ports_ready="0"):
-    block = section("# Schedule UFW Analysis;", "# Set application ownership")
+def cron_command(project, ready="1", ports_ready="0", traffic_ready="0"):
+    block = section(
+        "# Schedule UFW Analysis;",
+        "# Cron output files must remain writable after the source tree is locked down.",
+    )
     block = block[block.index("\n") + 1:]
-    result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + block + '\nprintf "%s\\n" "$UFW_ANALYSIS_CRON"'],
-        env={**os.environ, "PROJECT_DIR": str(project), "SOURCE_IP_ANALYSIS_READY": ready, "PORT_ANALYSIS_READY": ports_ready},
-        text=True, capture_output=True, check=True)
+    log_helper = "prepare_runtime_log() {" + section(
+        "prepare_runtime_log() {", "# Use file-descriptor operations"
+    )
+    script = (
+        "set -euo pipefail\n"
+        "chown() { :; }\n"
+        + log_helper + block
+        + '\nprintf "%s\\n" "$UFW_ANALYSIS_CRON"'
+    )
+    result = subprocess.run(
+        ["bash", "-c", script],
+        env={**os.environ, "PROJECT_DIR": str(project),
+             "SOURCE_IP_ANALYSIS_READY": ready, "PORT_ANALYSIS_READY": ports_ready,
+             "TRAFFIC_ANALYSIS_READY": traffic_ready,
+             "INSTALL_USER": "test-user", "APP_PYTHON": "/opt/mysql_siem-venv/bin/python"},
+        text=True, capture_output=True, check=True,
+    )
     return result.stdout.strip()
 
 
@@ -46,7 +67,7 @@ def test_cron_prepares_environment_and_private_bounded_log(tmp_path):
     command = cron_command(project)
     assert command.startswith("*/5 * * * * ")
     assert f'cd "{project}" && umask 077 && PYTHONPATH="{project}"' in command
-    assert 'config/run_with_env.sh" /usr/bin/python3 -m analysis.ufw.main --recent-hours 2' in command
+    assert 'config/run_with_env.sh" "/opt/mysql_siem-venv/bin/python" -m analysis.ufw.main --recent-hours 2' in command
     assert f'--log-file "{project}/analysis/ufw/cron.log"' in command
     assert ">>" not in command
     log = project / "analysis/ufw/cron.log"
@@ -76,7 +97,8 @@ crontab() {
 ''' + block
     env = {**os.environ, "PROJECT_DIR": str(tmp_path), "INSTALL_USER": "test-user",
            "CRON_BEGIN": "# BEGIN mysql_siem managed jobs", "CRON_END": "# END mysql_siem managed jobs",
-           "TEST_CRONTAB": str(cron), "UFW_ANALYSIS_CRON": cron_command(tmp_path, ports_ready="1"),
+           "TEST_CRONTAB": str(cron), "APP_PYTHON": "/opt/mysql_siem-venv/bin/python",
+           "UFW_ANALYSIS_CRON": cron_command(tmp_path, ports_ready="1"),
            "PORT_SCAN_CRON": "* * * * * echo keep-portscan", "DNS_CRON": "*/5 * * * * echo keep-dns",
            "SSH_AUTH_CRON": "* * * * * echo keep-auth", "SSH_DETECTION_CRON": "* * * * * echo keep-ssh"}
     subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True)
@@ -176,15 +198,10 @@ def test_installer_preflight_closes_connection_and_rejects_wrong_schema(monkeypa
     ("0", "0", "--traffic"),
 ])
 def test_ready_traffic_uses_one_shared_job(tmp_path, source, port, options):
-    block = section("# Schedule UFW Analysis;", "# Set application ownership")
-    block = block[block.index("\n") + 1:]
-    result = subprocess.run(["bash", "-c", "set -euo pipefail\n" + block + '\nprintf "%s\\n" "$UFW_ANALYSIS_CRON"'],
-        env={**os.environ, "PROJECT_DIR": str(tmp_path), "SOURCE_IP_ANALYSIS_READY": source,
-             "PORT_ANALYSIS_READY": port, "TRAFFIC_ANALYSIS_READY": "1"},
-        text=True, capture_output=True, check=True)
-    assert result.stdout.count("-m analysis.ufw.main") == 1
-    assert options in result.stdout
-    assert "daily_counts" not in result.stdout
+    command = cron_command(tmp_path, source, port, traffic_ready="1")
+    assert command.count("-m analysis.ufw.main") == 1
+    assert options in command
+    assert "daily_counts" not in command
 
 
 def test_standalone_retired_cron_removed_only_for_this_installation(tmp_path):
@@ -202,7 +219,8 @@ crontab() {
 ''' + block
     env = {**os.environ, "PROJECT_DIR": str(project), "INSTALL_USER": "test-user",
            "CRON_BEGIN": "# BEGIN mysql_siem managed jobs", "CRON_END": "# END mysql_siem managed jobs",
-           "TEST_CRONTAB": str(cron), "PORT_SCAN_CRON": "", "DNS_CRON": ""}
+           "TEST_CRONTAB": str(cron), "APP_PYTHON": "/opt/mysql_siem-venv/bin/python",
+           "PORT_SCAN_CRON": "", "DNS_CRON": ""}
     for _ in range(2):
         subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True)
         result = cron.read_text()

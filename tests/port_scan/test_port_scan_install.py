@@ -27,15 +27,29 @@ def detection_cron(project, ready="1"):
     installer = (ROOT / "install.sh").read_text()
     start = installer.index("# Schedule one bounded detection pass;")
     end = installer.index("# DNS is optional:", start)
+
+    log_helper = "prepare_runtime_log() {" + installer.split(
+        "prepare_runtime_log() {", 1
+    )[1].split("# Use file-descriptor operations", 1)[0]
+
     result = subprocess.run(
         [
             "bash",
             "-c",
             "set -euo pipefail\n"
+            "die() { printf '%s\\n' \"$*\" >&2; exit 1; }\n"
+            "chown() { :; }\n"
+            + log_helper
             + installer[start:end]
             + '\nprintf "%s\\n" "$PORT_SCAN_CRON"',
         ],
-        env={**os.environ, "PROJECT_DIR": str(project), "DETECTION_READY": ready},
+        env={
+            **os.environ,
+            "PROJECT_DIR": str(project),
+            "DETECTION_READY": ready,
+            "INSTALL_USER": "test-user",
+            "APP_PYTHON": "/opt/mysql_siem-venv/bin/python",
+        },
         text=True,
         capture_output=True,
         check=True,
@@ -49,7 +63,7 @@ def test_cron_uses_system_python_environment_cwd_and_bounded_log(project):
     assert f'cd "{project}"' in command
     assert f'PYTHONPATH="{project}"' in command
     assert (
-        'config/run_with_env.sh" --port-scan /usr/bin/python3 -m detection.port_scan.main'
+        'config/run_with_env.sh" --port-scan "/opt/mysql_siem-venv/bin/python" -m detection.port_scan.main'
         in command
     )
     assert f'--log-file "{project}/detection/port_scan/cron.log"' in command
@@ -97,6 +111,7 @@ crontab() {
         **os.environ,
         "PROJECT_DIR": str(project),
         "INSTALL_USER": "test-user",
+        "APP_PYTHON": "/opt/mysql_siem-venv/bin/python",
         "CRON_BEGIN": "# BEGIN mysql_siem managed jobs",
         "CRON_END": "# END mysql_siem managed jobs",
         "PORT_SCAN_CRON": command,

@@ -27,3 +27,6 @@ venv/
 # SSH runtime configuration
 /config/ssh.env
 /config/identity.env
+
+# Persistent installation role
+/config/role.env

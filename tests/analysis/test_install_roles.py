@@ -135,7 +135,7 @@ def test_server_reaches_existing_installation_path(isolated_installer, arguments
     assert INSTALLER.count(SERVER_ENTRY) == 1
     installer.write_text(INSTALLER.replace(SERVER_ENTRY, "printf 'SERVER_ENTRY\\n'\nexit 0", 1))
     for _attempt in range(2):
-        result = run_installer(isolated_installer, arguments, selection)
+        result = run_installer(isolated_installer, arguments, selection + "yes\n")
         assert result.returncode == 0, result.stderr
         assert "SERVER_ENTRY" in result.stdout
         assert "not available yet" not in result.stderr

@@ -358,8 +358,11 @@ mock_mysql() {
 def test_installer_dns_setup_uses_existing_cron_model(project, configured):
     installer = (ROOT / "install.sh").read_text()
     start = installer.index("# DNS is optional:")
-    end = installer.index("# Set application ownership", start)
+    end = installer.index("# Schedule the SSH jobs independently;", start)
     block = installer[start:end]
+    log_helper = "prepare_runtime_log() {" + installer.split(
+        "prepare_runtime_log() {", 1
+    )[1].split("# Use file-descriptor operations", 1)[0]
     dns = project / "ingestion/dns"
     dns.mkdir(parents=True)
     wrapper = project / "config/run_with_env.sh"
@@ -373,10 +376,15 @@ def test_installer_dns_setup_uses_existing_cron_model(project, configured):
             "bash",
             "-c",
             "set -euo pipefail\nlog() { :; }\n"
+            "die() { printf '%s\\n' \"$*\" >&2; exit 1; }\n"
+            "chown() { :; }\n"
+            + log_helper
             + block
             + '\nprintf "DNS_JOB:%s\\n" "$DNS_CRON"',
         ],
-        env={**os.environ, "PROJECT_DIR": str(project)},
+        env={**os.environ, "PROJECT_DIR": str(project),
+             "INSTALL_USER": "test-user",
+             "APP_PYTHON": "/opt/mysql_siem-venv/bin/python"},
         capture_output=True,
         text=True,
         check=False,
@@ -386,7 +394,7 @@ def test_installer_dns_setup_uses_existing_cron_model(project, configured):
     assert ("*/5 * * * *" in result.stdout) == configured
     assert (dns / "cron.log").exists() == configured
     if configured:
-        assert "--dns /usr/bin/python3 -m ingestion.dns.main" in result.stdout
+        assert "--dns /opt/mysql_siem-venv/bin/python -m ingestion.dns.main" in result.stdout
         assert "/usr/bin/timeout --signal=TERM 270s" in result.stdout
         assert f'cd "{project}"' in result.stdout
         assert settings.read_text() == "private fixture settings\n"
