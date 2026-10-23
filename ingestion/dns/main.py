@@ -1,7 +1,6 @@
 """One DNS collection run for cron. No automatic migration or scheduling."""
 
 import argparse
-import time
 from datetime import datetime, timezone
 
 from database.connection import get_connection
@@ -12,7 +11,6 @@ from ingestion.dns.db import (
     DNSCollectionBusy,
     DNSStorageError,
     find_source,
-    purge_events,
     register_source,
 )
 
@@ -49,28 +47,14 @@ def main(argv=None):
         source_id = find_source(
             connection, config.source_name, "adguard", config.base_url
         )
-        cleanup_deadline = time.monotonic() + settings.max_seconds
         with AdGuardAdapter(config) as adapter:
             result = collect(
                 adapter, connection, source_id, settings, page_size=config.page_size
             )
-        deleted = 0
-        for _ in range(10):
-            if time.monotonic() >= cleanup_deadline:
-                break
-            count = purge_events(
-                connection,
-                retention_days=settings.retention_days,
-                batch_size=10000,
-                source_id=source_id,
-            )
-            deleted += count
-            if count < 10000:
-                break
         log(
             f"DNS collection complete: fetched={result['fetched']}, "
             f"inserted={result['inserted']}, excluded={result['excluded']}, "
-            f"pages={result['pages']}, expired_deleted={deleted}, status=SUCCESS."
+            f"pages={result['pages']}, status=SUCCESS."
         )
         return 0
     except DNSCollectionBusy:

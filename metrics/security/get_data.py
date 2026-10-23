@@ -1,74 +1,63 @@
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from database.identity import configured_identity, identity_schema_enabled
 
 
-def get_failed_logins():
-
-    date = datetime.now().strftime("%Y-%m-%d")
-    file = "/var/log/auth.log"
-    failed_attempts_today = 0
-
-    with open(file, 'r') as infile:
-        for line in infile:
-
-            if date in line:
-                rivi = line.strip()
-
-                if (
-                    "authentication failure" in rivi
-                    or "authentication error" in rivi
-                    or "failed password" in rivi
-                ):
-                    failed_attempts_today += 1
-
-    return failed_attempts_today
+def get_timestamp():
+    return datetime.now(timezone.utc).replace(microsecond=0)
 
 
-def get_blocks_today(connection):
+def utc_day_bounds(observed_at):
+    if not isinstance(observed_at, datetime) or observed_at.utcoffset() is None:
+        raise ValueError("Security measurement time must include a timezone.")
+    observed_at = observed_at.astimezone(timezone.utc)
+    start = observed_at.replace(hour=0, minute=0, second=0, microsecond=0)
+    return start, start + timedelta(days=1)
 
+
+def count_today(connection, sql_message, observed_at):
+    if observed_at is None:
+        observed_at = get_timestamp()
+    start, end = utc_day_bounds(observed_at)
+    # MySQL DATETIME parameters are UTC-naive only at this database boundary.
+    parameters = (start.replace(tzinfo=None), end.replace(tzinfo=None))
     cursor = connection.cursor()
-    identity = configured_identity(cursor, "security")
+    try:
+        identity = configured_identity(cursor, "security")
+        if identity_schema_enabled(connection):
+            sql_message += " AND host_id <=> %s"
+            parameters += (identity.host_id if identity is not None else None,)
+        cursor.execute(sql_message, parameters)
+        return cursor.fetchone()[0]
+    finally:
+        cursor.close()
+
+
+def get_failed_logins(connection, observed_at=None):
+    # Count ingested, deduplicated SSH attempts; never infer UTC from log text.
     sql_message = """
-    SELECT COUNT(*) AS block_count_today
-    FROM ufw_log
-    WHERE action = 'BLOCK'
-    AND DATE(event_time) = CURDATE()
+    SELECT COUNT(*) FROM auth_events
+    WHERE event_type = 'SSH_AUTH_FAILURE' AND service = 'sshd'
+      AND event_time >= %s AND event_time < %s
     """
+    return count_today(connection, sql_message, observed_at)
 
-    parameters = ()
-    if identity_schema_enabled(connection):
-        sql_message += " AND host_id <=> %s"
-        parameters = (identity.host_id if identity is not None else None,)
-    cursor.execute(sql_message, parameters)
-    tulos = cursor.fetchone()[0]
 
-    cursor.close()
-
-    return tulos
-
-def get_unique_ips_today(connection):
-
-    cursor = connection.cursor()
-    identity = configured_identity(cursor, "security")
-
+def get_blocks_today(connection, observed_at=None):
     sql_message = """
-    SELECT COUNT(DISTINCT src_ip) AS unique_ips_today
-    FROM ufw_log
-    WHERE action = 'BLOCK'
-    AND DATE(event_time) = CURDATE()
+    SELECT COUNT(*) AS block_count_today FROM ufw_log
+    WHERE action = 'BLOCK' AND event_time >= %s AND event_time < %s
     """
+    return count_today(connection, sql_message, observed_at)
 
-    parameters = ()
-    if identity_schema_enabled(connection):
-        sql_message += " AND host_id <=> %s"
-        parameters = (identity.host_id if identity is not None else None,)
-    cursor.execute(sql_message, parameters)
 
-    tulos = cursor.fetchone()[0]
+def get_unique_ips_today(connection, observed_at=None):
+    sql_message = """
+    SELECT COUNT(DISTINCT src_ip) AS unique_ips_today FROM ufw_log
+    WHERE action = 'BLOCK' AND event_time >= %s AND event_time < %s
+    """
+    return count_today(connection, sql_message, observed_at)
 
-    cursor.close()
-    return tulos
 
 def get_uptime():
     tiedosto = "/proc/uptime"
@@ -78,22 +67,18 @@ def get_uptime():
         uptime = round(uptime / 3600, 2)
     return uptime
 
-def get_timestamp():
-    date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return date
 
 def get_data(connection):
+    observed_at = get_timestamp()
     uptime = get_uptime()
-    unique_ips = get_unique_ips_today(connection)
-    blocks = get_blocks_today(connection)
-    failed_logins = get_failed_logins()
-    date = get_timestamp()
+    unique_ips = get_unique_ips_today(connection, observed_at)
+    blocks = get_blocks_today(connection, observed_at)
+    failed_logins = get_failed_logins(connection, observed_at)
 
-    data = {
+    return {
         'uptime': uptime,
         'blocks': blocks,
         'failed_logins': failed_logins,
         'unique_ips': unique_ips,
-        'date': date
+        'date': observed_at,
     }
-    return(data)

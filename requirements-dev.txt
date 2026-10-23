@@ -1,3 +1,4 @@
+-r requirements-api.txt
 -r requirements-dns.txt
 pytest>=8,<10
 ruff

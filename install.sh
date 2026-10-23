@@ -1,6 +1,6 @@
 
 #!/usr/bin/env bash
-# mysql_siem - Ubuntu installation and deployment
+# mysql_siem - Debian 13, Ubuntu and Linux Mint installation
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
@@ -13,12 +13,206 @@ readonly CRON_BEGIN="# BEGIN mysql_siem managed jobs"
 readonly CRON_END="# END mysql_siem managed jobs"
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_USER="${SUDO_USER:-${USER}}"
+readonly INSTALL_USER="$APP_NAME"
+readonly APP_HOME="/var/lib/mysql_siem"
 ENV_FILE="$PROJECT_DIR/config/mysql.env"
 
 log()  { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
 die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
+
+# Installation role selection (before any installation changes).
+select_installation_role() {
+    local selection
+    if [[ $# -eq 0 ]]; then
+        printf '%s\n' 'mysql_siem Installation
+
+1. SIEM Server
+   Central server with MySQL, analysis,
+   detection and local collectors.
+
+2. SIEM Collector
+   Lightweight Linux collector that sends
+   events to a central SIEM server.
+'
+        printf 'Select installation type [1-2]: '
+        IFS= read -r selection || die "No installation type selected; use --role server or --role collector."
+        case "$selection" in
+            1) INSTALL_ROLE=server ;;
+            2) INSTALL_ROLE=collector ;;
+            *) die "Invalid installation selection; enter 1 or 2." ;;
+        esac
+    elif [[ $# -eq 2 && "$1" == --role ]]; then
+        INSTALL_ROLE="$2"
+    else
+        die "Usage: sudo bash install.sh [--role server|collector]"
+    fi
+
+    case "$INSTALL_ROLE" in
+        server|collector) ;;
+        *) die "Invalid installation role; use server or collector." ;;
+    esac
+}
+# End installation role selection.
+
+# Platform and dependency checks (no database writes).
+detect_distribution() {
+    local release_file="${1:-/etc/os-release}"
+    local ID="" VERSION_ID=""
+    [[ -r "$release_file" ]] || die "Cannot read operating system information."
+    . "$release_file"
+
+    REQUIRE_EXISTING_MYSQL=0
+    case "$ID" in
+        debian)
+            [[ "${VERSION_ID%%.*}" == "13" ]] || die "Debian 13 is required for the Debian installation path."
+            REQUIRE_EXISTING_MYSQL=1
+            ;;
+        ubuntu|linuxmint)
+            ;;
+        *)
+            die "Supported systems: Debian 13, Ubuntu and Linux Mint."
+            ;;
+    esac
+    log "Detected $ID $VERSION_ID."
+}
+
+select_mysql_package() {
+    local daemon version
+    MYSQL_PACKAGE=""
+    daemon="$(command -v mysqld || true)"
+    if [[ -z "$daemon" && -x /usr/sbin/mysqld ]]; then
+        daemon=/usr/sbin/mysqld
+    fi
+
+    if [[ -n "$daemon" ]]; then
+        version="$("$daemon" --version)" || die "Cannot determine the installed MySQL version."
+        case "$version" in
+            *MariaDB*) die "MariaDB is not supported; the installer will not replace it." ;;
+            *"Ver 8.0."*|*"Ver 8.4."*) ;;
+            *) die "Expected an existing MySQL 8.0 or 8.4 server; no server packages were changed." ;;
+        esac
+        [[ -x /usr/bin/mysql ]] || die "The installed MySQL server requires its /usr/bin/mysql client."
+        log "Keeping the installed MySQL server; no MySQL server package will be requested."
+    elif command -v mariadbd >/dev/null 2>&1 || [[ -x /usr/sbin/mariadbd ]]; then
+        die "MariaDB is installed; the installer will not replace it."
+    elif [[ "$REQUIRE_EXISTING_MYSQL" == "1" ]]; then
+        die "Debian 13 requires a preinstalled Oracle MySQL 8.0 or 8.4 server and client."
+    else
+        MYSQL_PACKAGE=mysql-server
+    fi
+}
+
+install_dependencies() {
+    local packages=(
+        python3 python3-pymysql python3-requests python3-cryptography
+        rsyslog cron ca-certificates openssl coreutils
+    )
+    if [[ -n "$MYSQL_PACKAGE" ]]; then
+        packages+=("$MYSQL_PACKAGE")
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    log "Updating package lists."
+    apt-get update
+    log "Installing dependencies."
+    apt-get install -y "${packages[@]}"
+}
+# End platform and dependency checks.
+
+
+# Application account management (shared by Debian, Ubuntu and Linux Mint).
+validate_application_user() {
+    local record name password account_uid account_gid description account_home account_shell
+    local group_record group_name group_password group_gid group_members
+    local status status_name password_state rest groups group_id accounts sudo_output expected_uid
+
+    record="$(getent passwd "$INSTALL_USER")" || die "Cannot read the mysql_siem account."
+    IFS=: read -r name password account_uid account_gid description account_home account_shell <<< "$record"
+    [[ "$name" == "$INSTALL_USER" && "$account_uid" =~ ^[0-9]+$ && "$account_uid" != 0 ]] ||
+        die "mysql_siem must be a non-root account; existing UID was not changed."
+    [[ "$account_home" == "$APP_HOME" && "$account_shell" == /usr/sbin/nologin ]] ||
+        die "mysql_siem requires home $APP_HOME and shell /usr/sbin/nologin; existing account was not changed."
+    group_record="$(getent group "$INSTALL_USER")" || die "mysql_siem requires its own primary group."
+    IFS=: read -r group_name group_password group_gid group_members <<< "$group_record"
+    [[ "$group_name" == "$INSTALL_USER" && "$group_gid" =~ ^[0-9]+$ && "$group_gid" != 0 && "$account_gid" == "$group_gid" ]] ||
+        die "mysql_siem has a conflicting primary group; existing GID was not changed."
+    [[ -z "$group_members" || "$group_members" == "$INSTALL_USER" ]] ||
+        die "The mysql_siem group is shared with other users; review it manually."
+
+    expected_uid="$account_uid"
+    accounts="$(getent passwd)" || die "Cannot check mysql_siem UID/group ownership."
+    while IFS=: read -r name password account_uid account_gid description account_home account_shell; do
+        if [[ "$name" != "$INSTALL_USER" && "$account_uid" == "$expected_uid" ]]; then
+            die "Another account shares the mysql_siem UID; review it manually."
+        fi
+        if [[ "$name" != "$INSTALL_USER" && "$account_gid" == "$group_gid" ]]; then
+            die "Another account uses the mysql_siem primary group; review it manually."
+        fi
+    done <<< "$accounts"
+    groups="$(id -G "$INSTALL_USER")" || die "Cannot check mysql_siem groups."
+    local -a account_groups
+    IFS=' ' read -r -a account_groups <<< "$groups"
+    for group_id in "${account_groups[@]}"; do
+        [[ "$group_id" == "$group_gid" ]] ||
+            die "mysql_siem has supplementary groups; review them manually instead of granting broad access."
+    done
+    status="$(LC_ALL=C passwd -S "$INSTALL_USER")" || die "Cannot verify mysql_siem password status."
+    IFS=' ' read -r status_name password_state rest <<< "$status"
+    [[ "$status_name" == "$INSTALL_USER" && "$password_state" == L ]] ||
+        die "mysql_siem must have a locked password; existing password was not changed."
+    if command -v sudo >/dev/null 2>&1; then
+        if sudo_output="$(LC_ALL=C sudo -n -l -U "$INSTALL_USER" 2>&1)"; then
+            die "mysql_siem has sudo privileges; remove them manually before installing."
+        elif [[ "$sudo_output" != *"is not allowed to run sudo"* ]]; then
+            die "Cannot verify that mysql_siem has no sudo privileges; review sudo policy."
+        fi
+    fi
+}
+
+ensure_application_user() {
+    local record group_record group_name group_password group_gid group_members status accounts
+    local name password account_uid account_gid description account_home account_shell
+    local created=0
+
+    [[ -x /usr/sbin/nologin ]] || die "/usr/sbin/nologin is required."
+    if record="$(getent passwd "$INSTALL_USER")"; then
+        validate_application_user
+    else
+        status=$?
+        [[ "$status" == 2 ]] || die "Account lookup failed; no account was created."
+        [[ ! -e "$APP_HOME" && ! -L "$APP_HOME" ]] ||
+            die "$APP_HOME exists without mysql_siem; review its ownership before creating the account."
+        if group_record="$(getent group "$INSTALL_USER")"; then
+            IFS=: read -r group_name group_password group_gid group_members <<< "$group_record"
+            [[ "$group_name" == "$INSTALL_USER" && "$group_gid" =~ ^[0-9]+$ && "$group_gid" != 0 && -z "$group_members" ]] ||
+                die "The existing mysql_siem group conflicts with account creation."
+            accounts="$(getent passwd)" || die "Cannot check the existing mysql_siem group."
+            while IFS=: read -r name password account_uid account_gid description account_home account_shell; do
+                [[ "$account_gid" != "$group_gid" ]] || die "Another account uses the mysql_siem group."
+            done <<< "$accounts"
+        else
+            status=$?
+            [[ "$status" == 2 ]] || die "Group lookup failed; no group was created."
+            groupadd --system "$INSTALL_USER" || die "Failed to create the mysql_siem system group."
+        fi
+        useradd --system --gid "$INSTALL_USER" --home-dir "$APP_HOME" \
+            --no-create-home --shell /usr/sbin/nologin --password '!' "$INSTALL_USER" ||
+            die "Failed to create mysql_siem; inspect the group/account before retrying."
+        created=1
+        validate_application_user
+    fi
+
+    [[ ! -L "$APP_HOME" ]] || die "mysql_siem home must not be a symbolic link."
+    if [[ ! -e "$APP_HOME" ]]; then
+        install -d -m 750 -o "$INSTALL_USER" -g "$INSTALL_USER" "$APP_HOME" ||
+            die "Failed to create the mysql_siem home directory."
+    fi
+    [[ -d "$APP_HOME" ]] || die "mysql_siem home must be a directory."
+    [[ "$(stat -c '%U:%G:%a' "$APP_HOME")" == "$INSTALL_USER:$INSTALL_USER:750" ]] ||
+        die "mysql_siem home requires owner mysql_siem:mysql_siem and mode 750; review it manually."
+    log "mysql_siem account verified (created=$created)."
+}
+# End application account management.
 
 load_mysql_env() {
     local env_file="$1"
@@ -81,8 +275,12 @@ load_mysql_env() {
 
 trap 'rc=$?; printf "[ERROR] Installation failed (exit %s, line %s).\n" "$rc" "${BASH_LINENO[0]:-?}" >&2; exit "$rc"' ERR
 
+select_installation_role "$@"
+if [[ "$INSTALL_ROLE" == collector ]]; then
+    die "SIEM Collector is not available yet. Current collectors require MySQL; HTTPS registration and event delivery are not implemented. No installation changes were made."
+fi
+
 [[ $EUID -eq 0 ]] || die "Run: sudo bash install.sh"
-id "$INSTALL_USER" >/dev/null 2>&1 || die "User not found: $INSTALL_USER"
 
 for path in \
     database/schema.sql \
@@ -111,14 +309,12 @@ do
     [[ -f "$PROJECT_DIR/$path" ]] || die "Required file is missing: $path"
 done
 
-export DEBIAN_FRONTEND=noninteractive
-log "Updating package lists."
-apt-get update
-
-log "Installing dependencies."
-apt-get install -y \
-    python3 python3-pymysql python3-requests mysql-server rsyslog cron \
-    ca-certificates openssl coreutils
+detect_distribution
+select_mysql_package
+ensure_application_user
+runuser -u "$INSTALL_USER" -- test -r "$PROJECT_DIR/install.sh" || \
+    die "mysql_siem cannot access the project; use an accessible path such as /opt/mysql_siem."
+install_dependencies
 
 log "Starting services."
 systemctl enable --now mysql

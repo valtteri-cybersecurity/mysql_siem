@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pymysql
 
@@ -6,7 +6,11 @@ from database.identity import configured_identity, identity_schema_enabled
 
 
 def save_metrics_db(connection, data):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    observed_at = data["date"]
+    if not isinstance(observed_at, datetime) or observed_at.utcoffset() is None:
+        raise ValueError("Security measurement time must include a timezone.")
+    observed_at = observed_at.astimezone(timezone.utc).replace(microsecond=0)
+    timestamp = observed_at.strftime("%Y-%m-%d %H:%M:%S")
     cursor = None
 
     try:
@@ -31,7 +35,7 @@ def save_metrics_db(connection, data):
             data["blocks"],
             data["failed_logins"],
             data["unique_ips"],
-            data["date"]
+            observed_at.replace(tzinfo=None)
         )
         if identity is not None:
             sql_message = """INSERT INTO security_metrics

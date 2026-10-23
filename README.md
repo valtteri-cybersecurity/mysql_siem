@@ -40,4 +40,17 @@ The project is continuously being improved as I develop my skills in software de
 
 This is a personal learning project and is not intended to replace production-grade SIEM solutions.
 
+## Installation roles
 
+Run `sudo bash install.sh` for the role menu, or select
+`sudo bash install.sh --role server` explicitly. The server role preserves the
+local collectors, MySQL storage, analysis and detection on Debian 13, Ubuntu
+and Linux Mint.
+
+The `collector` role is recognized but stops before making installation changes.
+Remote collection and HTTPS registration are not implemented yet. See
+[installation roles and collector prerequisites](docs/install-roles.md).
+
+## Debian 13 installation
+
+See [Debian 13 setup and local collection checks](docs/debian-install.md).

@@ -204,13 +204,27 @@ def test_empty_batch_can_save_explicit_state(connection):
     )
 
 
-def test_default_retention_is_bounded_30_days(connection):
+def test_manual_purge_keeps_default_30_day_boundary(connection):
     now = datetime(2026, 10, 21, tzinfo=timezone.utc)
     assert purge_events(connection, now=now) == 2
     sql, params = connection.cursor.return_value.execute.call_args.args
     assert "LIMIT %s" in sql
     assert params == (datetime(2026, 9, 21), 1000)
     connection.commit.assert_called_once()
+
+
+def test_manual_purge_is_source_scoped_and_leaves_collection_state_alone(connection):
+    now = datetime(2026, 10, 21, tzinfo=timezone.utc)
+    assert purge_events(connection, retention_days=90, source_id=7, now=now) == 2
+    cursor = connection.cursor.return_value
+    cursor.execute.assert_called_once_with(
+        "DELETE FROM dns_events WHERE source_id = %s AND event_time < %s ORDER BY event_time LIMIT %s",
+        (7, datetime(2026, 7, 23), 1000),
+    )
+    cursor.executemany.assert_not_called()
+    connection.begin.assert_called_once()
+    connection.commit.assert_called_once()
+    connection.rollback.assert_not_called()
 
 
 @pytest.mark.parametrize("source_id", [0, -1, True, "7", 2**64])

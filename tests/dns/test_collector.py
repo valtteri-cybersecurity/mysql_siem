@@ -566,3 +566,86 @@ def test_domain_filtered_group_replays_after_partial_commit(store, domain_exclus
     result = run(QueryLog(records), page_size=1000)
     assert result["inserted"] == 1 and result["excluded"] == 1000
     assert len(store.rows) == 1001 and store.state["pending"] is None
+
+
+@pytest.mark.parametrize("resume_pending", [False, True])
+def test_cli_keeps_old_history_and_resumes_collection_with_filters(
+    store, monkeypatch, resume_pending
+):
+    from ingestion.dns import db
+    from ingestion.dns import main as entrypoint
+    from ingestion.dns.config import AdGuardConfig
+
+    expected_rows = {}
+    for age in (31, 90, 365):
+        old = event((NOW - timedelta(days=age)).isoformat(), name=f"old-{age}.example.net")
+        key = replay_keys([old])[0]
+        store.rows[key] = old
+        expected_rows[key] = old
+
+    kept = event()
+    client_filtered = replace(
+        event("2026-10-21T11:58:00Z"), client_ip="192.0.2.2"
+    )
+    domain_filtered = event("2026-10-21T11:57:00Z", name="filtered.example.net")
+    records = [kept, client_filtered, domain_filtered]
+    monkeypatch.setattr(collector, "get_active_client_filters", lambda *_args: [
+        {"client_ip": "192.0.2.2", "exclude_from_collection": True},
+    ])
+    monkeypatch.setattr(collector, "get_active_domain_filters", lambda *_args: [
+        {"domain": "filtered.example.net"},
+    ])
+    pending_cursor = None
+    if resume_pending:
+        with pytest.raises(DNSCollectionIncomplete):
+            run(QueryLog(records), page_size=2, settings=CollectorConfig(max_pages=1))
+        pending_cursor = store.state["pending"]["cursor"]
+
+    config = AdGuardConfig(
+        "https://dns.example.net", "fixture-user", "fixture-password",
+        source_name="dns", page_size=2,
+    )
+    connection = Mock()
+    register = Mock()
+    purge = Mock(side_effect=AssertionError("Automatic history deletion is forbidden."))
+    monkeypatch.setattr(entrypoint, "get_connection", lambda: connection)
+    monkeypatch.setattr(entrypoint, "load_adguard_config", lambda: config)
+    monkeypatch.setattr(entrypoint, "load_collector_config", CollectorConfig)
+    monkeypatch.setattr(entrypoint, "find_source", lambda *_args: 7)
+    monkeypatch.setattr(entrypoint, "register_source", register)
+    monkeypatch.setattr(db, "purge_events", purge)
+    monkeypatch.setattr(entrypoint, "purge_events", purge, raising=False)
+    log = QueryLog(records)
+    monkeypatch.setattr(entrypoint, "AdGuardAdapter", lambda _config: nullcontext(log))
+    clock = [NOW]
+
+    def collect_at_fixed_time(adapter, connection, source_id, settings, *, page_size):
+        return collect(
+            adapter, connection, source_id, settings, page_size=page_size, now=clock[0]
+        )
+
+    monkeypatch.setattr(entrypoint, "collect", collect_at_fixed_time)
+    assert entrypoint.main([]) == 0
+    expected_rows[replay_keys([kept])[0]] = kept
+    assert store.rows == expected_rows
+    assert store.state == {
+        "version": 1,
+        "completed_until": "2026-10-21T11:59:30.000000+00:00",
+        "pending": None,
+    }
+    if resume_pending:
+        assert log.calls[0] == (pending_cursor, 0)
+
+    # Revisit the same source window: preserve old keys, skip duplicates and
+    # keep both client and domain exclusions while advancing the checkpoint.
+    clock[0] = NOW + timedelta(minutes=5)
+    assert entrypoint.main([]) == 0
+    assert store.rows == expected_rows
+    assert store.state == {
+        "version": 1,
+        "completed_until": "2026-10-21T12:04:30.000000+00:00",
+        "pending": None,
+    }
+    purge.assert_not_called()
+    register.assert_not_called()
+    connection.cursor.assert_not_called()

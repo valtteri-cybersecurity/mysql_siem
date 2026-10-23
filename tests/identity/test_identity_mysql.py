@@ -479,7 +479,7 @@ def test_all_metric_writers_keep_two_hosts_separate(mysql, monkeypatch):
             save_system(mysql, [Decimal(1)] * 10)
             filesystem.save_metrics(3, 17)
             filesystem.save_metrics(4, 18)
-            save_security(mysql, {"uptime": 1, "blocks": 2, "failed_logins": 3, "unique_ips": 4, "date": START})
+            save_security(mysql, {"uptime": 1, "blocks": 2, "failed_logins": 3, "unique_ips": 4, "date": START.replace(tzinfo=timezone.utc)})
 
         with mysql.cursor() as cursor:
             for table in ("system_metrics", "filesystem_metrics", "security_metrics"):

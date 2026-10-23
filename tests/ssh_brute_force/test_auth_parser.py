@@ -88,3 +88,19 @@ def test_companion_messages_count_as_one_attempt():
         "Connection closed by invalid user admin 192.0.2.1 port 22 [preauth]",
     ]
     assert sum(parse_auth_line(log_line(message)) is not None for message in messages) == 1
+
+
+@pytest.mark.parametrize("process", ["sshd", "sshd-session", "sshd-auth"])
+def test_openssh_process_names_normalize_to_existing_detection_service(process):
+    line = log_line(service=f"{process}[1234]")
+    event = parse_auth_line(line)
+    assert event is not None
+    assert event["service"] == "sshd"
+    assert event["event_time"] == datetime(2026, 10, 22, 12, 0, 0, 123456)
+    assert event["raw_message"] == line.rstrip("\n")
+    assert event["event_hash"] == parse_auth_line(log_line())["event_hash"]
+
+
+@pytest.mark.parametrize("process", ["fake-sshd-auth", "sshd-auth-extra", "sshd-session-extra"])
+def test_unrecognized_process_names_are_still_rejected(process):
+    assert parse_auth_line(log_line(service=f"{process}[1234]")) is None

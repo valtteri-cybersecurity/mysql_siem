@@ -8,10 +8,11 @@ from datetime import datetime, timezone
 from ingestion.ip_addresses import canonical_ip
 
 # Require a complete date and an explicit offset: never guess a missing year/zone.
+# OpenSSH 9.8/10 may log through sshd-session or sshd-auth; normalize to sshd.
 LOG_LINE = re.compile(
     r"(?P<time>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2}))\s+"
-    r"(?P<host>\S+)\s+sshd\[(?P<pid>[0-9]+)\]: (?P<message>.+)"
+    r"(?P<host>\S+)\s+sshd(?:-session|-auth)?\[(?P<pid>[0-9]+)\]: (?P<message>.+)"
 )
 FAILURE = re.compile(
     r"Failed password for (?:invalid user )?(?P<username>\S+) "

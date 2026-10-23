@@ -133,3 +133,27 @@ def test_rotation_disappearing_between_listing_and_open_is_safe(tmp_path, monkey
                         lambda _: [str(logfile) + ".1", str(logfile)])
     assert collect_auth_events(connection, logfile, collector_id="test")["inserted"] == 1
     connection.commit.assert_called_once()
+
+
+@pytest.mark.parametrize("process", ["sshd-session", "sshd-auth"])
+def test_new_openssh_failures_are_collected_and_detected(tmp_path, process, monkeypatch):
+    from detection.ssh_brute_force.detector import detect_ssh_brute_force
+
+    logfile = tmp_path / "auth.log"
+    lines = []
+    for pid in range(1, 6):
+        line = LINE.decode().replace("sshd[12]", f"{process}[{pid}]")
+        lines.append(line)
+    logfile.write_text("".join(lines))
+    events = []
+
+    def capture_event(cursor, event, *, identity=None):
+        events.append(event)
+        return 1
+
+    monkeypatch.setattr("ingestion.auth.collector.save_event", capture_event)
+    cursor = MagicMock()
+    cursor.fetchone.return_value = None
+    assert process_file(cursor, str(logfile), "local-debian") == (5, 0)
+    assert cursor.execute.call_args_list[-1].args[1][4] == logfile.stat().st_size
+    assert detect_ssh_brute_force(events)[0]["failure_count"] == 5

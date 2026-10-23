@@ -14,6 +14,12 @@ def parse_timestamp(value):
     match = PATTERN.fullmatch(value) if isinstance(value, str) else None
     if match is None:
         raise ValueError("Invalid DNS timestamp.")
+    zone = match["zone"]
+    if zone != "Z":
+        hours = int(zone[1:3])
+        minutes = int(zone[4:6])
+        if hours > 23 or minutes > 59:
+            raise ValueError("Invalid DNS timestamp.")
     iso = match["time"]
     if match["fraction"]:
         iso += "." + match["fraction"][:6].ljust(6, "0")

@@ -105,6 +105,7 @@ class CollectorConfig:
     max_seconds: int = 240
     overlap_seconds: int = 600
     settle_seconds: int = 30
+    # Source query/checkpoint window only; stored events are not expired.
     retention_days: int = 30
     max_group_events: int = 10000
 
