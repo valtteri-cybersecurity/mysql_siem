@@ -68,7 +68,14 @@ getent() {
 id() { printf '%s\n' "${ACCOUNT_GROUPS:-222}"; }
 passwd() { printf 'passwd %s\n' "$*" >> "$CALLS"; printf 'mysql_siem %s 2026-10-23 0 99999 7 -1\n' "${PASSWORD_STATE:-L}"; }
 sudo() {
-    [[ "${HAS_SUDO:-0}" != 1 ]] || return 0
+    if [[ "${SUDO_OUTPUT+x}" == x ]]; then
+        printf '%s\n' "$SUDO_OUTPUT" >&2
+        return "${SUDO_STATUS:-0}"
+    fi
+    if [[ "${HAS_SUDO:-0}" == 1 ]]; then
+        printf 'User mysql_siem may run the following commands on test-host:\n    (ALL : ALL) ALL\n'
+        return 0
+    fi
     [[ "${SUDO_ERROR:-0}" != 1 ]] || { printf 'policy failed\n' >&2; return 1; }
     printf 'User mysql_siem is not allowed to run sudo on test-host.\n' >&2
     return 1
@@ -205,3 +212,32 @@ def test_only_primary_and_optional_adm_groups_are_allowed(tmp_path, groups, adm_
     if not accepted:
         assert "supplementary groups" in result.stderr
     assert "useradd" not in calls and "groupadd" not in calls and "install" not in calls
+
+
+@pytest.mark.parametrize("sudo_status", ["0", "1"])
+def test_explicit_no_sudo_grants_accepts_both_listing_statuses(tmp_path, sudo_status):
+    result, calls = account_setup(
+        tmp_path, exists=True, SUDO_STATUS=sudo_status,
+        SUDO_OUTPUT="User mysql_siem is not allowed to run sudo on SIEM-CENTER.",
+    )
+    assert result.returncode == 0, result.stderr
+    assert calls == "passwd -S mysql_siem\n"
+
+
+@pytest.mark.parametrize("sudo_output,sudo_status", [
+    ("", "0"),
+    ("policy failed", "1"),
+    ("sudo: a password is required", "1"),
+    ("User other is not allowed to run sudo on SIEM-CENTER.", "0"),
+    ("User mysql_siem is not allowed to run sudo on SIEM-CENTER.\npolicy failed", "0"),
+    ("policy failed\nUser mysql_siem is not allowed to run sudo on SIEM-CENTER.", "1"),
+    ("User mysql_siem is not allowed to run sudo on SIEM-CENTER.", "2"),
+    ("User mysql_siem is not allowed to run sudo on SIEM-CENTER. extra", "0"),
+])
+def test_uncertain_sudo_check_stops_without_modifying_account(tmp_path, sudo_output, sudo_status):
+    result, calls = account_setup(
+        tmp_path, exists=True, SUDO_OUTPUT=sudo_output, SUDO_STATUS=sudo_status,
+    )
+    assert result.returncode != 0
+    assert "Cannot verify" in result.stderr
+    assert calls == "passwd -S mysql_siem\n"

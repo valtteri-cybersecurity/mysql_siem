@@ -268,9 +268,18 @@ validate_application_user() {
     [[ "$status_name" == "$INSTALL_USER" && "$password_state" == L ]] ||
         die "mysql_siem must have a locked password; existing password was not changed."
     if command -v sudo >/dev/null 2>&1; then
-        if sudo_output="$(LC_ALL=C sudo -n -l -U "$INSTALL_USER" 2>&1)"; then
+        local sudo_status=0 sudo_denial_prefix sudo_denial_host
+        sudo_output="$(LC_ALL=C sudo -n -l -U "$INSTALL_USER" 2>&1)" || sudo_status=$?
+        sudo_denial_prefix="User $INSTALL_USER is not allowed to run sudo on "
+        sudo_denial_host="${sudo_output#"$sudo_denial_prefix"}"
+        # Root's listing can succeed even when the listed user has no grants.
+        if [[ ( "$sudo_status" == 0 || "$sudo_status" == 1 ) &&
+              "$sudo_output" == "$sudo_denial_prefix"* &&
+              "$sudo_denial_host" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*\.$ ]]; then
+            :
+        elif [[ "$sudo_output" == *"User $INSTALL_USER may run the following commands on "* ]]; then
             die "mysql_siem has sudo privileges; remove them manually before installing."
-        elif [[ "$sudo_output" != *"is not allowed to run sudo"* ]]; then
+        else
             die "Cannot verify that mysql_siem has no sudo privileges; review sudo policy."
         fi
     fi
