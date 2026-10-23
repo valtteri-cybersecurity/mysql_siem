@@ -97,6 +97,10 @@ def validate_source_ips_schema(connection):
             "unique_destination_ips", "tcp_events", "udp_events")})
         expected.update({"source_ip": ("varchar(45)", "NO", "ascii_bin", None, ""),
                          "analyzed_at": ("timestamp(6)", "NO", None, "current_timestamp(6)", "default_generated")})
+        scoped = "host_id" in actual
+        if scoped:
+            expected["host_id"] = ("bigint unsigned", "YES", None, None, "")
+            expected["host_scope"] = ("bigint unsigned", "NO", None, "0", "")
         if actual != expected:
             raise SchemaError("analysis_source_ips: incompatible columns; inspect database/schema.sql.")
         cursor.execute("""SELECT index_name, non_unique, column_name, sub_part, is_visible
@@ -107,8 +111,12 @@ def validate_source_ips_schema(connection):
             if prefix is not None or visible != "YES":
                 raise SchemaError("analysis_source_ips: incompatible index; inspect database/schema.sql.")
             indexes.setdefault(name, (non_unique, []))[1].append(column)
-        if indexes != {"PRIMARY": (0, ["period_start", "period_end", "source_ip"]),
-                       "idx_analysis_source_history": (1, ["source_ip", "period_start", "period_end"])}:
+        expected_indexes = {"PRIMARY": (0, ["period_start", "period_end", "source_ip"]),
+                            "idx_analysis_source_history": (1, ["source_ip", "period_start", "period_end"])}
+        if scoped:
+            expected_indexes["PRIMARY"][1].append("host_scope")
+            expected_indexes["fk_analysis_source_ips_host"] = (1, ["host_id"])
+        if indexes != expected_indexes:
             raise SchemaError("analysis_source_ips: incompatible keys; inspect database/schema.sql.")
 
 

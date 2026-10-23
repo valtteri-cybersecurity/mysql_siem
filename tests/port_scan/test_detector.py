@@ -35,6 +35,7 @@ def test_exactly_ten_ports_and_result_fields():
     events = make_events()
     assert detect_port_scans(events) == [{
         "rule_key": "PORT_SCAN_001",
+        "host_id": None,
         "source_ip": "192.0.2.1",
         "destination_ip": "198.51.100.1",
         "protocol": "TCP",

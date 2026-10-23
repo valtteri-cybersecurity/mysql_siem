@@ -31,6 +31,7 @@ def test_four_failures_do_not_detect():
 def test_five_failures_and_result_fields():
     assert detect_ssh_brute_force(make_events()) == [{
         "rule_key": "SSH_BRUTE_FORCE_001", "source_ip": "192.0.2.1",
+        "host_id": None,
         "hostname": "server-a", "failure_count": 5, "first_seen": START,
         "last_seen": START + timedelta(seconds=4), "evidence_ids": [1, 2, 3, 4, 5],
         "usernames": ["alice"],

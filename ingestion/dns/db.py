@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 import pymysql
 
+from database.identity import configured_identity, identity_schema_enabled
 from ingestion.dns.models import DNSEvent
 
 
@@ -193,13 +194,20 @@ def save_events(connection, source_id, events, *, state=None, dedup_keys=None):
             raise ValueError("DNS collection state exceeds 64 KiB.")
 
     with transaction(connection) as cursor:
+        registry_field = ", registry_source_id" if identity_schema_enabled(connection) else ""
+        identity = configured_identity(cursor, "dns")
         cursor.execute(
-            "SELECT source_name, enabled FROM dns_sources WHERE id = %s FOR UPDATE",
+            f"SELECT source_name, enabled{registry_field} FROM dns_sources WHERE id = %s FOR UPDATE",
             (source_id,),
         )
         source = cursor.fetchone()
         if source is None or not source[1]:
             raise DNSStorageError("DNS source is missing or disabled.")
+        registry_source_id = source[2] if len(source) > 2 else None
+        if identity is not None and registry_source_id != identity.source_id:
+            raise DNSStorageError("DNS integration is not bound to the configured registry source.")
+        if registry_source_id is not None and identity is None:
+            raise DNSStorageError("Registered DNS integration requires SIEM_DNS_SOURCE_ID and SIEM_COLLECTOR_ID.")
         if any(event.source_name != source[0] for event in events):
             raise ValueError("DNS events do not match the registered source.")
         if values and dedup_keys is not None:
@@ -232,6 +240,17 @@ def save_events(connection, source_id, events, *, state=None, dedup_keys=None):
                         upstream, elapsed_ms, cached, dedup_key
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """
+            if identity is not None:
+                # Snapshot the server identity; a client's IP stays unassigned.
+                fields = ("source_id", "event_time", "raw_timestamp", "client_ip", "domain",
+                          "query_type", "response_code", "filtering_result", "filtering_reason",
+                          "upstream", "elapsed_ms", "cached")
+                if dedup_keys is not None:
+                    fields += ("dedup_key",)
+                fields += ("host_id", "registry_source_id", "collector_id")
+                placeholders = ", ".join(["%s"] * len(fields))
+                sql = f"INSERT INTO dns_events ({', '.join(fields)}) VALUES ({placeholders})"
+                values = [row + identity.values()[:3] for row in values]
             cursor.executemany(sql, values)
         inserted = cursor.rowcount if values else 0
         if state_json is not None:

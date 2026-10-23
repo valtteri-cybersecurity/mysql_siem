@@ -5,6 +5,21 @@ import json
 
 import pymysql
 
+from database.identity import validate_id, validate_text
+
+
+def link_alert_hosts(cursor, alert_id, hosts):
+    """Link one stored alert to several machines, with caller-supplied roles."""
+    validate_id(alert_id)
+    for host_id, role in hosts:
+        validate_id(host_id)
+        validate_text(role, maximum=32)
+        if not role.isascii():
+            raise ValueError("Alert host roles must use ASCII characters.")
+        cursor.execute("""INSERT INTO alert_hosts (alert_id, host_id, host_role)
+            VALUES (%s, %s, %s) ON DUPLICATE KEY UPDATE host_role = alert_hosts.host_role""",
+                       (alert_id, host_id, role))
+
 
 class AlertStorageError(RuntimeError):
     """A database or rule configuration failure safe to display to the user."""
@@ -103,6 +118,14 @@ def save_alert(connection, alert, evidence, *, manage_transaction=True):
             return False
 
         alert_id = cursor.lastrowid
+        host_id = alert.get("host_id")
+        hosts = list(alert.get("hosts", ()))
+        if host_id is not None:
+            validate_id(host_id)
+            cursor.execute("UPDATE detection_alerts SET host_id = %s WHERE id = %s", (host_id, alert_id))
+            hosts.append((host_id, "TARGET"))
+        if hosts:
+            link_alert_hosts(cursor, alert_id, hosts)
         rows = []
         for event_type, event_id in evidence_rows:
             rows.append((alert_id, event_type, event_id))

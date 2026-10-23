@@ -1,7 +1,8 @@
-from database.connection import get_connection
+import pymysql
 
-from metrics.system.get import get_data, get_timestamp
+from database.connection import get_connection
 from metrics.system.db import save_metrics_db
+from metrics.system.get import get_data, get_timestamp
 
 
 def main():
@@ -22,8 +23,8 @@ def main():
         else:
             print(f"{timestamp}:   No measurement data received.")
 
-    except Exception as error:
-        print(f"{timestamp}:   Error during program execution: {error}")
+    except (OSError, ValueError, pymysql.MySQLError):
+        print(f"{timestamp}:   System metric collection failed.")
 
     finally:
         if connection:

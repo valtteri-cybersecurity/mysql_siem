@@ -14,7 +14,11 @@ def build_alert(detection):
         "last_seen": detection["last_seen"].isoformat(timespec="microseconds"),
         "evidence_ids": evidence_ids,
     }
+    if detection.get("host_id") is not None:
+        identity["host_id"] = detection["host_id"]
+        identity.pop("hostname")
     alert = {
+        "host_id": detection.get("host_id"),
         "rule_key": RULE_KEY,
         "title": "SSH Brute Force Attempt",
         "description": (
@@ -27,6 +31,7 @@ def build_alert(detection):
         "last_seen": detection["last_seen"],
         "alert_fingerprint": make_alert_fingerprint(RULE_KEY, identity),
         "details": {
+            "host_id": detection.get("host_id"),
             "hostname": detection["hostname"],
             "failure_count": detection["failure_count"],
             "window_seconds": int(WINDOW.total_seconds()),
@@ -34,4 +39,6 @@ def build_alert(detection):
             "usernames": sorted(set(detection.get("usernames", []))),
         },
     }
+    if detection.get("host_id") is None:
+        alert["details"].pop("host_id")
     return alert, [("AUTH", event_id) for event_id in evidence_ids]

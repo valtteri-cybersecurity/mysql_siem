@@ -1,10 +1,9 @@
 """Manage source-scoped DNS client rules independently of collection and views."""
 
-from ipaddress import ip_address
-
 import pymysql
 
 from ingestion.dns.db import DNSStorageError, transaction, validate_id, validate_text
+from ingestion.ip_addresses import canonical_ip
 
 FILTER_COLUMNS = (
     "id",
@@ -28,7 +27,7 @@ def normalize_client_ip(value):
     if not isinstance(value, str) or "%" in value:
         raise ValueError("A valid IPv4 or IPv6 client address is required.")
     try:
-        return str(ip_address(value))
+        return canonical_ip(value)
     except ValueError:
         raise ValueError("A valid IPv4 or IPv6 client address is required.") from None
 

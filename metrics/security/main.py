@@ -1,7 +1,8 @@
-from database.connection import get_connection
+import pymysql
 
-from metrics.security.get_data import get_data
+from database.connection import get_connection
 from metrics.security.database import save_metrics_db
+from metrics.security.get_data import get_data
 
 
 def main():
@@ -17,8 +18,8 @@ def main():
         data = get_data(connection)
         save_metrics_db(connection, data)
 
-    except Exception as error:
-        print(f"ERROR DURING EXECUTION: {error}")
+    except (OSError, ValueError, pymysql.MySQLError):
+        print("Security metric collection failed.")
 
     finally:
         if connection:

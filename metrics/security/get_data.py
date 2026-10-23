@@ -1,5 +1,8 @@
 from datetime import datetime
 
+from database.identity import configured_identity, identity_schema_enabled
+
+
 def get_failed_logins():
 
     date = datetime.now().strftime("%Y-%m-%d")
@@ -25,14 +28,19 @@ def get_failed_logins():
 def get_blocks_today(connection):
 
     cursor = connection.cursor()
+    identity = configured_identity(cursor, "security")
     sql_message = """
     SELECT COUNT(*) AS block_count_today
     FROM ufw_log
     WHERE action = 'BLOCK'
-    AND DATE(event_time) = CURDATE();
+    AND DATE(event_time) = CURDATE()
     """
 
-    cursor.execute(sql_message)
+    parameters = ()
+    if identity_schema_enabled(connection):
+        sql_message += " AND host_id <=> %s"
+        parameters = (identity.host_id if identity is not None else None,)
+    cursor.execute(sql_message, parameters)
     tulos = cursor.fetchone()[0]
 
     cursor.close()
@@ -42,15 +50,20 @@ def get_blocks_today(connection):
 def get_unique_ips_today(connection):
 
     cursor = connection.cursor()
+    identity = configured_identity(cursor, "security")
 
     sql_message = """
     SELECT COUNT(DISTINCT src_ip) AS unique_ips_today
     FROM ufw_log
     WHERE action = 'BLOCK'
-    AND DATE(event_time) = CURDATE();
+    AND DATE(event_time) = CURDATE()
     """
 
-    cursor.execute(sql_message)
+    parameters = ()
+    if identity_schema_enabled(connection):
+        sql_message += " AND host_id <=> %s"
+        parameters = (identity.host_id if identity is not None else None,)
+    cursor.execute(sql_message, parameters)
 
     tulos = cursor.fetchone()[0]
 

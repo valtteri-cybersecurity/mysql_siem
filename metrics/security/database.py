@@ -2,13 +2,17 @@ from datetime import datetime
 
 import pymysql
 
+from database.identity import configured_identity, identity_schema_enabled
+
 
 def save_metrics_db(connection, data):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor = None
 
     try:
+        identity_schema_enabled(connection)
         cursor = connection.cursor()
+        identity = configured_identity(cursor, "security")
 
         sql_message = """
         INSERT INTO security_metrics
@@ -22,13 +26,24 @@ def save_metrics_db(connection, data):
             unique_ips = VALUES(unique_ips);
         """
 
-        cursor.execute(sql_message, (
+        values = (
             data["uptime"],
             data["blocks"],
             data["failed_logins"],
             data["unique_ips"],
             data["date"]
-        ))
+        )
+        if identity is not None:
+            sql_message = """INSERT INTO security_metrics
+                (uptime, blocks, failed_logins, unique_ips, date,
+                 host_id, source_id, collector_id, sender_id, host_scope)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE uptime = VALUES(uptime), blocks = VALUES(blocks),
+                    failed_logins = VALUES(failed_logins), unique_ips = VALUES(unique_ips),
+                    source_id = VALUES(source_id), collector_id = VALUES(collector_id),
+                    sender_id = VALUES(sender_id)"""
+            values += identity.values() + (identity.host_id,)
+        cursor.execute(sql_message, values)
 
         connection.commit()
 
@@ -37,8 +52,8 @@ def save_metrics_db(connection, data):
             "Security-metrics successfully written to the database!"
         )
 
-    except pymysql.MySQLError as error:
-        print(f"{timestamp}:   DATABASE ERROR: {error}")
+    except pymysql.MySQLError:
+        print(f"{timestamp}:   Security metric database operation failed.")
 
         if connection:
             connection.rollback()

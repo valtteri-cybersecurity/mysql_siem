@@ -38,6 +38,7 @@ def event():
 @pytest.fixture
 def connection():
     connection = Mock()
+    connection._siem_identity_ready = False
     connection.cursor.return_value.fetchone.return_value = ("dns", 1)
     connection.cursor.return_value.rowcount = 2
     return connection

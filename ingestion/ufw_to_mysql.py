@@ -6,7 +6,10 @@ import hashlib
 import os
 import time
 
+import pymysql
+
 from database.connection import get_connection
+from database.identity import configured_identity, identity_schema_enabled
 from ingestion.splitter import parse_ufw_line
 
 LOGFILE = "/var/log/ufw.log"
@@ -48,7 +51,7 @@ def validate_limits(max_lines, max_seconds):
         raise ValueError("--max-seconds must be within 1..50.")
 
 
-def save_event(cursor, line):
+def save_event(cursor, line, *, identity=None):
     clean_line = line.strip()
 
     if clean_line == "":
@@ -69,20 +72,8 @@ def save_event(cursor, line):
         clean_line.encode("utf-8")
     ).hexdigest()
 
-    sql = """
-        INSERT IGNORE INTO ufw_log (
-            event_time,
-            action,
-            src_ip,
-            dst_ip,
-            protocol,
-            src_port,
-            dst_port,
-            raw_line,
-            event_hash
-        )
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """
+    fields = ("event_time", "action", "src_ip", "dst_ip", "protocol", "src_port",
+              "dst_port", "raw_line", "event_hash")
 
     values = (
         event_time,
@@ -96,7 +87,19 @@ def save_event(cursor, line):
         event_hash
     )
 
-    cursor.execute(sql, values)
+    if identity is not None:
+        fields += ("host_id", "source_id", "collector_id", "sender_id", "source_scope", "reported_hostname")
+        values += identity.values() + (identity.source_id, info_table.get("reported_hostname"))
+    # Suppress only an actual replay. INSERT IGNORE could hide an invalid
+    # identity binding or a truncated field and still advance the file offset.
+    placeholders = ", ".join(["%s"] * len(fields))
+    sql = f"INSERT INTO ufw_log ({', '.join(fields)}) VALUES ({placeholders})"
+    try:
+        cursor.execute(sql, values)
+    except pymysql.IntegrityError as error:
+        if error.args[0] != 1062:
+            raise
+        return 0
 
     if cursor.rowcount == 1:
         return 1
@@ -104,7 +107,7 @@ def save_event(cursor, line):
     return 0
 
 
-def process_file(cursor, filename, *, stats=None, max_lines=MAX_LINES, deadline=None):
+def process_file(cursor, filename, *, stats=None, max_lines=MAX_LINES, deadline=None, identity=None):
     """Read complete lines only, up to this file's initial size and shared budget.
 
     stats counts every complete line, including blank and duplicate lines. The
@@ -139,14 +142,21 @@ def process_file(cursor, filename, *, stats=None, max_lines=MAX_LINES, deadline=
         file_inode = file_info.st_ino
         current_size = file_info.st_size
 
+        source_scope = identity.source_id if identity is not None else 0
+        scoped = identity is not None or identity_schema_enabled(cursor.connection)
+        scope_filter = " AND source_scope = %s" if scoped else ""
+        position_parameters = (file_device, file_inode)
+        if scoped:
+            position_parameters += (source_scope,)
         cursor.execute(
-            """
+            f"""
             SELECT last_position
             FROM ufw_state
             WHERE file_device = %s
               AND file_inode = %s
+              {scope_filter}
             """,
-            (file_device, file_inode)
+            position_parameters
         )
 
         result = cursor.fetchone()
@@ -182,33 +192,20 @@ def process_file(cursor, filename, *, stats=None, max_lines=MAX_LINES, deadline=
                 stats["stop_reason"] = "time_limit"
                 break
             line = raw_line.decode("utf-8", errors="ignore")
-            inserted_rows += save_event(cursor, line)
+            inserted_rows += save_event(cursor, line, identity=identity)
             stats["lines_read"] += 1
 
         new_position = infile.tell()
 
-        cursor.execute(
-            """
-            INSERT INTO ufw_state (
-                logfile,
-                last_position,
-                file_device,
-                file_inode
-            )
-            VALUES (%s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-                logfile = %s,
-                last_position = %s
-            """,
-            (
-                filename,
-                new_position,
-                file_device,
-                file_inode,
-                filename,
-                new_position
-            )
-        )
+        fields = ("logfile", "last_position", "file_device", "file_inode")
+        values = (filename, new_position, file_device, file_inode)
+        if scoped:
+            fields += ("source_scope",)
+            values += (source_scope,)
+        placeholders = ", ".join(["%s"] * len(fields))
+        cursor.execute(f"INSERT INTO ufw_state ({', '.join(fields)}) VALUES ({placeholders}) "
+                       "ON DUPLICATE KEY UPDATE logfile = %s, last_position = %s",
+                       values + (filename, new_position))
 
     return inserted_rows
 
@@ -246,6 +243,7 @@ def process_log(connection, *, max_lines=MAX_LINES, max_seconds=MAX_SECONDS):
         lock_acquired = True
         deadline = time.monotonic() + max_seconds
         connection.begin()
+        identity = configured_identity(cursor, "ufw")
         inserted_rows = 0
 
         logfiles = get_logfiles()
@@ -258,7 +256,7 @@ def process_log(connection, *, max_lines=MAX_LINES, max_seconds=MAX_SECONDS):
                 stats["stop_reason"] = "time_limit"
                 break
             inserted_rows += process_file(cursor, filename, stats=stats,
-                                          max_lines=max_lines, deadline=deadline)
+                                          max_lines=max_lines, deadline=deadline, identity=identity)
         if stats["lines_read"] >= max_lines:
             stats["stop_reason"] = "line_limit"
         elif time.monotonic() >= deadline:
@@ -307,8 +305,8 @@ def main(argv=None):
 
         process_log(connection, max_lines=args.max_lines, max_seconds=args.max_seconds)
 
-    except Exception as error:  # noqa: BLE001 - retain the existing CLI error behavior
-        print(f"Error during program execution: {error}")
+    except (pymysql.MySQLError, OSError, ValueError, RuntimeError):
+        print("UFW collection failed. Check schema, source access and identity configuration.")
 
     finally:
         if connection:

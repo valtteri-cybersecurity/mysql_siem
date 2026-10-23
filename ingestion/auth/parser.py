@@ -4,7 +4,8 @@ import hashlib
 import json
 import re
 from datetime import datetime, timezone
-from ipaddress import ip_address
+
+from ingestion.ip_addresses import canonical_ip
 
 # Require a complete date and an explicit offset: never guess a missing year/zone.
 LOG_LINE = re.compile(
@@ -46,7 +47,7 @@ def parse_auth_line(line):
     try:
         event_time = datetime.fromisoformat(match["time"].replace("Z", "+00:00"))
         event_time = event_time.astimezone(timezone.utc).replace(tzinfo=None)
-        source_ip = str(ip_address(failure["ip"]))
+        source_ip = canonical_ip(failure["ip"])
     except (ValueError, OverflowError):
         return None
     # MySQL DATETIME starts at year 1000; malformed old dates must not abort ingestion.

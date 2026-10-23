@@ -39,7 +39,7 @@ def test_growing_log_stops_at_initial_size_and_resumes_next_pass(tmp_path, monke
     logfile.write_bytes(line())
     seen = []
 
-    def save(cursor, value):
+    def save(cursor, value, *, identity=None):
         seen.append(value)
         if len(seen) <= 3:
             with logfile.open("ab") as out:
@@ -62,7 +62,7 @@ def test_newline_appended_during_pass_does_not_complete_snapshot_partial_line(tm
     logfile.write_bytes(line() + line(1).rstrip(b"\n"))
     seen = []
 
-    def save(cursor, value):
+    def save(cursor, value, *, identity=None):
         seen.append(value)
         if len(seen) == 1:
             with logfile.open("ab") as out:
@@ -147,7 +147,7 @@ def test_time_limit_is_shared_and_commits_processed_lines(tmp_path, monkeypatch)
     monkeypatch.setattr(ufw.time, "monotonic", lambda: clock[0])
     seen = []
 
-    def save(cursor, value):
+    def save(cursor, value, *, identity=None):
         seen.append(value)
         clock[0] = 2.0
         return 1
@@ -184,7 +184,7 @@ def test_deadline_during_read_keeps_the_unprocessed_line(tmp_path, monkeypatch):
     assert stats == {"lines_read": 0, "stop_reason": "time_limit"}
 
 
-@pytest.mark.parametrize("failed_operation", ["INSERT IGNORE INTO ufw_log", "INSERT INTO ufw_state", "commit"])
+@pytest.mark.parametrize("failed_operation", ["INSERT INTO ufw_log", "INSERT INTO ufw_state", "commit"])
 def test_database_failures_roll_back_and_release_writer_lock(tmp_path, monkeypatch, failed_operation):
     logfile = tmp_path / "ufw.log"
     logfile.write_bytes(line())

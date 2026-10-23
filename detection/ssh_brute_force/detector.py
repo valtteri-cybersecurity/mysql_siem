@@ -1,8 +1,10 @@
 """Detect SSH_BRUTE_FORCE_001 from normalized events without database access."""
 
 from datetime import datetime, timedelta, timezone
-from ipaddress import ip_address
 from operator import itemgetter
+
+from database.identity import event_scope
+from ingestion.ip_addresses import canonical_ip
 
 RULE_KEY = "SSH_BRUTE_FORCE_001"
 MIN_FAILURES = 5
@@ -40,7 +42,7 @@ def _normalize_event(event):
     if not isinstance(source_ip, str) or "%" in source_ip:
         return None
     try:
-        source_ip = str(ip_address(source_ip))
+        source_ip = canonical_ip(source_ip)
     except ValueError:
         return None
     event_time = _parse_event_time(event.get("event_time"))
@@ -98,6 +100,7 @@ def _build_detection(events):
             usernames.add(username)
     return {
         "rule_key": RULE_KEY,
+        "host_id": events[0].get("host_id"),
         "source_ip": events[0]["source_ip"],
         "hostname": events[0]["hostname"],
         "failure_count": len(events),
@@ -124,11 +127,13 @@ def detect_ssh_brute_force(events):
         if event is None:
             continue
         keys = _identity_keys(event)
+        scope = event_scope(event)
+        keys = [(scope, key) for key in keys]
         duplicate = any(key in seen for key in keys)
         seen.update(keys)
         if duplicate:
             continue
-        group = (event["source_ip"], event["hostname"])
+        group = (event["source_ip"], scope)
         groups.setdefault(group, []).append(event)
     detections = []
     for group_events in groups.values():

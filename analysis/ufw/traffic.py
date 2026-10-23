@@ -10,6 +10,7 @@ Rerun a historical range to repair late arrivals beyond the recent window.
 from datetime import datetime, timedelta
 
 from analysis.ufw.source_ips import validate_time_range
+from database.identity import identity_schema_enabled, validate_id
 
 LOCK_NAME = "mysql_siem_analysis_ufw_traffic"
 METRICS = (
@@ -54,26 +55,35 @@ def hour_periods(start_time, end_time):
         start = end
 
 
-def analyze_traffic(connection, start_time, end_time):
+def analyze_traffic(connection, start_time, end_time, *, host_id=None):
     """One indexed range query, including empty intervals; caller owns transaction.
 
     No LIMIT: truncation would silently corrupt totals and daily distinct counts.
     SQL aggregation does not load the raw event history into Python memory.
     """
     validate_time_range(start_time, end_time)
+    if host_id is not None:
+        validate_id(host_id)
+    sql = AGGREGATE_SQL
+    parameters = (start_time, end_time)
+    if identity_schema_enabled(connection):
+        sql += " AND host_id <=> %s"
+        parameters += (host_id,)
+    elif host_id is not None:
+        raise TrafficAnalysisError("Host-specific traffic requires the phase-2 migrations.")
     with connection.cursor() as cursor:
-        cursor.execute(AGGREGATE_SQL, (start_time, end_time))
+        cursor.execute(sql, parameters)
         row = cursor.fetchone()
     result = {name: int(value) for name, value in zip(METRICS, row[:10])}
     result.update(first_seen=row[10], last_seen=row[11])
     return result
 
 
-def save_traffic(connection, start_time, end_time, *, daily, now):
+def save_traffic(connection, start_time, end_time, *, daily, now, host_id=None):
     """Save one bucket atomically. Table/column names are internal constants."""
     connection.begin()
     try:
-        result = analyze_traffic(connection, start_time, end_time)
+        result = analyze_traffic(connection, start_time, end_time, host_id=host_id)
         if daily:
             table = "analysis_ufw_traffic_daily"
             fields = ("analysis_date",) + METRICS
@@ -84,6 +94,9 @@ def save_traffic(connection, start_time, end_time, *, daily, now):
             values = (start_time, end_time) + tuple(result[name] for name in METRICS) + (result["first_seen"], result["last_seen"])
         fields += ("period_status", "coverage_status")
         values += ("OPEN" if now < end_time else "CLOSED", "UNKNOWN")
+        if identity_schema_enabled(connection):
+            fields += ("host_id", "host_scope")
+            values += (host_id, host_id or 0)
         updates = ", ".join(f"{name} = VALUES({name})" for name in fields)
         with connection.cursor() as cursor:
             cursor.execute(
@@ -124,16 +137,28 @@ def run_traffic_analysis(connection, start_time, end_time, *, now=None, previous
             summary["reason"] = "Another Traffic Analysis run holds the lock."
             return summary
         locked = True
+        host_ids = set()
+        if identity_schema_enabled(connection):
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT host_id FROM log_sources WHERE source_type = 'ufw' "
+                               "UNION SELECT DISTINCT host_id FROM ufw_log")
+                host_ids = {row[0] for row in cursor.fetchall()}
+        # Retain the legacy empty-period behavior without assigning a machine.
+        host_ids.add(None)
         days = set()
         for start, end in hour_periods(start_time, end_time):
-            result = save_traffic(connection, start, end, daily=False, now=now)
+            total_events = 0
+            for host_id in host_ids:
+                result = save_traffic(connection, start, end, daily=False, now=now, host_id=host_id)
+                total_events += result["total_events"]
             days.add(start.replace(hour=0))
-            summary["total_events"] += result["total_events"]
+            summary["total_events"] += total_events
             summary["hour_count"] += 1
         if previous_day:
             days.add(now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1))
         for start in sorted(days):
-            save_traffic(connection, start, start + timedelta(days=1), daily=True, now=now)
+            for host_id in host_ids:
+                save_traffic(connection, start, start + timedelta(days=1), daily=True, now=now, host_id=host_id)
             summary["day_count"] += 1
         summary["status"] = "SUCCESS"
         return summary
@@ -165,6 +190,10 @@ def validate_traffic_schema(connection):
             expected.update({name: ("date" if name == "analysis_date" else "datetime(6)", "NO", "") for name in keys})
             if table == "analysis_ufw_traffic":
                 expected.update({name: ("datetime(6)", "YES", "") for name in ("first_seen", "last_seen")})
+            scoped = "host_id" in actual
+            if scoped:
+                expected["host_id"] = ("bigint unsigned", "YES", "")
+                expected["host_scope"] = ("bigint unsigned", "NO", "")
             if actual != expected:
                 raise TrafficAnalysisError(f"{table}: incompatible columns; inspect database/schema.sql.")
             cursor.execute("""SELECT index_name, non_unique, column_name, sub_part, is_visible
@@ -175,5 +204,9 @@ def validate_traffic_schema(connection):
                 if prefix is not None or visible != "YES":
                     raise TrafficAnalysisError(f"{table}: incompatible index; inspect database/schema.sql.")
                 indexes.setdefault(name, (non_unique, []))[1].append(column)
-            if indexes != {"PRIMARY": (0, ["id"]), "uq_traffic_period": (0, keys)}:
+            expected_indexes = {"PRIMARY": (0, ["id"]), "uq_traffic_period": (0, list(keys))}
+            if scoped:
+                expected_indexes["uq_traffic_period"][1].append("host_scope")
+                expected_indexes[f"fk_{table}_host"] = (1, ["host_id"])
+            if indexes != expected_indexes:
                 raise TrafficAnalysisError(f"{table}: incompatible period keys; inspect database/schema.sql.")

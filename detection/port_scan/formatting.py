@@ -17,7 +17,10 @@ def build_alert(detection):
         "distinct_ports": ports,
         "evidence_ids": evidence_ids,
     }
+    if detection.get("host_id") is not None:
+        identity["host_id"] = detection["host_id"]
     alert = {
+        "host_id": detection.get("host_id"),
         "rule_key": detection["rule_key"],
         "title": "Possible Port Scanning",
         "description": (

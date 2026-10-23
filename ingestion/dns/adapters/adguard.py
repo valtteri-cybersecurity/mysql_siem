@@ -3,12 +3,12 @@
 import json
 import time
 from decimal import Decimal, InvalidOperation
-from ipaddress import ip_address
 
 import requests
 
 from ingestion.dns.models import DNSEvent, DNSPage
 from ingestion.dns.timestamps import parse_timestamp as parse_dns_timestamp
+from ingestion.ip_addresses import canonical_ip
 
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 FILTERING_RESULTS = {
@@ -72,7 +72,7 @@ def normalize_event(data, source_name):
         try:
             if "%" in client:
                 raise ValueError
-            client = str(ip_address(client))
+            client = canonical_ip(client)
         except ValueError:
             raise AdGuardDataError("Invalid query log client address.") from None
 

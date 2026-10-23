@@ -3,7 +3,12 @@
 import json
 from datetime import datetime
 
-from detection.ssh_brute_force.db import FIELDS, MAX_EVENTS, SSHDetectionError
+from detection.ssh_brute_force.db import (
+    FIELDS,
+    IDENTITY_FIELDS,
+    MAX_EVENTS,
+    SSHDetectionError,
+)
 
 
 def load_state(connection, rule_id):
@@ -28,7 +33,9 @@ def load_state(connection, rule_id):
         seen = set()
         for item in data["events"]:
             event = dict(item["event"])
-            if set(event) != set(FIELDS):
+            # Phase-1 buffers have no registry identity. Retain their events and
+            # checkpoint without inventing an identity during upgrade.
+            if set(event) not in (set(FIELDS), set(FIELDS + IDENTITY_FIELDS)):
                 raise ValueError
             event_id = event["id"]
             if type(event_id) is not int or not 0 < event_id <= last_id or event_id in seen:

@@ -29,6 +29,8 @@ def _confirm_detection(connection, detection):
         raise SSHDetectionError("SSH evidence does not describe one qualifying episode.")
     confirmed = findings[0]
     fields = ("rule_key", "source_ip", "hostname", "failure_count", "first_seen", "last_seen")
+    if confirmed.get("host_id") != detection.get("host_id"):
+        raise SSHDetectionError("The SSH finding does not match its registered host.")
     if (any(confirmed[key] != detection[key] for key in fields)
             or sorted(confirmed["evidence_ids"]) != validate_evidence_ids(detection["evidence_ids"])):
         raise SSHDetectionError("The SSH finding no longer matches its source events.")
@@ -60,7 +62,9 @@ def store_detection(connection, detection):
     previous = find_related_alert(connection, alert["rule_key"], evidence)
     if previous is None or previous["id"] != related_ids[0]:
         raise SSHDetectionError("The related SSH alert changed during processing.")
-    if previous["details"].get("hostname") != detection["hostname"]:
+    if (previous["details"].get("host_id") != detection.get("host_id")
+            or (detection.get("host_id") is None
+                and previous["details"].get("hostname") != detection["hostname"])):
         raise SSHDetectionError("The related SSH alert has an inconsistent target host.")
     previous_ids = get_alert_evidence_ids(connection, previous["id"])
     # Count the union of source events, never the sum of overlapping window counts.
@@ -69,7 +73,8 @@ def store_detection(connection, detection):
     merged = detect_ssh_brute_force(events)
     if (len(merged) != 1 or sorted(merged[0]["evidence_ids"]) != combined_ids
             or merged[0]["source_ip"] != detection["source_ip"]
-            or merged[0]["hostname"] != detection["hostname"]):
+            or merged[0].get("host_id") != detection.get("host_id")
+            or (detection.get("host_id") is None and merged[0]["hostname"] != detection["hostname"])):
         raise SSHDetectionError("Saved and new SSH evidence do not form one consistent episode.")
     alert, evidence = build_alert(merged[0])
     changed = update_alert(connection, previous["id"], alert["first_seen"], alert["last_seen"],

@@ -2,11 +2,19 @@
 
 from datetime import datetime
 
+from database.identity import identity_schema_enabled
 from detection.ssh_brute_force.detector import RULE_KEY
 
 MAX_EVENTS = 100000
 LOCK_NAME = "mysql_siem_detection_SSH_BRUTE_FORCE_001"
 FIELDS = ("id", "event_time", "hostname", "source_ip", "username", "event_type", "service", "event_hash")
+IDENTITY_FIELDS = ("host_id", "source_id")
+
+
+def event_fields(connection):
+    if identity_schema_enabled(connection):
+        return FIELDS + IDENTITY_FIELDS
+    return FIELDS
 
 
 class SSHDetectionError(RuntimeError):
@@ -24,10 +32,11 @@ def validate_time_range(start_time, end_time):
 def get_db_data(connection, start_time, end_time):
     """Return only SSH failures in [start_time, end_time), ordered by time/ID."""
     validate_time_range(start_time, end_time)
+    fields = event_fields(connection)
     with connection.cursor() as cursor:
         cursor.execute(
-            """
-            SELECT id, event_time, hostname, source_ip, username, event_type, service, event_hash
+            f"""
+            SELECT {', '.join(fields)}
             FROM auth_events
             WHERE event_time >= %s AND event_time < %s
               AND event_type = %s AND service = %s
@@ -38,7 +47,7 @@ def get_db_data(connection, start_time, end_time):
         rows = cursor.fetchall()
     if len(rows) > MAX_EVENTS:
         raise SSHDetectionError("Too many SSH events; retry with a shorter time range.")
-    return [dict(zip(FIELDS, row)) for row in rows]
+    return [dict(zip(fields, row)) for row in rows]
 
 
 def get_rule(connection, *, lock=False):
@@ -67,10 +76,11 @@ def validate_evidence_ids(event_ids):
 def get_evidence_events(connection, event_ids):
     """Lock actual source rows until the caller commits alert/evidence writes."""
     event_ids = validate_evidence_ids(event_ids)
+    fields = event_fields(connection)
     with connection.cursor() as cursor:
         cursor.execute(
-            """
-            SELECT id, event_time, hostname, source_ip, username, event_type, service, event_hash
+            f"""
+            SELECT {', '.join(fields)}
             FROM auth_events WHERE id IN %s
               AND event_type = %s AND service = %s
             ORDER BY event_time, id FOR SHARE
@@ -80,7 +90,7 @@ def get_evidence_events(connection, event_ids):
         rows = cursor.fetchall()
     if len(rows) != len(event_ids):
         raise SSHDetectionError("SSH evidence is missing or has an unsupported event type/service.")
-    return [dict(zip(FIELDS, row)) for row in rows]
+    return [dict(zip(fields, row)) for row in rows]
 
 
 def get_related_alert_ids(connection, evidence):
@@ -137,12 +147,13 @@ def get_new_events(connection, last_event_id, batch_size):
     if (type(last_event_id) is not int or not 0 <= last_event_id < 2**64
             or type(batch_size) is not int or not 1 <= batch_size <= 10000):
         raise SSHDetectionError("Invalid SSH checkpoint or batch size.")
+    fields = event_fields(connection)
     with connection.cursor() as cursor:
         cursor.execute(
-            """
-            SELECT id, event_time, hostname, source_ip, username, event_type, service, event_hash
+            f"""
+            SELECT {', '.join(fields)}
             FROM auth_events WHERE id > %s ORDER BY id LIMIT %s
             """,
             (last_event_id, batch_size),
         )
-        return [dict(zip(FIELDS, row)) for row in cursor.fetchall()]
+        return [dict(zip(fields, row)) for row in cursor.fetchall()]

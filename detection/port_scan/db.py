@@ -2,6 +2,8 @@
 
 from datetime import datetime
 
+from database.identity import identity_schema_enabled
+
 
 def validate_time_range(start_time, end_time):
     for value in (start_time, end_time):
@@ -22,11 +24,12 @@ def get_db_data(connection, start_time, end_time):
     propagated; a failed query must never look like an empty successful run.
     """
     validate_time_range(start_time, end_time)
+    identity_fields = ", host_id, source_id" if identity_schema_enabled(connection) else ""
     cursor = connection.cursor()
     try:
         cursor.execute(
-            """
-            SELECT id, event_time, action, src_ip, dst_ip, protocol, dst_port
+            f"""
+            SELECT id, event_time, action, src_ip, dst_ip, protocol, dst_port{identity_fields}
             FROM ufw_log
             WHERE event_time >= %s AND event_time < %s
               AND action IN (%s, %s, %s)
@@ -37,8 +40,7 @@ def get_db_data(connection, start_time, end_time):
         )
         events = []
         for row in cursor.fetchall():
-            events.append(
-                {
+            event = {
                     "id": row[0],
                     "event_time": row[1],
                     "action": row[2],
@@ -47,7 +49,9 @@ def get_db_data(connection, start_time, end_time):
                     "protocol": row[5],
                     "dst_port": row[6],
                 }
-            )
+            if len(row) > 7:
+                event.update(host_id=row[7], source_id=row[8])
+            events.append(event)
         return events
     finally:
         cursor.close()
@@ -59,10 +63,11 @@ def get_new_events(connection, last_event_id, batch_size):
     Read every action so unsupported rows also advance the ID checkpoint.
     The existing collector serializes its writes through commit with GET_LOCK.
     """
+    identity_fields = ", host_id, source_id" if identity_schema_enabled(connection) else ""
     with connection.cursor() as cursor:
         cursor.execute(
-            """
-            SELECT id, event_time, action, src_ip, dst_ip, protocol, dst_port
+            f"""
+            SELECT id, event_time, action, src_ip, dst_ip, protocol, dst_port{identity_fields}
             FROM ufw_log WHERE id > %s ORDER BY id LIMIT %s
             """,
             (last_event_id, batch_size),
@@ -80,6 +85,8 @@ def get_new_events(connection, last_event_id, batch_size):
                             "dst_ip",
                             "protocol",
                             "dst_port",
+                            "host_id",
+                            "source_id",
                         ),
                         row,
                     )

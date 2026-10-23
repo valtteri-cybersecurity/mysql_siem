@@ -5,6 +5,7 @@ from datetime import datetime
 import pymysql
 
 from analysis.ufw.source_ips import MAX_EVENTS, normalize_ip, validate_time_range
+from database.identity import event_scope, identity_schema_enabled
 
 LOCK_NAME = "mysql_siem_analysis_ufw_ports"
 EVENT_FIELDS = ("event_time", "dst_ip", "dst_port", "protocol", "action", "src_ip")
@@ -48,6 +49,10 @@ def validate_ports_schema(connection):
             "protocol": ("varchar(3)", "NO", "ascii_bin", None, ""),
             "updated_at": ("timestamp(6)", "NO", None, "current_timestamp(6)", "default_generated on update current_timestamp(6)"),
         })
+        scoped = "host_id" in actual
+        if scoped:
+            expected["host_id"] = ("bigint unsigned", "YES", None, None, "")
+            expected["host_scope"] = ("bigint unsigned", "NO", None, "0", "")
         if actual != expected:
             raise PortAnalysisError("analysis_ufw_ports: column mismatch; inspect database/schema.sql.")
         cursor.execute("""SELECT index_name, non_unique, column_name, sub_part, index_type, is_visible
@@ -58,11 +63,15 @@ def validate_ports_schema(connection):
             if prefix is not None or kind != "BTREE" or visible != "YES":
                 raise PortAnalysisError("analysis_ufw_ports: invalid index; inspect database/schema.sql.")
             indexes.setdefault(name, (non_unique, []))[1].append(column)
-        if indexes != {
+        expected_indexes = {
             "PRIMARY": (0, ["id"]),
             "uq_ufw_ports_period": (0, ["period_start", "period_end", "destination_ip", "destination_port", "protocol"]),
             "idx_ufw_ports_history": (1, ["destination_port", "protocol", "destination_ip", "period_start", "period_end"]),
-        }:
+        }
+        if scoped:
+            expected_indexes["uq_ufw_ports_period"][1].append("host_scope")
+            expected_indexes["fk_analysis_ufw_ports_host"] = (1, ["host_id"])
+        if indexes != expected_indexes:
             raise PortAnalysisError("analysis_ufw_ports: index mismatch; inspect database/schema.sql.")
         cursor.execute("""SELECT tc.constraint_name, tc.constraint_type, tc.enforced, cc.check_clause
                        FROM information_schema.table_constraints AS tc
@@ -76,14 +85,18 @@ def validate_ports_schema(connection):
                 for token in ("`", " ", "(", ")", chr(92), "\t", "\n", "\r", "_ascii", "_utf8mb4"):
                     clause = clause.replace(token, "")
             constraints[name] = (kind, enforced, clause)
-        if constraints != {
+        expected_constraints = {
             "PRIMARY": ("PRIMARY KEY", "YES", None),
             "uq_ufw_ports_period": ("UNIQUE", "YES", None),
             "chk_ufw_ports_period": ("CHECK", "YES", "period_start<period_end"),
             "chk_ufw_ports_seen": ("CHECK", "YES", "first_seen>=period_startandfirst_seen<=last_seenandlast_seen<period_end"),
             "chk_ufw_ports_port": ("CHECK", "YES", "destination_portbetween1and65535"),
             "chk_ufw_ports_protocol": ("CHECK", "YES", "protocolin'tcp','udp'"),
-        }:
+        }
+        if scoped:
+            expected_constraints["fk_analysis_ufw_ports_host"] = ("FOREIGN KEY", "YES", None)
+            expected_constraints["chk_analysis_ufw_ports_scope"] = ("CHECK", "YES", "host_scope=coalescehost_id,0")
+        if constraints != expected_constraints:
             raise PortAnalysisError("analysis_ufw_ports: constraint mismatch; inspect database/schema.sql.")
 
 def aggregate_ports(events, start_time, end_time, *, max_events=MAX_EVENTS):
@@ -109,7 +122,7 @@ def aggregate_ports(events, start_time, end_time, *, max_events=MAX_EVENTS):
                 or protocol not in ("TCP", "UDP") or not isinstance(event_time, datetime)
                 or event_time.tzinfo is not None or not start_time <= event_time < end_time):
             continue
-        key = (destination_ip, port, protocol)
+        key = (event_scope(event), destination_ip, port, protocol)
         if key not in groups:
             groups[key] = {
                 "period_start": start_time, "period_end": end_time,
@@ -117,6 +130,9 @@ def aggregate_ports(events, start_time, end_time, *, max_events=MAX_EVENTS):
                 "total_events": 0, "blocked_events": 0, "allowed_events": 0, "audited_events": 0,
                 "first_seen": event_time, "last_seen": event_time, "source_ips": set(),
             }
+            if "host_id" in event:
+                groups[key]["host_id"] = event["host_id"]
+                groups[key]["host_scope"] = event["host_id"] or 0
         group = groups[key]
         group["total_events"] += 1
         group["first_seen"] = min(group["first_seen"], event_time)
@@ -140,17 +156,18 @@ def analyze_ports(connection, start_time, end_time, *, max_events=MAX_EVENTS):
     validate_time_range(start_time, end_time)
     if type(max_events) is not int or not 1 <= max_events <= 1000000:
         raise ValueError("max_events must be within 1..1000000.")
+    identity_fields = ", host_id" if identity_schema_enabled(connection) else ""
     with connection.cursor(pymysql.cursors.SSCursor) as cursor:
         cursor.execute(
-            """
-            SELECT event_time, dst_ip, dst_port, protocol, action, src_ip
+            f"""
+            SELECT event_time, dst_ip, dst_port, protocol, action, src_ip{identity_fields}
             FROM ufw_log
             WHERE event_time >= %s AND event_time < %s
             ORDER BY event_time, id LIMIT %s
             """,
             (start_time, end_time, max_events + 1),
         )
-        events = (dict(zip(EVENT_FIELDS, row)) for row in cursor)
+        events = (dict(zip(EVENT_FIELDS + ("host_id",), row)) for row in cursor)
         return aggregate_ports(events, start_time, end_time, max_events=max_events)
 
 
@@ -182,13 +199,13 @@ def run_port_analysis(connection, start_time, end_time, *, max_events=MAX_EVENTS
             cursor.execute("DELETE FROM analysis_ufw_ports WHERE period_start = %s AND period_end = %s",
                            (start_time, end_time))
             if results:
+                fields = RESULT_FIELDS
+                if "host_id" in results[0]:
+                    fields += ("host_id", "host_scope")
+                placeholders = ", ".join(["%s"] * len(fields))
                 cursor.executemany(
-                    """INSERT INTO analysis_ufw_ports (
-                        period_start, period_end, destination_ip, destination_port, protocol,
-                        total_events, blocked_events, allowed_events, audited_events,
-                        unique_source_ips, first_seen, last_seen
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    [tuple(result[field] for field in RESULT_FIELDS) for result in results],
+                    f"INSERT INTO analysis_ufw_ports ({', '.join(fields)}) VALUES ({placeholders})",
+                    [tuple(result[field] for field in fields) for result in results],
                 )
         connection.commit()
         committed = True

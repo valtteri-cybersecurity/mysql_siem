@@ -107,6 +107,25 @@ load_adguard_env() {
 
 load_mysql_env "$PROJECT_DIR/config/mysql.env"
 
+load_identity_env() {
+    local env_file="$PROJECT_DIR/config/identity.env"
+    local line key value
+    [[ -f "$env_file" ]] || return 0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        [[ "$line" == *=* ]] || { printf 'Invalid identity configuration.\n' >&2; return 1; }
+        key="${line%%=*}"
+        value="${line#*=}"
+        case "$key" in
+            SIEM_COLLECTOR_ID|SIEM_UFW_SOURCE_ID|SIEM_AUTH_SOURCE_ID|SIEM_DNS_SOURCE_ID|\
+            SIEM_SYSTEM_SOURCE_ID|SIEM_FILESYSTEM_SOURCE_ID|SIEM_SECURITY_SOURCE_ID)
+                export "$key=$value" ;;
+            *) printf 'Unknown identity configuration key.\n' >&2; return 1 ;;
+        esac
+    done < "$env_file"
+}
+load_identity_env
+
 load_port_scan_env() {
     local env_file="$PROJECT_DIR/config/port_scan.env"
     local line key value

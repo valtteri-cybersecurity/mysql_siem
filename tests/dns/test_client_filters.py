@@ -26,6 +26,7 @@ def connection():
         ("2001:0DB8:0000:0000:0000:0000:0000:ABCD", "2001:db8::abcd"),
         ("::1", "::1"),
         ("::ffff:192.0.2.15", "::ffff:c000:20f"),
+        ("::ffff:c000:020f", "::ffff:c000:20f"),
     ],
 )
 def test_normalize_ipv4_and_ipv6(value, expected):

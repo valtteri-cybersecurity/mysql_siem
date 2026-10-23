@@ -87,6 +87,9 @@ id "$INSTALL_USER" >/dev/null 2>&1 || die "User not found: $INSTALL_USER"
 for path in \
     database/schema.sql \
     database/schema.py \
+    database/migrate.py \
+    database/migration_steps.py \
+    database/migrations/014_host_registry.sql \
     config/run_with_env.sh \
     config/ssh.env.example \
     ingestion/auth/main.py \
@@ -202,6 +205,9 @@ try:
                 (db_name,),
             )
             existing = {row[0] for row in cur.fetchall()}
+            existing -= {"schema_migrations", "hosts", "host_groups", "host_group_members", "log_sources",
+                         "collectors", "collector_sources", "sender_identities", "sender_sources",
+                         "sender_certificates", "alert_hosts"}
             expected = {
                 "filesystem_metrics", "security_metrics", "system_metrics",
                 "ufw_log", "ufw_state",
@@ -263,6 +269,9 @@ fi
 ensure_schema() {
     PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 -m database.schema "$1"
 }
+# Read-only preflight. Migrations remain a separate, explicit admin operation.
+PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 -m database.migrate check --admin-socket /run/mysqld/mysqld.sock || \
+    die "Phase-2 migration required. Stop jobs, back up, and explicitly apply the documented migrations before retrying."
 log "Checking and creating missing UFW Analysis tables."
 ensure_schema analysis
 
@@ -353,6 +362,9 @@ try:
     with conn.cursor() as cur:
         cur.execute("SHOW TABLES")
         actual = {row[0] for row in cur.fetchall()}
+    actual -= {"schema_migrations", "hosts", "host_groups", "host_group_members", "log_sources",
+               "collectors", "collector_sources", "sender_identities", "sender_sources",
+               "sender_certificates", "alert_hosts"}
     dns_tables = {"dns_sources", "dns_events", "dns_collection_state"}
     detection_tables = {"detection_rules", "detection_alerts", "alert_evidence"}
     state_tables = {"detection_state"}
@@ -423,7 +435,8 @@ try:
                 raise SystemExit("ufw_state: the file-identity index must be unique.")
             index_columns[row[3]] = row[4]
 
-        if index_columns != {1: "file_device", 2: "file_inode"}:
+        if index_columns not in ({1: "file_device", 2: "file_inode"},
+                                 {1: "file_device", 2: "file_inode", 3: "source_scope"}):
             raise SystemExit("ufw_state: the file-identity index is missing or invalid.")
 finally:
     conn.close()
@@ -511,6 +524,13 @@ try:
             (db_name,),
         )
         actual = {row[0] for row in cur.fetchall()}
+        # Runtime jobs can resolve approved bindings but cannot enroll hosts,
+        # approve collectors, edit sender identities or manage certificates.
+        for table in ("schema_migrations", "hosts", "log_sources", "collectors", "collector_sources", "sender_identities", "sender_sources"):
+            if table in actual:
+                grants[table] = "SELECT"
+        if "alert_hosts" in actual:
+            grants["alert_hosts"] = "SELECT, INSERT"
         dns_tables = {"dns_sources", "dns_events", "dns_collection_state"}
         if dns_tables <= actual:
             grants.update({

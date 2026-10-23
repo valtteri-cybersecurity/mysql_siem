@@ -26,8 +26,8 @@ def test_installer_provisions_analysis_before_schema_validation_and_grants():
     grants = INSTALLER.index("# Grant privileges only after")
     schedule = INSTALLER.index("# Schedule UFW Analysis;")
     assert setup < guard < grants < schedule
-    assert "database/migrations/" not in INSTALLER
-    assert "apply migration" not in INSTALLER.lower()
+    assert "-m database.migrate check" in INSTALLER
+    assert "-m database.migrate apply" not in INSTALLER
     assert "database/schema.py" in INSTALLER
     assert "SOURCE_IP_ANALYSIS_READY=1" in section("# Source IP Analysis schema:", "# Port Activity Analysis schema:")
 

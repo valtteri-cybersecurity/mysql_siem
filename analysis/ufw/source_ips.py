@@ -1,9 +1,11 @@
 """Source-IP metrics for explicit UFW time intervals, without threat labels."""
 
 from datetime import datetime
-from ipaddress import ip_address
 
 import pymysql
+
+from database.identity import event_scope, identity_schema_enabled
+from ingestion.ip_addresses import canonical_ip
 
 MAX_EVENTS = 100000
 LOCK_NAME = "mysql_siem_analysis_source_ips"
@@ -33,7 +35,7 @@ def normalize_ip(value):
     if not isinstance(value, str) or "%" in value:
         return None
     try:
-        return str(ip_address(value))
+        return canonical_ip(value)
     except ValueError:
         return None
 
@@ -60,15 +62,19 @@ def aggregate_source_ips(events, start_time, end_time, *, max_events=MAX_EVENTS)
         if (source_ip is None or not isinstance(event_time, datetime)
                 or event_time.tzinfo is not None or not start_time <= event_time < end_time):
             continue
-        if source_ip not in groups:
-            groups[source_ip] = {
+        key = (event_scope(event), source_ip)
+        if key not in groups:
+            groups[key] = {
                 "period_start": start_time, "period_end": end_time, "source_ip": source_ip,
                 "total_events": 0, "blocked_events": 0, "allowed_events": 0, "audited_events": 0,
                 "tcp_events": 0, "udp_events": 0,
                 "first_seen": event_time, "last_seen": event_time,
                 "destination_ports": set(), "destination_ips": set(),
             }
-        group = groups[source_ip]
+            if "host_id" in event:
+                groups[key]["host_id"] = event["host_id"]
+                groups[key]["host_scope"] = event["host_id"] or 0
+        group = groups[key]
         group["total_events"] += 1
         group["first_seen"] = min(group["first_seen"], event_time)
         group["last_seen"] = max(group["last_seen"], event_time)
@@ -87,8 +93,8 @@ def aggregate_source_ips(events, start_time, end_time, *, max_events=MAX_EVENTS)
             group["destination_ips"].add(destination_ip)
 
     results = []
-    for source_ip in sorted(groups):
-        group = groups[source_ip]
+    for key in sorted(groups):
+        group = groups[key]
         group["unique_destination_ports"] = len(group.pop("destination_ports"))
         group["unique_destination_ips"] = len(group.pop("destination_ips"))
         results.append(group)
@@ -104,17 +110,18 @@ def analyze_source_ips(connection, start_time, end_time, *, max_events=MAX_EVENT
     validate_time_range(start_time, end_time)
     if type(max_events) is not int or not 1 <= max_events <= 1000000:
         raise ValueError("max_events must be within 1..1000000.")
+    identity_fields = ", host_id" if identity_schema_enabled(connection) else ""
     with connection.cursor(pymysql.cursors.SSCursor) as cursor:
         cursor.execute(
-            """
-            SELECT event_time, src_ip, action, protocol, dst_port, dst_ip
+            f"""
+            SELECT event_time, src_ip, action, protocol, dst_port, dst_ip{identity_fields}
             FROM ufw_log
             WHERE event_time >= %s AND event_time < %s
             ORDER BY event_time, id LIMIT %s
             """,
             (start_time, end_time, max_events + 1),
         )
-        events = (dict(zip(EVENT_FIELDS, row)) for row in cursor)
+        events = (dict(zip(EVENT_FIELDS + ("host_id",), row)) for row in cursor)
         return aggregate_source_ips(events, start_time, end_time, max_events=max_events)
 
 
@@ -150,15 +157,13 @@ def run_source_ip_analysis(connection, start_time, end_time, *, max_events=MAX_E
                 (start_time, end_time),
             )
             if results:
+                fields = RESULT_FIELDS
+                if "host_id" in results[0]:
+                    fields += ("host_id", "host_scope")
+                placeholders = ", ".join(["%s"] * len(fields))
                 cursor.executemany(
-                    """
-                    INSERT INTO analysis_source_ips (
-                        period_start, period_end, source_ip, total_events, blocked_events,
-                        allowed_events, audited_events, unique_destination_ports,
-                        unique_destination_ips, first_seen, last_seen, tcp_events, udp_events
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    [tuple(result[field] for field in RESULT_FIELDS) for result in results],
+                    f"INSERT INTO analysis_source_ips ({', '.join(fields)}) VALUES ({placeholders})",
+                    [tuple(result[field] for field in fields) for result in results],
                 )
         connection.commit()
         committed = True

@@ -26,3 +26,4 @@ venv/
 
 # SSH runtime configuration
 /config/ssh.env
+/config/identity.env

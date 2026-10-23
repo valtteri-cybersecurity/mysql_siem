@@ -1,8 +1,10 @@
 """Detect PORT_SCAN_001 from UFW rows without database access."""
 
 from datetime import datetime, timedelta
-from ipaddress import ip_address
 from operator import itemgetter
+
+from database.identity import event_scope
+from ingestion.ip_addresses import canonical_ip
 
 RULE_KEY = "PORT_SCAN_001"
 MIN_DISTINCT_PORTS = 10
@@ -40,8 +42,8 @@ def _normalize_event(event):
     if not isinstance(source_ip, str) or not isinstance(destination_ip, str):
         return None
     try:
-        source_ip = str(ip_address(source_ip))
-        destination_ip = str(ip_address(destination_ip))
+        source_ip = canonical_ip(source_ip)
+        destination_ip = canonical_ip(destination_ip)
     except ValueError:
         return None
 
@@ -62,6 +64,8 @@ def _normalize_event(event):
         return None
 
     return {
+        "host_id": event.get("host_id"),
+        "source_id": event.get("source_id"),
         "id": event.get("id"),
         "event_time": event_time,
         "src_ip": source_ip,
@@ -111,6 +115,7 @@ def _build_detection(events):
     first = events[0]
     return {
         "rule_key": RULE_KEY,
+        "host_id": first.get("host_id"),
         "source_ip": first["src_ip"],
         "destination_ip": first["dst_ip"],
         "protocol": first["protocol"],
@@ -139,6 +144,7 @@ def detect_port_scans(events):
         if normalized is None:
             continue
         group_key = (
+            event_scope(normalized),
             normalized["src_ip"],
             normalized["dst_ip"],
             normalized["protocol"],

@@ -1,5 +1,6 @@
--- Current MySQL 8 schema for fresh installations. No DROP or data replacement.
--- Existing installations use database.schema to create only missing tables.
+-- Immutable pre-registry baseline for migration 013. No data replacement.
+-- Initialize/upgrade through: python -m database.migrate apply
+-- Migration 014 adds the registry; 015/016 add identities and scoped keys.
 -- Preserve existing rule IDs, operator settings, events and checkpoints.
 
 CREATE TABLE `filesystem_metrics` (

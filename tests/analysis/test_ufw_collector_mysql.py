@@ -60,7 +60,7 @@ def test_continuous_appends_are_committed_one_snapshot_at_a_time(collection, mon
     save = ufw.save_event
     count = [0]
 
-    def save_and_append(cursor, value):
+    def save_and_append(cursor, value, *, identity=None):
         inserted = save(cursor, value)
         count[0] += 1
         if count[0] < 4:
@@ -83,7 +83,7 @@ def test_time_budget_commits_progress_and_next_pass_finishes(collection, monkeyp
     save = ufw.save_event
     monkeypatch.setattr(ufw.time, "monotonic", lambda: clock[0])
 
-    def save_and_expire(cursor, value):
+    def save_and_expire(cursor, value, *, identity=None):
         inserted = save(cursor, value)
         clock[0] += 2.0
         return inserted
@@ -101,7 +101,7 @@ def test_partial_line_completed_after_snapshot_waits_for_next_pass(collection, m
     logfile.write_bytes(line(0) + line(1)[:-1])
     save = ufw.save_event
 
-    def save_and_complete(cursor, value):
+    def save_and_complete(cursor, value, *, identity=None):
         inserted = save(cursor, value)
         with logfile.open("ab") as out:
             out.write(b"\n")

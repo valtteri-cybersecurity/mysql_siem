@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 
+from database.identity import configured_identity
 from ingestion.auth.db import load_position, save_event, save_position
 from ingestion.auth.parser import parse_auth_line
 
@@ -40,13 +41,14 @@ def position_hash(infile, position):
     return digest
 
 
-def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_LINES):
+def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_LINES, identity=None):
     inserted = skipped = lines_read = 0
     if stats is None:
         stats = {"lines_read": 0, "failures_recognized": 0, "duplicates": 0}
     with open(filename, "rb") as infile:
         info = os.fstat(infile.fileno())
-        state = load_position(cursor, collector_id, info.st_dev, info.st_ino)
+        source_scope = identity.source_id if identity is not None else 0
+        state = load_position(cursor, collector_id, info.st_dev, info.st_ino, source_scope=source_scope)
         position = 0
         if state is not None:
             previous_position, previous_hash = state
@@ -74,14 +76,14 @@ def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_L
                 skipped += 1
                 continue
             stats["failures_recognized"] += 1
-            saved = save_event(cursor, event)
+            saved = save_event(cursor, event, identity=identity)
             inserted += saved
             stats["duplicates"] += 1 - saved
 
         position = infile.tell()
         digest = position_hash(infile, position)
         save_position(cursor, collector_id, info.st_dev, info.st_ino,
-                      filename, position, digest)
+                      filename, position, digest, source_scope=source_scope)
     return inserted, skipped
 
 
@@ -89,8 +91,10 @@ def collect_auth_events(connection, logfile="/var/log/auth.log", *, collector_id
                         stats=None, max_lines=MAX_LINES):
     """Commit events and file positions together, or roll back and propagate.
 
-    collector_id identifies the machine reading the logs, not the target host
-    in a log line. Keep it stable when moving to a different rsyslog file path.
+    The string collector_id is the legacy checkpoint reader label. The numeric
+    registry collector identity comes from SIEM_COLLECTOR_ID; the approved auth
+    source comes from SIEM_AUTH_SOURCE_ID. Neither uses a log-line hostname.
+    Keep the legacy label stable when moving to a different log file path.
     Use a dedicated connection with autocommit=False, as get_connection provides.
     """
     if (not isinstance(collector_id, str) or not collector_id.strip()
@@ -114,6 +118,7 @@ def collect_auth_events(connection, logfile="/var/log/auth.log", *, collector_id
             raise AuthCollectionBusy("Another auth collector is running.")
         locked = True
         connection.begin()
+        identity = configured_identity(cursor, "auth")
         inserted = skipped = 0
         for filename in get_logfiles(logfile):
             remaining = max_lines - stats["lines_read"]
@@ -121,7 +126,7 @@ def collect_auth_events(connection, logfile="/var/log/auth.log", *, collector_id
                 break
             try:
                 new, ignored = process_file(cursor, filename, collector_id,
-                                            stats=stats, line_limit=remaining)
+                                            stats=stats, line_limit=remaining, identity=identity)
             except FileNotFoundError:
                 if filename == logfile:
                     raise

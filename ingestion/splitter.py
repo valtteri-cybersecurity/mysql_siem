@@ -13,6 +13,9 @@ def parse_ufw_line(line):
 
     if len(parts) > 0:
         info_table["timestamp"] = parts[0]
+    if len(parts) > 1 and len(parts[1]) <= 255:
+        # This is only the original message's claim, never a registry lookup.
+        info_table["reported_hostname"] = parts[1]
 
     if "[UFW BLOCK]" in line:    
         info_table["action"] = "BLOCK"

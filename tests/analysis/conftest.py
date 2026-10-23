@@ -29,6 +29,7 @@ def events():
 @pytest.fixture
 def connection():
     connection = MagicMock()
+    connection._siem_identity_ready = False
     cursor = connection.cursor.return_value
     cursor.__enter__.return_value = cursor
     cursor.fetchone.side_effect = [(1,), (1,)]
@@ -77,8 +78,16 @@ def analysis_private_server():
             if admin is not None:
                 try:
                     if process.poll() is None:
-                        with admin.cursor() as cursor:
-                            cursor.execute("SHUTDOWN")
+                        # The session fixture can be idle while other suites
+                        # run. Use a fresh connection to shut down this private
+                        # server, as the DNS fixture already does.
+                        shutdown = pymysql.connect(unix_socket=str(socket), user="root",
+                                                   connect_timeout=2, read_timeout=10)
+                        try:
+                            with shutdown.cursor() as cursor:
+                                cursor.execute("SHUTDOWN")
+                        finally:
+                            shutdown.close()
                 finally:
                     admin.close()
             # SHUTDOWN is asynchronous; wait for graceful exit before cleanup.
