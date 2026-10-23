@@ -40,6 +40,4 @@ The project is continuously being improved as I develop my skills in software de
 
 This is a personal learning project and is not intended to replace production-grade SIEM solutions.
 
-## License
 
-See the repository's LICENSE file, if provided.

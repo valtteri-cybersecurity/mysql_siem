@@ -9,9 +9,10 @@ from ingestion import ufw_to_mysql as ufw
 
 
 def line(index=0):
-    return (f"2026-10-22T12:00:{index:02d} host kernel: [UFW BLOCK] "
-            f"SRC=192.0.2.1 DST=198.51.100.1 PROTO=TCP DPT={1000 + index}\n").encode()
-
+    return (
+        f"2026-10-22T12:00:{index:02d}.123456+03:00 host kernel: [UFW BLOCK] "
+        f"SRC=192.0.2.1 DST=198.51.100.1 PROTO=TCP DPT={1000 + index}\n"
+    ).encode()
 
 def cursor_at(position=None):
     cursor = MagicMock()

@@ -1,13 +1,14 @@
 """Hourly/daily UFW event history; these are log events, not connections.
 
-UFW uses naive local DATETIME, as do Source IP and Port Activity Analysis.
+New UFW events use naive UTC DATETIME, as do Source IP and Port Activity Analysis.
+Legacy local-time history must remain offline; see docs/phase3-utc.md.
 The collector's file offsets have no observation times or heartbeat history.
 Consequently coverage_status is always UNKNOWN, even for a closed, nonempty
 period. OPEN/CLOSED describes the clock only, never ingestion completeness.
 Rerun a historical range to repair late arrivals beyond the recent window.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from analysis.ufw.source_ips import validate_time_range
 from database.identity import identity_schema_enabled, validate_id
@@ -121,9 +122,9 @@ def run_traffic_analysis(connection, start_time, end_time, *, now=None, previous
     Never infer coverage from offsets, event counts or the latest event time.
     """
     validate_time_range(start_time, end_time)
-    now = datetime.now() if now is None else now
+    now = datetime.now(timezone.utc).replace(tzinfo=None) if now is None else now
     if not isinstance(now, datetime) or now.tzinfo is not None or now.year < 1000:
-        raise ValueError("Use the local naive UFW time basis.")
+        raise ValueError("Use the naive UTC UFW time basis.")
     summary = {"status": "SKIPPED", "total_events": 0, "hour_count": 0, "day_count": 0,
                "coverage_status": "UNKNOWN"}
     locked = False

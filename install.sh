@@ -90,6 +90,7 @@ for path in \
     database/migrate.py \
     database/migration_steps.py \
     database/migrations/014_host_registry.sql \
+    database/migrations/017_ufw_datetime_precision.sql \
     config/run_with_env.sh \
     config/ssh.env.example \
     ingestion/auth/main.py \
@@ -269,9 +270,12 @@ fi
 ensure_schema() {
     PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 -m database.schema "$1"
 }
-# Read-only preflight. Migrations remain a separate, explicit admin operation.
+
+# Read-only preflight: all migrations, including 017, must already be applied.
+# The administrator uses database.migrate to make changes during maintenance.
 PYTHONPATH="$PROJECT_DIR" /usr/bin/python3 -m database.migrate check --admin-socket /run/mysqld/mysqld.sock || \
-    die "Phase-2 migration required. Stop jobs, back up, and explicitly apply the documented migrations before retrying."
+    die "Database migration 013-017 required. Stop jobs, back up, and apply the versioned migrations through database.migrate before retrying."
+
 log "Checking and creating missing UFW Analysis tables."
 ensure_schema analysis
 
@@ -710,7 +714,6 @@ CRON
 crontab -u "$INSTALL_USER" "$CRON_TMP"
 rm -f "$CRON_TMP"
 trap - EXIT
-
 
 log "Installation steps completed."
 log "Cron: sudo crontab -u $INSTALL_USER -l"

@@ -22,7 +22,7 @@ class SourceIPAnalysisError(RuntimeError):
 
 
 def validate_time_range(start_time, end_time):
-    """Use the existing UFW naive DATETIME basis; do not assume SSH/DNS UTC."""
+    """Use naive UTC ranges for active UFW data; keep unverified history offline."""
     for value in (start_time, end_time):
         if not isinstance(value, datetime) or value.tzinfo is not None or value.year < 1000:
             raise ValueError("Use naive datetimes matching UFW event_time, within the MySQL range.")

@@ -34,6 +34,7 @@ def test_existing_no_argument_call_works(connect):
     kwargs = connect.call_args.kwargs
     assert kwargs["charset"] == "utf8mb4"
     assert kwargs["autocommit"] is False
+    assert kwargs["init_command"] == "SET time_zone = '+00:00'"
     assert (
         kwargs["connect_timeout"],
         kwargs["read_timeout"],

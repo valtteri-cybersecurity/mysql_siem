@@ -4,7 +4,7 @@ import argparse
 import io
 import sys
 from contextlib import redirect_stdout
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pymysql
 
@@ -23,7 +23,7 @@ from database.connection import get_connection
 def recent_hour_periods(now, hours=2):
     """Stable hourly keys, including the current provisional hour; no full backfill."""
     if not isinstance(now, datetime) or now.tzinfo is not None or now.year < 1000:
-        raise ValueError("Use the local naive UFW time basis.")
+        raise ValueError("Use the naive UTC UFW time basis.")
     if type(hours) is not int or not 1 <= hours <= 24:
         raise ValueError("--recent-hours must be within 1..24.")
     end = now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -38,13 +38,13 @@ def main(argv=None):
     selection.add_argument("--ports", action="store_true", help="Port Activity Analysis only.")
     selection.add_argument("--all", action="store_true", help="Run all three analyses; each bucket saves independently.")
     parser.add_argument("--traffic", action="store_true", help="Traffic history: whole hours/days intersecting the range; may combine with --ports or --source-ips.")
-    parser.add_argument("--start", type=datetime.fromisoformat, help="Inclusive start in the naive UFW time basis.")
+    parser.add_argument("--start", type=datetime.fromisoformat, help="Inclusive start in UTC without an offset.")
     parser.add_argument("--end", type=datetime.fromisoformat, help="Exclusive end in the same time basis.")
     parser.add_argument("--recent-hours", type=int, help="Refresh 1..24 hourly buckets; default: 2 for source IPs, 3 for ports/traffic/all.")
     parser.add_argument("--max-events", type=int, default=MAX_EVENTS, help="Source IP/Port raw-row limit per interval; default: 100000. Traffic SQL counts all rows.")
     parser.add_argument("--log-file", help="Rotate at 1 MB with three backups.")
     args = parser.parse_args(argv)
-    now = datetime.now()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     try:
         if not 1 <= args.max_events <= 1000000:
             raise ValueError("--max-events must be within 1..1000000.")

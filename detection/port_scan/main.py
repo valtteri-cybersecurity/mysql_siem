@@ -62,7 +62,7 @@ def main(argv=None):
     parser.add_argument(
         "--start",
         type=datetime.fromisoformat,
-        help="Inclusive manual start in the UFW naive time basis.",
+        help="Inclusive manual start in UTC without an offset.",
     )
     parser.add_argument(
         "--end", type=datetime.fromisoformat, help="Exclusive manual end."
