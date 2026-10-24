@@ -1,56 +1,42 @@
 # mysql_siem
 
-mysql_siem is a Python-based security monitoring project for Linux systems. It collects system metrics and security-related events, stores them in MySQL, and analyzes the collected data to identify potentially suspicious activity.
+mysql_siem is a Python-based security monitoring application for Linux. It collects local events and system metrics, stores them in MySQL, and analyzes them for suspicious activity.
 
-The project is developed as a personal learning project focused on Python, MySQL, Linux administration, and cybersecurity.
+The project is actively evolving into a **centralized security monitoring service** for multiple Linux machines. Local Server installation is available today; remote Collector registration and HTTPS event delivery are still under development.
 
 ## Features
 
-- Linux system and filesystem monitoring
-- UFW firewall log collection and analysis
-- SSH authentication monitoring
-- Port scanning and SSH brute-force detection
-- DNS monitoring through AdGuard Home
-- Security alerts and event history
-- MySQL-based data storage
-- Automated data collection and analysis
+- UFW firewall event collection and traffic analysis
+- SSH authentication monitoring and brute-force detection
+- Port scan detection
+- DNS event collection through AdGuard Home
+- System, filesystem and security metrics
+- MySQL event history, security alerts and automated cron jobs
 
-## Development
+## Installation
 
-Development has started to expand mysql_siem into a **centralized security monitoring system** capable of collecting and analyzing data from multiple Linux machines.
+Installation has been tested on **Debian 13, Ubuntu 24.04/26.04 and Linux Mint 22.3**. The current automatic installer recognizes Debian 13, Ubuntu and Linux Mint.
 
-The initial work includes a host identity registry, source management, and versioned database migrations.
+Clone the project and start the Server installation:
 
-The centralized architecture is still under development.
+```bash
+git clone https://github.com/valtteri-cybersecurity/mysql_siem.git
+cd mysql_siem
+sudo bash install.sh --role server
+```
 
-## Technologies
+Confirm the Server role when prompted. The installer creates the service account, installs dependencies, prepares an isolated Python environment and configures collection and analysis jobs. You can run it from a private home directory without moving the clone or opening access to your home.
 
-- Python
-- MySQL
-- Linux
-- Bash
-- Git
-- Pytest
+- Service code: `/usr/local/lib/mysql_siem`
+- Python environment: `/opt/mysql_siem-venv`
+- Machine settings: `/usr/local/lib/mysql_siem/config/*.env`
 
-## Project Status
+The original Git clone stays in place. Re-running the installer updates the service copy while preserving installed settings and logs. Back up existing settings and the database before upgrading an existing installation.
 
-**Active development**
+**Debian 13 requires a preinstalled Oracle MySQL 8.0 or 8.4 server and client**, with local administrative socket access. On Ubuntu and Mint, the installer can install MySQL when needed. MariaDB is not supported. Optional AdGuard Home integration requires separate configuration.
 
-The project is continuously being improved as I develop my skills in software development, Linux systems, and cybersecurity.
+The `collector` installation role is reserved for future development and currently stops before making system changes.
 
-This is a personal learning project and is not intended to replace production-grade SIEM solutions.
+## Project status
 
-## Installation roles
-
-Run `sudo bash install.sh` for the role menu, or select
-`sudo bash install.sh --role server` explicitly. The server role preserves the
-local collectors, MySQL storage, analysis and detection on Debian 13, Ubuntu
-and Linux Mint.
-
-The `collector` role is recognized but stops before making installation changes.
-Remote collection and HTTPS registration are not implemented yet. See
-[installation roles and collector prerequisites](docs/install-roles.md).
-
-## Debian 13 installation
-
-See [Debian 13 setup and local collection checks](docs/debian-install.md).
+This is an actively developed learning project focused on Python, MySQL, Linux administration and cybersecurity. It is not a replacement for a production-grade SIEM. The centralized architecture is being built incrementally while retaining the existing local collectors and detection capabilities.
