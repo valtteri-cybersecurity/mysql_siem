@@ -1,3 +1,4 @@
+
 #!/usr/bin/env bash
 # mysql_siem - Debian 13, Ubuntu and Linux Mint installation
 set -Eeuo pipefail
@@ -399,12 +400,12 @@ ensure_log_access() {
     validate_application_user
 
     # UFW is a core log source; do not silently install an unusable UFW collector.
-    # /var/log/auth.log is optional and may be inaccessible on some Ubuntu
-    # installations even when adm membership appears correct. Do not weaken
-    # file permissions or abort the entire SIEM installation for SSH alone.
+    # /var/log/auth.log is optional. Check the ability to open UFW log data,
+    # not the preflight test -r result, which may disagree with open(2).
+    # Never loosen system log permissions to make an installation pass.
     source=/var/log/ufw.log
     if [[ -e "$source" ]]; then
-        runuser -u "$INSTALL_USER" -- test -r "$source" ||
+        runuser -u "$INSTALL_USER" -- /usr/bin/head -c 1 "$source" >/dev/null ||
             die "mysql_siem cannot read $source even with adm membership."
     else
         warn "Log source does not exist yet: $source"
@@ -848,7 +849,7 @@ if [[ "${SSH_READY:-0}" == "1" ]]; then
     SSH_LOG_READABLE=1
     if [[ ! -e "$SSH_LOG_SOURCE" ]]; then
         warn "SSH log source absent: $SSH_LOG_SOURCE; the SSH collector will report SKIPPED until it appears."
-    elif ! runuser -u "$INSTALL_USER" -- test -r "$SSH_LOG_SOURCE"; then
+    elif ! runuser -u "$INSTALL_USER" -- /usr/bin/head -c 1 "$SSH_LOG_SOURCE" >/dev/null; then
         SSH_LOG_READABLE=0
         warn "SSH log source is unreadable by mysql_siem: $SSH_LOG_SOURCE. SSH collection and detection will NOT be scheduled."
         warn "Check log ACLs, directory permissions and any access controls separately; do not loosen log permissions."
@@ -968,3 +969,4 @@ if [[ "${SSH_LOG_READABLE:-1}" == 0 ]]; then
     warn "SSH ingestion and SSH detection were not enabled: unreadable SSH log source."
 fi
 log "Check the UFW log source and permissions before production use."
+
