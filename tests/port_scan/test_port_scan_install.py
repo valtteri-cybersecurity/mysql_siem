@@ -140,50 +140,19 @@ crontab() {
     assert "analysis/daily_counts" not in first
 
 
-@pytest.mark.parametrize("new_database", [False, True])
-def test_only_new_database_gets_automatic_detection_setup(tmp_path, new_database):
+def test_fresh_database_enables_detection_after_single_initialization():
     installer = (ROOT / "install.sh").read_text()
-    start = installer.index("# Detection schema:")
-    end = installer.index("# Verify tables and migrate", start)
-    block = installer[start:end].replace("/usr/bin/mysql", "mock_mysql")
-    script = (
-        r"""set -euo pipefail
-log() { :; }
-warn() { :; }
-ensure_schema() { printf 'CURRENT_SCHEMA:%s\n' "$1"; }
-mock_mysql() {
-    if [[ "$*" == *"SELECT COUNT"* ]]; then
-        printf '0\n'
-    else
-        printf 'MIGRATION\n'
-        cat
-    fi
-}
-"""
-        + block
-        + '\nprintf "READY:%s\\n" "$DETECTION_READY"'
-    )
-    result = subprocess.run(
-        ["bash", "-c", script],
-        env={
-            **os.environ,
-            "TABLE_COUNT": "0" if new_database else "8",
-            "PROJECT_DIR": str(ROOT),
-            "EXPECTED_DB_NAME": "mysql_siem",
-        },
-        text=True,
-        capture_output=True,
-        check=True,
-    )
-    assert ("CURRENT_SCHEMA:detection" in result.stdout) is new_database
-    assert "MIGRATION" not in result.stdout
-    assert f"READY:{int(new_database)}" in result.stdout
+    assert installer.index('config.reset_installation reset') < installer.index('DETECTION_READY=1')
+    assert 'TABLE_COUNT' not in installer
 
 
-def test_installer_keeps_existing_passwords():
+def test_reset_reuses_secret_and_synchronizes_dedicated_account():
     installer = (ROOT / "install.sh").read_text()
-    assert "CREATE USER IF NOT EXISTS" in installer
-    assert "ALTER USER" not in installer
+    reset = (ROOT / 'config/reset_installation.py').read_text()
+    assert 'Keeping the existing mysql.env file.' in installer
+    assert "CREATE USER IF NOT EXISTS" in reset
+    assert "ALTER USER" in reset
+    assert 'validate_account(connection)' in reset
 
 
 def test_port_scan_settings_are_literal_and_optional_for_other_jobs(project):

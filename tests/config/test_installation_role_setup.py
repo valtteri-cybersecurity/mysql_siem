@@ -172,13 +172,10 @@ def test_role_checks_precede_mutations_and_initialization_precedes_packages():
     assert 'DROP DATABASE' not in INSTALLER
     assert 'DROP TABLE' not in INSTALLER
 
-    migration = INSTALLER.split(
-        '# Only a database exclusively created', 1
-    )[1].split('# Final preflight:', 1)[0]
+    assert '-m config.reset_installation reset' in INSTALLER
+    assert 'DATABASE_CREATED_THIS_RUN' not in INSTALLER
+    assert INSTALLER.index('Type RESET to continue:') < INSTALLER.index('\nensure_application_user\n')
 
-    assert 'DATABASE_CREATED_THIS_RUN' in migration
-    assert '"$TABLE_COUNT" == "0"' in migration
-    assert migration.count('-m database.migrate apply') == 1
 
 
 @pytest.mark.parametrize('content,valid', [('SIEM_ROLE=server\n', True), ('SIEM_ROLE=SERVER\n', False)])

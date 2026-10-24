@@ -264,13 +264,15 @@ def test_current_rule_registration_preserves_operator_settings(setup_mysql):
     assert snapshot(connection, {"detection_rules"}) == before
 
 
-def test_analysis_setup_failure_stops_installer_before_later_steps(tmp_path):
+def test_fresh_initializer_failure_stops_installer_before_publication(tmp_path):
     import subprocess
     installer = (ROOT / "install.sh").read_text()
-    start = installer.index("# Provision current UFW summaries")
-    end = installer.index("# Create DNS tables once;", start)
-    block = installer[start:end].replace("/usr/bin/python3", "failed_schema_setup")
-    result = subprocess.run(["bash", "-c", 'set -euo pipefail\nlog() { :; }\nfailed_schema_setup() { return 1; }\n'
-                             + block + '\nprintf "UNREACHABLE\\n"'],
-                            env={"PROJECT_DIR": str(tmp_path)}, capture_output=True, text=True, check=False)
-    assert result.returncode != 0 and "UNREACHABLE" not in result.stdout
+    start = installer.index("# One initialization path:")
+    end = installer.index("# Fresh schema:", start)
+    block = installer[start:end]
+    script = ('set -euo pipefail\nservice_installation() { :; }\n'
+              'failed_schema_setup() { return 1; }\n' + block + '\nprintf "UNREACHABLE\n"')
+    result = subprocess.run(['bash', '-c', script],
+                            env={'PROJECT_DIR': str(tmp_path), 'APP_PYTHON': 'failed_schema_setup'},
+                            capture_output=True, text=True, check=False)
+    assert result.returncode != 0 and 'UNREACHABLE' not in result.stdout

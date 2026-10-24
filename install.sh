@@ -7,12 +7,17 @@ umask 077
 readonly APP_NAME="mysql_siem"
 readonly EXPECTED_DB_NAME="mysql_siem"
 readonly EXPECTED_DB_USER="pythonuser"
-readonly SCHEMA_REL="database/schema.sql"
 readonly CRON_BEGIN="# BEGIN mysql_siem managed jobs"
 readonly CRON_END="# END mysql_siem managed jobs"
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SOURCE_DIR="$PROJECT_DIR"
+SETTINGS_SOURCE_DIR="$SOURCE_DIR"
+if [[ "${SIEM_BOOTSTRAP_CHECKOUT:-}" == "$SOURCE_DIR" ]]; then
+    SETTINGS_SOURCE_DIR="${SIEM_BOOTSTRAP_SETTINGS:?Missing original settings directory}"
+fi
+SIEM_DATABASE_RESET_APPROVED=0
+export SIEM_DATABASE_RESET_APPROVED
 readonly SERVICE_DIR="/usr/local/lib/mysql_siem"
 readonly INSTALL_USER="$APP_NAME"
 readonly APP_HOME="/var/lib/mysql_siem"
@@ -32,7 +37,7 @@ die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 # Installation role selection (before any installation changes).
 select_installation_role() {
     local selection stored_role="" role_directory found_role
-    for role_directory in "$PROJECT_DIR" "${SERVICE_DIR:-$PROJECT_DIR}"; do
+    for role_directory in "${SETTINGS_SOURCE_DIR:-$PROJECT_DIR}" "${SERVICE_DIR:-$PROJECT_DIR}"; do
         [[ ! -L "$role_directory/config" ]] || die "Configuration directory must not be a symbolic link."
         if [[ -e "$role_directory/config/role.env" || -L "$role_directory/config/role.env" ]]; then
             found_role="$(role_configuration read "$role_directory")" || die "Cannot validate the stored installation role; no installation changes were made."
@@ -73,7 +78,7 @@ select_installation_role() {
     if [[ -n "$stored_role" && "$INSTALL_ROLE" != "$stored_role" ]]; then
         die "Installation role conflict; the stored role will not be changed."
     fi
-    if [[ -z "$stored_role" && "$INSTALL_ROLE" == server ]]; then
+    if [[ -z "$stored_role" && "$INSTALL_ROLE" == server && "${SIEM_BOOTSTRAP_CONFIRMED:-}" != "${SOURCE_DIR:-$PROJECT_DIR}" ]]; then
         printf 'No persistent role exists. Confirm Server role for this new or existing installation [yes]: '
         IFS= read -r selection || die "Server role confirmation required; no changes were made."
         [[ "$selection" == yes ]] || die "Server role not confirmed; no changes were made."
@@ -135,7 +140,7 @@ PY_SERVICE
 }
 
 prepare_service_installation() {
-    STAGED_PROJECT_DIR="$(service_installation stage "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER" "$INSTALL_ROLE")"
+    STAGED_PROJECT_DIR="$(service_installation stage "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER" "$INSTALL_ROLE" "$SETTINGS_SOURCE_DIR" reset)"
     LOCAL_DEPLOYMENT_STARTED=1
     PROJECT_DIR="$STAGED_PROJECT_DIR"
     ENV_FILE="$PROJECT_DIR/config/mysql.env"
@@ -246,6 +251,7 @@ validate_virtualenv_location() {
 
 install_virtualenv() {
     local system_version candidate_version
+    /usr/bin/python3 -I -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' || die "Python 3.10 or newer is required."
     validate_virtualenv_location
     VENV_BUILD_DIR="$(service_installation environment)"
     APP_PYTHON="$VENV_BUILD_DIR/bin/python"
@@ -548,9 +554,16 @@ fi
 
 [[ $EUID -eq 0 ]] || die "Run: sudo bash install.sh"
 
+# The first invocation downloads; the verified invocation continues without a loop.
+. "$SOURCE_DIR/config/install_bootstrap.sh"
+bootstrap_latest_release
+
+
 for path in \
     requirements-dns.txt \
     config/service_installation.py \
+    config/reset_installation.py \
+    config/install_bootstrap.sh \
     config/installation_state.py \
     database/local_identity.py \
     database/schema.sql \
@@ -581,8 +594,26 @@ do
     [[ -f "$PROJECT_DIR/$path" ]] || die "Required file is missing: $path"
 done
 
+# Cancelled reset must not pause existing jobs or change the installed version.
+if [[ -x /usr/bin/mysql ]]; then
+    EXISTING_DATABASE="$(/usr/bin/mysql --no-defaults --protocol=socket --socket=/run/mysqld/mysqld.sock \
+        --user=root --batch --skip-column-names \
+        -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='mysql_siem'")" ||
+        die "Cannot inspect local MySQL. Start/check the installed server before retrying; no reset was performed."
+    if [[ "$EXISTING_DATABASE" == 1 ]]; then
+        printf '%s\n' 'Existing local mysql_siem database detected.' \
+            'Reinstallation permanently deletes all events, metrics, alerts and database records.'
+        printf 'Type RESET to continue: '
+        IFS= read -r reset_answer || die "Reset cancelled; no installation changes were made."
+        [[ "$reset_answer" == RESET ]] || die "Reset cancelled; no installation changes were made."
+        SIEM_DATABASE_RESET_APPROVED=1
+    elif [[ "$EXISTING_DATABASE" != 0 ]]; then
+        die "Unexpected database inspection result; reset was not attempted."
+    fi
+fi
+
 # Recheck persistent roles before creating even the installation lock.
-service_installation check "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER"
+service_installation check "$SETTINGS_SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER"
 [[ ! -L /usr/local/lib/.mysql_siem-install.lock ]] || die "Unsafe installation lock link."
 exec 9>> /usr/local/lib/.mysql_siem-install.lock
 flock -n 9 || die "Another mysql_siem installation is running."
@@ -592,7 +623,7 @@ if [[ -e /usr/local/lib/.mysql_siem-local/maintenance ]]; then
     exec 8< /usr/local/lib/.mysql_siem-local/runtime.lock
     flock -x -w 30 8 || die "Runtime jobs did not stop; collection remains paused."
 fi
-service_installation check "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER"
+service_installation check "$SETTINGS_SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER"
 trap cleanup_prepared_installation EXIT
 
 detect_distribution
@@ -605,8 +636,11 @@ persist_installation_role
 secure_project_sources
 install_dependencies
 install_virtualenv
+printf '%s\n' "$SIEM_BOOTSTRAP_COMMIT" > "$PROJECT_DIR/config/installed-version"
+chown root:"$INSTALL_USER" "$PROJECT_DIR/config/installed-version"
+chmod 640 "$PROJECT_DIR/config/installed-version"
 
-local_identity_setup begin
+local_identity_setup begin --reset
 exec 8< /usr/local/lib/.mysql_siem-local/runtime.lock
 flock -x -w 30 8 || die "Runtime jobs did not stop; collection remains paused."
 export SIEM_INSTALL_MAINTENANCE=1
@@ -632,310 +666,26 @@ load_mysql_env "$ENV_FILE"
 [[ "${DB_HOST:-}" == "localhost" ]] ||
     die "This installer requires DB_HOST=localhost."
 
-# Prepare tables before granting table-specific privileges.
-# Do not reimport existing tables when rerunning the installer.
-log "Checking database and schema."
-
-# Keep generated credentials recoverable if database provisioning fails midway.
+# One initialization path: always create a fresh database after explicit consent.
 DATABASE_SETUP_STARTED=1
 service_installation database-started
-DB_SETUP_RESULT="$("$APP_PYTHON" - "$ENV_FILE" "$PROJECT_DIR/$SCHEMA_REL" <<'PY'
+PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation reset --project "$PROJECT_DIR"
+
+# Fresh schema: the single initializer has created every current table and rule.
+DETECTION_READY=1
+
+# Source IP Analysis schema: validate the fresh migrated structure.
+PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" - <<'PY_CHECK_SOURCES'
 import os
-import sys
 import pymysql
+from database.schema import validate_source_ips_schema
 
-env_file, schema_file = sys.argv[1:3]
-
-# Read mysql.env as key-value pairs without executing its contents.
-# Credentials are exported by the load_mysql_env function in install.sh.
-password = os.environ["DB_PASSWORD"]
-db_name = os.environ["DB_NAME"]
-db_user = os.environ["DB_USER"]
-
-conn = pymysql.connect(
-    unix_socket="/run/mysqld/mysqld.sock",
-    user="root",
-    charset="utf8mb4",
-    autocommit=True,
-)
+conn = pymysql.connect(unix_socket="/run/mysqld/mysqld.sock", user="root", database=os.environ["DB_NAME"])
 try:
-    with conn.cursor() as cur:
-        cur.execute("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name=%s", (db_name,))
-        if cur.fetchone()[0] == 0:
-            # No IF NOT EXISTS: a concurrent creator must make this attempt fail.
-            cur.execute(
-                f"CREATE DATABASE `{db_name}` "
-                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-            )
-            print("DATABASE_CREATED_THIS_RUN")
-        cur.execute(
-            "SELECT COUNT(*) FROM information_schema.tables "
-            "WHERE table_schema=%s",
-            (db_name,),
-        )
-        table_count = cur.fetchone()[0]
-
-        if table_count == 0:
-            # The new database needs its table definitions.
-            # Use the mysql CLI to import the schema in a separate step.
-            print("SCHEMA_EMPTY")
-        else:
-            cur.execute(
-                "SELECT table_name FROM information_schema.tables "
-                "WHERE table_schema=%s",
-                (db_name,),
-            )
-            existing = {row[0] for row in cur.fetchall()}
-            existing -= {"schema_migrations", "hosts", "host_groups", "host_group_members", "log_sources",
-                         "collectors", "collector_sources", "sender_identities", "sender_sources",
-                         "sender_certificates", "alert_hosts"}
-            expected = {
-                "filesystem_metrics", "security_metrics", "system_metrics",
-                "ufw_log", "ufw_state",
-            }
-            dns_tables = {"dns_sources", "dns_events", "dns_collection_state"}
-            detection_tables = {"detection_rules", "detection_alerts", "alert_evidence"}
-            state_tables = {"detection_state"}
-            client_filter_tables = {"dns_client_filters"}
-            domain_filter_tables = {"dns_domain_filters"}
-            auth_tables = {"auth_events", "auth_ingestion_state"}
-            if existing & auth_tables not in (set(), auth_tables):
-                raise SystemExit("The auth schema is incomplete; inspect it manually.")
-            existing -= auth_tables
-            existing.discard("analysis_source_ips")
-            existing -= {"analysis_ufw_ports", "analysis_ufw_traffic", "analysis_ufw_traffic_daily"}
-            existing -= {"ufw_daily_actions_counts", "top_attacking_ips", "top_targeted_ports"}
-            if existing not in (
-                expected, expected | dns_tables,
-                expected | detection_tables, expected | dns_tables | detection_tables,
-                expected | detection_tables | state_tables,
-                expected | dns_tables | detection_tables | state_tables,
-                expected | dns_tables | client_filter_tables,
-                expected | dns_tables | detection_tables | client_filter_tables,
-                expected | dns_tables | detection_tables | state_tables | client_filter_tables,
-                expected | dns_tables | domain_filter_tables,
-                expected | dns_tables | detection_tables | domain_filter_tables,
-                expected | dns_tables | detection_tables | state_tables | domain_filter_tables,
-                expected | dns_tables | client_filter_tables | domain_filter_tables,
-                expected | dns_tables | detection_tables | client_filter_tables | domain_filter_tables,
-                expected | dns_tables | detection_tables | state_tables | client_filter_tables | domain_filter_tables,
-            ):
-                raise SystemExit(
-                    "The database has a partial or unexpected schema. "
-                    f"Tables: {sorted(existing)}. Correct the schema manually before continuing. "
-                    "Inspect the current definitions in database/schema.sql; existing legacy tables may remain."
-                )
-            print("SCHEMA_EXISTS")
-
-        # Escape the SQL string using the connection's encoder.
-        escaped_password = conn.escape(password)
-        cur.execute(
-            f"CREATE USER IF NOT EXISTS '{db_user}'@'localhost' "
-            f"IDENTIFIED BY {escaped_password}"
-        )
+    validate_source_ips_schema(conn)
 finally:
     conn.close()
-PY
-)"
-printf '%s\n' "$DB_SETUP_RESULT"
-
-# Import the DDL schema if the database is new.
-TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
-    -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}'")"
-
-if [[ "$TABLE_COUNT" == "0" ]]; then
-    log "Importing database schema."
-    /usr/bin/mysql --protocol=socket "$EXPECTED_DB_NAME" < "$PROJECT_DIR/$SCHEMA_REL"
-fi
-
-# Provision current UFW summaries before checking or scheduling them.
-ensure_schema() {
-    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m database.schema "$1"
-}
-
-# Only a database exclusively created by this attempt may migrate automatically.
-# An existing empty or partially initialized database never enters this branch.
-if [[ "$DB_SETUP_RESULT" == *$'DATABASE_CREATED_THIS_RUN\n'* && "$TABLE_COUNT" == "0" ]]; then
-    log "Initializing migrations in the database created by this installation."
-    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m database.migrate apply --admin-socket /run/mysqld/mysqld.sock
-fi
-
-# Final preflight: all migrations, including 017, must be applied.
-# The administrator uses database.migrate to make changes during maintenance.
-PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m database.migrate check --admin-socket /run/mysqld/mysqld.sock || \
-    die "Database migration 013-017 required. Stop jobs, back up, and apply the versioned migrations through database.migrate before retrying."
-
-log "Checking and creating missing UFW Analysis tables."
-ensure_schema analysis
-
-# Create DNS tables once; preserve existing telemetry and reject partial schemas.
-DNS_TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
-    -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name IN ('dns_sources', 'dns_events', 'dns_collection_state')")"
-
-case "$DNS_TABLE_COUNT" in
-    0)
-        log "Creating DNS telemetry tables."
-        ensure_schema dns
-        ;;
-    3)
-        log "Keeping existing DNS telemetry tables."
-        ;;
-    *)
-        die "The DNS schema is incomplete. Inspect it manually before retrying."
-        ;;
-esac
-
-# DNS client filters: create once after the source tables exist.
-DNS_CLIENT_FILTER_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
-    -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name='dns_client_filters'")"
-
-case "$DNS_CLIENT_FILTER_COUNT" in
-    0)
-        log "Creating DNS client filter table."
-        ensure_schema dns-client-filters
-        ;;
-    1)
-        log "Keeping existing DNS client filters."
-        ;;
-    *)
-        die "Cannot verify the DNS client filter table. Inspect the schema before retrying."
-        ;;
-esac
-
-# DNS domain filters: exact-name exclusions, independent of client rules.
-DNS_DOMAIN_FILTER_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
-    -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name='dns_domain_filters'")"
-
-case "$DNS_DOMAIN_FILTER_COUNT" in
-    0)
-        log "Creating DNS domain filter table."
-        ensure_schema dns-domain-filters
-        ;;
-    1)
-        log "Keeping existing DNS domain filters."
-        ;;
-    *)
-        die "Cannot verify the DNS domain filter table. Inspect the schema before retrying."
-        ;;
-esac
-
-# Detection schema: automatic provisioning is restricted to a new database.
-# Existing installations retain their current detection activation policy.
-DETECTION_READY=0
-if [[ "$TABLE_COUNT" == "0" ]]; then
-    log "Creating detection tables in the new database."
-    ensure_schema detection
-    DETECTION_READY=1
-else
-    DETECTION_TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
-        -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name IN ('detection_rules', 'detection_alerts', 'alert_evidence', 'detection_state')")"
-    if [[ "$DETECTION_TABLE_COUNT" == "4" ]]; then
-        DETECTION_READY=1
-    else
-        warn "Detection not scheduled: its current tables are incomplete; inspect database/schema.sql."
-    fi
-fi
-
-# Verify tables and migrate the existing ufw_state tracking columns.
-"$APP_PYTHON" - <<'PY'
-import os
-import sys
-import pymysql
-
-expected = {
-    "filesystem_metrics", "security_metrics", "system_metrics",
-    "ufw_log", "ufw_state",
-}
-conn = pymysql.connect(
-    unix_socket="/run/mysqld/mysqld.sock",
-    user="root",
-    database=os.environ["DB_NAME"],
-)
-try:
-    with conn.cursor() as cur:
-        cur.execute("SHOW TABLES")
-        actual = {row[0] for row in cur.fetchall()}
-    actual -= {"schema_migrations", "hosts", "host_groups", "host_group_members", "log_sources",
-               "collectors", "collector_sources", "sender_identities", "sender_sources",
-               "sender_certificates", "alert_hosts"}
-    dns_tables = {"dns_sources", "dns_events", "dns_collection_state"}
-    detection_tables = {"detection_rules", "detection_alerts", "alert_evidence"}
-    state_tables = {"detection_state"}
-    client_filter_tables = {"dns_client_filters"}
-    domain_filter_tables = {"dns_domain_filters"}
-    auth_tables = {"auth_events", "auth_ingestion_state"}
-    if actual & auth_tables not in (set(), auth_tables):
-        raise SystemExit("The auth schema is incomplete; inspect it manually.")
-    actual -= auth_tables
-    actual.discard("analysis_source_ips")
-    actual -= {"analysis_ufw_ports", "analysis_ufw_traffic", "analysis_ufw_traffic_daily"}
-    actual -= {"ufw_daily_actions_counts", "top_attacking_ips", "top_targeted_ports"}
-    if actual not in (
-        expected, expected | dns_tables,
-        expected | detection_tables, expected | dns_tables | detection_tables,
-        expected | detection_tables | state_tables,
-        expected | dns_tables | detection_tables | state_tables,
-        expected | dns_tables | client_filter_tables,
-        expected | dns_tables | detection_tables | client_filter_tables,
-        expected | dns_tables | detection_tables | state_tables | client_filter_tables,
-        expected | dns_tables | domain_filter_tables,
-        expected | dns_tables | detection_tables | domain_filter_tables,
-        expected | dns_tables | detection_tables | state_tables | domain_filter_tables,
-        expected | dns_tables | client_filter_tables | domain_filter_tables,
-        expected | dns_tables | detection_tables | client_filter_tables | domain_filter_tables,
-        expected | dns_tables | detection_tables | state_tables | client_filter_tables | domain_filter_tables,
-    ):
-        raise SystemExit(
-            f"Schema tables do not match. Missing: {sorted(expected-actual)}; "
-            f"extra: {sorted(actual-expected)}. "
-            "Inspect the current definitions in database/schema.sql; existing legacy tables may remain."
-        )
-    with conn.cursor() as cur:
-        cur.execute("SHOW COLUMNS FROM ufw_state")
-        columns = {}
-
-        for row in cur.fetchall():
-            columns[row[0]] = row
-
-        if "file_device" not in columns and "file_inode" not in columns:
-            cur.execute("""ALTER TABLE ufw_state
-                MODIFY COLUMN id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-                ADD COLUMN file_device BIGINT UNSIGNED NULL,
-                ADD COLUMN file_inode BIGINT UNSIGNED NULL,
-                ADD UNIQUE KEY uq_ufw_state_file (file_device, file_inode)""")
-            print("UFW_STATE_MIGRATED")
-        elif "file_device" not in columns or "file_inode" not in columns:
-            raise SystemExit("ufw_state: the file-identity schema is incomplete.")
-
-        cur.execute("SHOW COLUMNS FROM ufw_state")
-        columns = {}
-
-        for row in cur.fetchall():
-            columns[row[0]] = row
-
-        for name in ("id", "file_device", "file_inode"):
-            if columns[name][1].lower() != "bigint unsigned":
-                raise SystemExit(f"ufw_state: column {name} must be BIGINT UNSIGNED.")
-
-        if "auto_increment" not in columns["id"][5].lower():
-            raise SystemExit("ufw_state: the id column is missing AUTO_INCREMENT.")
-
-        cur.execute("SHOW INDEX FROM ufw_state WHERE Key_name = 'uq_ufw_state_file'")
-        index_columns = {}
-
-        for row in cur.fetchall():
-            if row[1] != 0:
-                raise SystemExit("ufw_state: the file-identity index must be unique.")
-            index_columns[row[3]] = row[4]
-
-        if index_columns not in ({1: "file_device", 2: "file_inode"},
-                                 {1: "file_device", 2: "file_inode", 3: "source_scope"}):
-            raise SystemExit("ufw_state: the file-identity index is missing or invalid.")
-finally:
-    conn.close()
-PY
-
-# Source IP Analysis schema: created and validated before the strict guard.
+PY_CHECK_SOURCES
 SOURCE_IP_ANALYSIS_READY=1
 
 # Port Activity Analysis schema: validate before grants and scheduling.
@@ -970,25 +720,8 @@ finally:
 PY_CHECK_TRAFFIC
 TRAFFIC_ANALYSIS_READY=1
 
-# SSH schema: provision new databases only; existing installations opt in manually.
-SSH_READY=0
-if [[ "$TABLE_COUNT" == "0" && "$DETECTION_READY" == "1" ]]; then
-    log "Creating SSH telemetry and rule in the new database."
-    ensure_schema auth
-    SSH_READY=1
-elif [[ "$DETECTION_READY" == "1" ]]; then
-    SSH_TABLE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names \
-        -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${EXPECTED_DB_NAME}' AND table_name IN ('auth_events', 'auth_ingestion_state')")"
-    SSH_RULE_COUNT="$(/usr/bin/mysql --protocol=socket --batch --skip-column-names "$EXPECTED_DB_NAME" \
-        -e "SELECT COUNT(*) FROM detection_rules WHERE rule_key='SSH_BRUTE_FORCE_001'")"
-    if [[ "$SSH_TABLE_COUNT" == "2" && "$SSH_RULE_COUNT" == "1" ]]; then
-        SSH_READY=1
-    else
-        warn "SSH jobs not scheduled: its auth tables or rule are missing; inspect database/schema.sql."
-    fi
-else
-    warn "SSH jobs not scheduled: the shared detection schema is required."
-fi
+# SSH schema: the fresh initializer has also installed both detection rules.
+SSH_READY=1
 
 # Grant privileges only after the tables have been created.
 # Do not grant global privileges to the database user.
@@ -1219,6 +952,6 @@ unset SIEM_INSTALL_MAINTENANCE
 rm -f "$CRON_TMP"
 trap - EXIT
 
-log "Installation steps completed."
+log "Installation steps completed. Installed official commit $SIEM_BOOTSTRAP_COMMIT."
 log "Cron: sudo crontab -u $INSTALL_USER -l"
 log "Check the UFW log source and permissions before production use."

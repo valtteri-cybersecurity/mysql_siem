@@ -162,7 +162,7 @@ def test_required_identity_cannot_fall_back_to_inherited_values(tmp_path):
 
 def test_installer_verifies_identity_before_publication_and_cron():
     installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
-    begin = installer.index('\nlocal_identity_setup begin\n')
+    begin = installer.index('\nlocal_identity_setup begin --reset\n')
     prepare = installer.index('\nlocal_identity_setup prepare\n', begin)
     verify = installer.index('\nverify_local_identity\n', prepare)
     publish = installer.index('\nactivate_service_installation\n', verify)

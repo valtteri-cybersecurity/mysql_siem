@@ -1,4 +1,3 @@
-import ast
 import json
 import os
 import re
@@ -100,134 +99,11 @@ def test_installer_embedded_python_compiles():
         compile(block, "installer-python", "exec")
 
 
-@pytest.mark.parametrize(
-    "extra,allowed",
-    [
-        (set(), True),
-        ({"dns_sources", "dns_events", "dns_collection_state"}, True),
-        ({"dns_sources"}, False),
-        ({"unexpected"}, False),
-        ({"dns_domain_filters"}, False),
-        ({"dns_sources", "dns_domain_filters"}, False),
-        (
-            {"dns_sources", "dns_events", "dns_collection_state", "dns_domain_filters"},
-            True,
-        ),
-        (
-            {
-                "dns_sources",
-                "dns_events",
-                "dns_collection_state",
-                "dns_client_filters",
-                "dns_domain_filters",
-            },
-            True,
-        ),
-        (
-            {
-                "dns_sources",
-                "dns_events",
-                "dns_collection_state",
-                "dns_client_filters",
-                "dns_domain_filters",
-                "detection_rules",
-                "detection_alerts",
-                "alert_evidence",
-                "detection_state",
-            },
-            True,
-        ),
-        ({"dns_client_filters"}, False),
-        (
-            {"dns_sources", "dns_events", "dns_collection_state", "dns_client_filters"},
-            True,
-        ),
-        ({"dns_sources", "dns_client_filters"}, False),
-        (
-            {
-                "detection_rules",
-                "detection_alerts",
-                "alert_evidence",
-                "dns_client_filters",
-            },
-            False,
-        ),
-        (
-            {
-                "dns_sources",
-                "dns_events",
-                "dns_collection_state",
-                "dns_client_filters",
-                "detection_rules",
-                "detection_alerts",
-                "alert_evidence",
-                "detection_state",
-            },
-            True,
-        ),
-        ({"detection_rules", "detection_alerts", "alert_evidence"}, True),
-        (
-            {
-                "detection_rules",
-                "detection_alerts",
-                "alert_evidence",
-                "detection_state",
-            },
-            True,
-        ),
-        (
-            {
-                "dns_sources",
-                "dns_events",
-                "dns_collection_state",
-                "detection_rules",
-                "detection_alerts",
-                "alert_evidence",
-                "detection_state",
-            },
-            True,
-        ),
-        ({"detection_rules"}, False),
-        ({"detection_state"}, False),
-    ],
-)
-def test_both_installer_schema_guards_accept_only_complete_dns(extra, allowed):
-    checked = 0
-    for block in python_blocks():
-        tree = ast.parse(block)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
-                continue
-            left = node.test.left
-            if not isinstance(left, ast.Name) or left.id not in {"actual", "existing"}:
-                continue
-            if "dns_tables" not in ast.unparse(node.test):
-                continue
-            namespace = {}
-            for assignment in ast.walk(tree):
-                if isinstance(assignment, ast.Assign) and any(
-                    isinstance(target, ast.Name)
-                    and target.id
-                    in {
-                        "expected",
-                        "dns_tables",
-                        "detection_tables",
-                        "state_tables",
-                        "client_filter_tables",
-                        "domain_filter_tables",
-                    }
-                    for target in assignment.targets
-                ):
-                    for target in assignment.targets:
-                        if isinstance(target, ast.Name):
-                            namespace[target.id] = ast.literal_eval(assignment.value)
-            namespace[left.id] = namespace["expected"] | extra
-            rejects = eval(
-                compile(ast.Expression(node.test), "schema-guard", "eval"), namespace
-            )
-            assert rejects is not allowed
-            checked += 1
-    assert checked == 2
+def test_installer_no_longer_accepts_legacy_table_combinations():
+    installer = (ROOT / 'install.sh').read_text()
+    assert 'SCHEMA_EXISTS' not in installer
+    assert 'Schema tables do not match' not in installer
+    assert 'config.reset_installation reset' in installer
 
 
 @pytest.mark.parametrize(
@@ -299,59 +175,17 @@ def test_dns_collector_limits_are_loaded_as_data(project):
     assert json.loads(result.stdout)["DNS_MAX_PAGES"] == "250"
 
 
-def test_dns_cron_template_is_inactive():
-    template = (ROOT / "config/dns.cron.example").read_text()
-    assert all(
-        not line.strip() or line.startswith("#") for line in template.splitlines()
-    )
-    assert "*/5 * * * *" in template
+def test_dns_schedule_is_generated_only_by_installer():
     installer = (ROOT / "install.sh").read_text()
     assert "$DNS_CRON\n$CRON_END" in installer
+    assert not (ROOT / 'config/dns.cron.example').exists()
 
 
-@pytest.mark.parametrize("table_count", [0, 1, 2, 3])
-def test_installer_creates_only_absent_dns_schema(table_count):
-    installer = (ROOT / "install.sh").read_text()
-    start = installer.index("# Create DNS tables once;")
-    end = installer.index("# DNS client filters:", start)
-    block = installer[start:end].replace("/usr/bin/mysql", "mock_mysql")
-    script = (
-        r"""
-set -euo pipefail
-log() { printf '%s\n' "$*"; }
-die() { printf '%s\n' "$*" >&2; exit 1; }
-ensure_schema() { printf 'CURRENT_SCHEMA:%s\n' "$1"; }
-mock_mysql() {
-    if [[ "$*" == *"SELECT COUNT"* ]]; then
-        printf '%s\n' "$TEST_TABLE_COUNT"
-    else
-        printf 'MIGRATION_INPUT\n'
-        cat
-    fi
-}
-"""
-        + block
-    )
-    result = subprocess.run(
-        ["bash", "-c", script],
-        env={
-            **os.environ,
-            "PROJECT_DIR": str(ROOT),
-            "EXPECTED_DB_NAME": "mysql_siem",
-            "TEST_TABLE_COUNT": str(table_count),
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert (result.returncode == 0) == (table_count in (0, 3))
-    if table_count == 0:
-        assert "CURRENT_SCHEMA:dns" in result.stdout
-        assert "DROP TABLE" not in result.stdout
-    else:
-        assert "CURRENT_SCHEMA:" not in result.stdout
-        if table_count != 3:
-            assert "incomplete" in result.stderr
+def test_dns_schema_uses_the_single_fresh_initializer():
+    installer = (ROOT / 'install.sh').read_text()
+    assert installer.count('-m config.reset_installation reset') == 1
+    assert 'DNS_TABLE_COUNT' not in installer
+    assert 'ensure_schema dns' not in installer
 
 
 @pytest.mark.parametrize("configured", [False, True])
@@ -402,45 +236,10 @@ def test_installer_dns_setup_uses_existing_cron_model(project, configured):
         assert (dns / "cron.log").stat().st_mode & 0o777 == 0o600
 
 
-@pytest.mark.parametrize("count", ["0", "1", "unexpected"])
-@pytest.mark.parametrize("kind", ["client", "domain"])
-def test_installer_adds_filter_table_once_without_overwriting(count, kind):
-    installer = (ROOT / "install.sh").read_text()
-    start = installer.index(f"# DNS {kind} filters:")
-    end = installer.index(
-        "# DNS domain filters:" if kind == "client" else "# Detection schema:", start
-    )
-    block = installer[start:end].replace("/usr/bin/mysql", "mock_mysql")
-    script = (
-        r"""
-set -euo pipefail
-log() { :; }
-die() { printf '%s\n' "$*" >&2; exit 1; }
-ensure_schema() { printf 'CURRENT_SCHEMA:%s\n' "$1"; }
-mock_mysql() {
-    if [[ "$*" == *"SELECT COUNT"* ]]; then
-        printf '%s\n' "$TEST_COUNT"
-    else
-        cat
-    fi
-}
-"""
-        + block
-    )
-    result = subprocess.run(
-        ["bash", "-c", script],
-        env={
-            **os.environ,
-            "PROJECT_DIR": str(ROOT),
-            "EXPECTED_DB_NAME": "mysql_siem",
-            "TEST_COUNT": count,
-        },
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    assert (result.returncode == 0) == (count in ("0", "1"))
-    assert (f"CURRENT_SCHEMA:dns-{kind}-filters" in result.stdout) == (count == "0")
-    assert "DROP TABLE" not in result.stdout
-    assert "DELETE FROM" not in result.stdout
-    assert "ALTER USER" not in installer
+def test_dns_filters_are_initialized_with_the_fresh_baseline():
+    from database.schema import read_schema
+    tables, _rules = read_schema()
+    assert {'dns_client_filters', 'dns_domain_filters'} <= set(tables)
+    installer = (ROOT / 'install.sh').read_text()
+    assert 'DNS_CLIENT_FILTER_COUNT' not in installer
+    assert 'DNS_DOMAIN_FILTER_COUNT' not in installer

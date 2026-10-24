@@ -222,7 +222,7 @@ def check_ufw_utc_readiness(connection):
     if any(values):
         raise MigrationError(
             "Legacy UFW history has an unverified time basis; keep this database offline. "
-            "Use a fresh migrated database for UTC collection; see docs/phase3-utc.md."
+            "Use a fresh migrated database for UTC collection. The development installer recreates mysql_siem only after explicit RESET confirmation."
         )
 
 

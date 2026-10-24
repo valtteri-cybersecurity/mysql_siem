@@ -87,7 +87,7 @@ def make_parents(path, root, gid):
         path = path.parent
 
 
-def stage_service(source, target, uid, gid, role=None):
+def stage_service(source, target, uid, gid, role=None, *, settings_source=None):
     trusted_directory(target.parent)
     if target.exists() or target.is_symlink():
         trusted_directory(target)
@@ -103,7 +103,7 @@ def stage_service(source, target, uid, gid, role=None):
             os.chown(destination, 0, gid)
             destination.chmod(0o750 if original.stat().st_mode & 0o111 else 0o640)
         # The installed machine configuration wins over downloaded configuration.
-        state_root = target if target.exists() else source
+        state_root = settings_source if settings_source is not None else (target if target.exists() else source)
         for original in tree_files(state_root):
             relative = original.relative_to(state_root)
             if not preserved(relative):
@@ -397,7 +397,7 @@ def restore_missing_staged_settings(stage, target):
             destination.chmod(0o640 if relative == Path('config/identity.env') else 0o600)
 
 
-def prepare_deployment(source, target, user, role, stable, state):
+def prepare_deployment(source, target, user, role, stable, state, *, settings_source=None, reset=False):
     from config import installation_state as journal
 
     journal.require_install_lock()
@@ -408,7 +408,7 @@ def prepare_deployment(source, target, user, role, stable, state):
     trusted_directory(state)
     record = journal.read_deployment(state)
     pending_transition = None
-    if (record is None and ((state / 'receipt.json').exists() or (state / 'receipt.json').is_symlink())
+    if (not reset and record is None and ((state / 'receipt.json').exists() or (state / 'receipt.json').is_symlink())
             and not (target / 'config/mysql.env').is_file()):
         raise InstallationError('An older identity receipt exists without installed database settings or a deployment journal. '
                                 'Keep the receipt and old .mysql_siem-stage-* directories. Recover the original prepared '
@@ -422,16 +422,23 @@ def prepare_deployment(source, target, user, role, stable, state):
         if record['phase'] == 'staged' and Path(record['stage']).exists():
             trusted_directory(Path(record['stage']))
             restore_missing_staged_settings(Path(record['stage']), target)
-            return Path(record['stage'])
-        if record['phase'] == 'staged' and not target.exists():
+            if not reset:
+                return Path(record['stage'])
+            settings_source = Path(record['stage'])
+        if record['phase'] == 'staged' and not Path(record['stage']).exists() and not target.exists():
             raise InstallationError('Pending staged settings cannot be located; manual recovery required.')
         if record['phase'] == 'activated':
             verify_publication(state, record)
     account = pwd.getpwnam(user)
-    stage = stage_service(source, target, account.pw_uid, account.pw_gid, role=role)
+    previous_database_started = bool(reset and record is not None and record['database_started'])
+    if reset and target.exists():
+        settings_source = target
+    if settings_source is None or (target.exists() and (record is None or record['phase'] != 'staged')):
+        settings_source = target if target.exists() else (settings_source or source)
+    stage = stage_service(source, target, account.pw_uid, account.pw_gid, role=role, settings_source=settings_source)
     record = {'version': 1, 'stage': str(stage), 'target': str(target), 'stable': str(stable),
               'user': user, 'candidate': None, 'phase': 'staged', 'identity': {}, 'publication': None,
-              'database_started': False, 'cron_digest': None, 'checkpoint_transition': pending_transition}
+              'database_started': previous_database_started, 'cron_digest': None, 'checkpoint_transition': pending_transition}
     journal.save_deployment(state, record)
     return stage
 
@@ -529,7 +536,9 @@ def main(arguments):
         elif action == 'stage':
             from config.installation_state import STATE_DIR
             print(prepare_deployment(Path(arguments[1]), Path(arguments[2]), arguments[3], arguments[4],
-                                     Path('/opt/mysql_siem-venv'), STATE_DIR))
+                                     Path('/opt/mysql_siem-venv'), STATE_DIR,
+                                     settings_source=Path(arguments[5]) if len(arguments) > 5 else None,
+                                     reset=len(arguments) > 6 and arguments[6] == 'reset'))
         elif action == 'environment':
             from config import installation_state as journal
             journal.require_install_lock()

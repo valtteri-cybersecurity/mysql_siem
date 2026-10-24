@@ -25,13 +25,13 @@ cd mysql_siem
 sudo bash install.sh --role server
 ```
 
-Confirm the Server role when prompted. The installer creates the service account, installs dependencies, prepares an isolated Python environment and configures collection and analysis jobs. You can run it from a private home directory without moving the clone or opening access to your home.
+The installer downloads the current official `main` branch and shows its commit. Confirm the Server role when prompted. The installer creates the service account, installs dependencies, prepares an isolated Python environment and configures collection and analysis jobs. You can run it from a private home directory without moving the clone or opening access to your home.
 
 - Service code: `/usr/local/lib/mysql_siem`
 - Python environment: `/opt/mysql_siem-venv`
 - Machine settings: `/usr/local/lib/mysql_siem/config/*.env`
 
-The original Git clone stays in place. Re-running the installer updates the service copy while preserving installed settings and logs. Back up existing settings and the database before upgrading an existing installation.
+**Development reset installer:** if `mysql_siem` already exists, installation requires typing `RESET` and permanently deletes its events, metrics, alerts and database configuration. A fresh schema and local identities are created. File-based settings and logs are retained; the original Git clone and local changes stay untouched. Back up anything you want to keep before reinstalling. A failed reset installation keeps collection paused until a successful retry.
 
 **Debian 13 requires a preinstalled Oracle MySQL 8.0 or 8.4 server and client**, with local administrative socket access. On Ubuntu and Mint, the installer can install MySQL when needed. MariaDB is not supported. Optional AdGuard Home integration requires separate configuration.
 

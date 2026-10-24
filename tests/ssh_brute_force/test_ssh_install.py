@@ -134,42 +134,10 @@ def test_ssh_settings_are_literal_and_do_not_affect_other_jobs(project):
     assert result.returncode == 0
 
 
-@pytest.mark.parametrize("ready", [False, True])
-def test_only_new_database_provisions_ssh_schema(ready):
+def test_fresh_database_enables_ssh_after_single_initialization():
     installer = (ROOT / "install.sh").read_text()
-
-    start = installer.index("# SSH schema: provision new databases only;")
-    end = installer.index("# Grant privileges only after", start)
-
-    block = installer[start:end].replace("/usr/bin/mysql", "fake_mysql")
-
-    script = (
-        "set -euo pipefail\n"
-        "log() { :; }\n"
-        "warn() { :; }\n"
-        "ensure_schema() { printf 'CURRENT_SCHEMA:%s\\n' \"$1\"; }\n"
-        "fake_mysql() { if [[ \"$*\" == *'SELECT COUNT'* ]]; then echo 0; else echo MIGRATION; cat; fi; }\n"
-        + block
-        + '\nprintf "READY:%s\\n" "$SSH_READY"'
-    )
-
-    result = subprocess.run(
-        ["bash", "-c", script],
-        check=True,
-        text=True,
-        capture_output=True,
-        env={
-            **os.environ,
-            "PROJECT_DIR": str(ROOT),
-            "TABLE_COUNT": "0" if ready else "8",
-            "DETECTION_READY": "1",
-            "EXPECTED_DB_NAME": "test",
-        },
-    )
-
-    assert ("CURRENT_SCHEMA:auth" in result.stdout) == ready
-    assert "MIGRATION" not in result.stdout
-    assert f"READY:{int(ready)}" in result.stdout
+    assert installer.index('config.reset_installation reset') < installer.index('SSH_READY=1')
+    assert 'TABLE_COUNT' not in installer
 
 
 def test_managed_cron_is_repeatable_and_preserves_existing_jobs(project, tmp_path):
@@ -248,53 +216,9 @@ def test_embedded_installer_python_is_valid_and_no_ssh_server_changes():
     assert '"auth_events": "SELECT, INSERT"' in installer
 
 
-@pytest.mark.parametrize(
-    "tables,rule,ready",
-    [
-        ("2", "1", "1"),
-        ("2", "0", "0"),
-        ("0", "1", "0"),
-    ],
-)
-def test_existing_installation_requires_both_auth_schema_and_rule(
-    tables, rule, ready
-):
-    installer = (ROOT / "install.sh").read_text()
-
-    start = installer.index("# SSH schema: provision new databases only;")
-    end = installer.index("# Grant privileges only after", start)
-
-    block = installer[start:end].replace("/usr/bin/mysql", "fake_mysql")
-
-    script = (
-        '''set -euo pipefail
-log() { :; }
-warn() { :; }
-fake_mysql() {
-    if [[ "$*" == *information_schema.tables* ]]; then echo "$TEST_TABLES";
-    elif [[ "$*" == *detection_rules* ]]; then echo "$TEST_RULE";
-    else echo UNEXPECTED_WRITE; return 1; fi
-}
-'''
-        + block
-        + '\nprintf "READY:%s\\n" "$SSH_READY"'
-    )
-
-    result = subprocess.run(
-        ["bash", "-c", script],
-        check=True,
-        text=True,
-        capture_output=True,
-        env={
-            **os.environ,
-            "PROJECT_DIR": str(ROOT),
-            "TABLE_COUNT": "30",
-            "DETECTION_READY": "1",
-            "EXPECTED_DB_NAME": "test",
-            "TEST_TABLES": tables,
-            "TEST_RULE": rule,
-        },
-    )
-
-    assert f"READY:{ready}" in result.stdout
-    assert "UNEXPECTED_WRITE" not in result.stdout
+def test_ssh_fresh_setup_has_no_legacy_opt_in_branch():
+    installer = (ROOT / 'install.sh').read_text()
+    block = installer.split('# SSH schema:', 1)[1].split('# Grant privileges only after', 1)[0]
+    assert 'SSH_READY=1' in block
+    assert 'SSH_TABLE_COUNT' not in block
+    assert 'SSH_RULE_COUNT' not in block

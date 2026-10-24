@@ -1,6 +1,5 @@
 """Installer sections run with fake MySQL/crontab and temporary project files."""
 
-import ast
 import os
 import re
 import subprocess
@@ -21,17 +20,13 @@ def section(start, end):
 
 
 def test_installer_provisions_analysis_before_schema_validation_and_grants():
-    setup = INSTALLER.index("ensure_schema analysis")
-    guard = INSTALLER.index("# Verify tables and migrate")
+    setup = INSTALLER.index("config.reset_installation reset")
+    guard = INSTALLER.index("# Source IP Analysis schema:")
     grants = INSTALLER.index("# Grant privileges only after")
     schedule = INSTALLER.index("# Schedule UFW Analysis;")
     assert setup < guard < grants < schedule
-    assert "-m database.migrate check" in INSTALLER
-    migration = section('# Only a database exclusively created', '# Final preflight:')
-    assert '"$TABLE_COUNT" == "0"' in migration
-    assert 'DATABASE_CREATED_THIS_RUN' in migration
-    assert "-m database.migrate apply" in migration
-    assert 'CREATE DATABASE IF NOT EXISTS' not in INSTALLER
+    assert "-m config.reset_installation reset" in INSTALLER
+    assert 'DATABASE_CREATED_THIS_RUN' not in INSTALLER
     assert "database/schema.py" in INSTALLER
     assert "SOURCE_IP_ANALYSIS_READY=1" in section("# Source IP Analysis schema:", "# Port Activity Analysis schema:")
 
@@ -136,39 +131,12 @@ def test_new_table_grants_only_when_present_without_legacy_grants(monkeypatch, p
     assert any("GRANT SELECT, INSERT, DELETE ON `mysql_siem`.`analysis_ufw_ports`" in query for query in queries)
 
 
-@pytest.mark.parametrize("legacy_present", [False, True])
-def test_both_schema_guards_allow_retired_tables_without_dropping_them(legacy_present):
-    checked = 0
-    for block in re.findall(r"<<'PY'\n(.*?)\nPY", INSTALLER, re.DOTALL):
-        tree = ast.parse(block)
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.If) or not isinstance(node.test, ast.Compare):
-                continue
-            if "dns_tables" not in ast.unparse(node.test) or not isinstance(node.test.left, ast.Name):
-                continue
-            variable = node.test.left.id
-            if variable not in {"existing", "actual"}:
-                continue
-            namespace = {}
-            for assignment in ast.walk(tree):
-                if isinstance(assignment, ast.Assign) and isinstance(assignment.value, ast.Set):
-                    for target in assignment.targets:
-                        if isinstance(target, ast.Name):
-                            namespace[target.id] = ast.literal_eval(assignment.value)
-            assert "top_attacking_ips" not in namespace["expected"]
-            namespace[variable] = namespace["expected"] | {"analysis_source_ips"}
-            if legacy_present:
-                namespace[variable].add("top_attacking_ips")
-            # Execute optional/retired-table normalization, then the whitelist check.
-            discard = next(item for item in ast.walk(tree) if isinstance(item, ast.Expr)
-                           and ast.unparse(item) == f"{variable}.discard('analysis_source_ips')")
-            removals = [item for item in ast.walk(tree) if isinstance(item, ast.AugAssign)
-                        and isinstance(item.target, ast.Name) and item.target.id == variable]
-            normalization = ast.Module(body=[discard] + removals, type_ignores=[])
-            exec(compile(normalization, "schema-removal", "exec"), namespace)  # noqa: S102
-            assert eval(compile(ast.Expression(node.test), "schema-guard", "eval"), namespace) is False
-            checked += 1
-    assert checked == 2
+def test_reset_installer_does_not_run_legacy_schema_upgrade_branches():
+    assert 'SCHEMA_EXISTS' not in INSTALLER
+    assert 'TABLE_COUNT' not in INSTALLER
+    assert 'ALTER TABLE ufw_state' not in INSTALLER
+    assert 'ensure_schema' not in INSTALLER
+    assert INSTALLER.count('-m config.reset_installation reset') == 1
 
 
 @pytest.mark.parametrize("source,ports,selection", [("1", "1", "--all"), ("0", "1", "--ports")])

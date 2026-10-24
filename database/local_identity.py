@@ -166,7 +166,7 @@ def without_managed_jobs(text):
     return '\n'.join(lines) + '\n'
 
 
-def begin_maintenance(state, installed, user, *, confirm=input):
+def begin_maintenance(state, installed, user, *, confirm=input, reset=False):
     from config.service_installation import trusted_directory
 
     installation.require_install_lock()
@@ -191,17 +191,23 @@ def begin_maintenance(state, installed, user, *, confirm=input):
     else:
         text = result.stdout
     paused = without_managed_jobs(text)
+    kept = []
     for line in paused.splitlines():
         if line.strip() and not line.lstrip().startswith('#') and is_collection_command(line):
-            raise IdentityError('Unmanaged mysql_siem cron jobs remain. Disable those jobs manually and rerun; '
-                                'do not restore legacy collection during identity setup.')
+            from config.reset_installation import collection_command
+            if not reset or not collection_command(line):
+                raise IdentityError('Unmanaged mysql_siem cron jobs remain. Disable those jobs manually and rerun; '
+                                    'do not restore legacy collection during identity setup.')
+            continue
+        kept.append(line)
+    paused = '\n'.join(kept) + '\n'
     if not already_paused or not (state / 'previous.cron').exists():
         atomic_write(state / 'previous.cron', text)
     if text != paused:
         subprocess.run(['crontab', '-u', user, '-'], input=paused, text=True,
                        capture_output=True, timeout=10, check=True)
     wrapper = installed / 'config/run_with_env.sh'
-    if installed.exists() and (not wrapper.is_file() or '# Local identity maintenance barrier.' not in wrapper.read_text()):
+    if not reset and installed.exists() and (not wrapper.is_file() or '# Local identity maintenance barrier.' not in wrapper.read_text()):
         answer = confirm('Managed cron jobs are paused. Stop any remaining mysql_siem jobs and confirm '
                          'legacy checkpoints belong to this machine and its unchanged logs. '
                          'Type LOCAL-LEGACY-STOPPED to continue: ')
@@ -798,6 +804,7 @@ def main(argv=None):
     parser.add_argument('--user', default='mysql_siem')
     parser.add_argument('--admin-socket', default='/run/mysqld/mysqld.sock')
     parser.add_argument('--cron-file', type=Path)
+    parser.add_argument('--reset', action='store_true', help='Pause for a confirmed fresh-database installation.')
     args = parser.parse_args(argv)
     connection = None
     try:
@@ -805,7 +812,7 @@ def main(argv=None):
             require_administrator()
         path = args.project / 'config/identity.env'
         if args.action == 'begin':
-            begin_maintenance(STATE_DIR, args.installed, args.user)
+            begin_maintenance(STATE_DIR, args.installed, args.user, reset=args.reset)
             return 0
         if args.action != 'verify':
             installation.require_maintenance(STATE_DIR)

@@ -446,3 +446,33 @@ def test_unmanaged_legacy_job_cannot_be_restored_with_new_cron(deployment):
         local.schedule_maintenance(deployment.state, deployment.target, path, deployment.user)
     assert (deployment.state / 'maintenance').exists()
     assert journal.read_deployment(deployment.state)['cron_digest'] is None
+
+
+def test_reset_retry_uses_new_code_but_retains_pending_settings(deployment):
+    layout = deployment
+    (layout.stage / 'app.py').write_text('obsolete staged program\n')
+    secret = (layout.stage / 'config/mysql.env').read_bytes()
+    fresh = service.prepare_deployment(layout.source, layout.target, layout.user, None,
+                                       layout.stable, layout.state, reset=True)
+    assert fresh != layout.stage
+    assert (fresh / 'app.py').read_text() == 'new program\n'
+    assert (fresh / 'config/mysql.env').read_bytes() == secret
+    assert (layout.target / 'app.py').read_text() == 'working program\n'
+    record = journal.read_deployment(layout.state)
+    assert record['stage'] == str(fresh)
+    assert record['identity'] == {}
+    assert record['database_started'] is True
+
+
+def test_reset_invalidates_only_old_identity_after_confirmation(deployment):
+    from config.reset_installation import clear_old_identity
+    layout = deployment
+    secret = (layout.stage / 'config/mysql.env').read_bytes()
+    clear_old_identity(layout.state, layout.stage)
+    assert not (layout.stage / 'config/identity.env').exists()
+    assert not (layout.state / 'receipt.json').exists()
+    assert (layout.stage / 'config/mysql.env').read_bytes() == secret
+    assert (layout.target / 'config/identity.env').exists()
+    assert (layout.state / 'maintenance').exists()
+    record = journal.read_deployment(layout.state)
+    assert record['identity'] == {} and record['checkpoint_transition'] is False

@@ -510,12 +510,7 @@ def test_running_migration_after_process_exit_can_resume(empty_mysql, monkeypatc
     assert migrations.migrate(empty_mysql) == ["015", "016", "017"]
 
 
-def test_migrated_analysis_validators_and_installer_guards(mysql, monkeypatch):
-    import re
-    import sys
-    from pathlib import Path
-    from unittest.mock import MagicMock
-
+def test_migrated_analysis_validators(mysql):
     from analysis.ufw.ports import validate_ports_schema
     from analysis.ufw.traffic import validate_traffic_schema
     from database.schema import validate_source_ips_schema
@@ -523,27 +518,6 @@ def test_migrated_analysis_validators_and_installer_guards(mysql, monkeypatch):
     validate_source_ips_schema(mysql)
     validate_ports_schema(mysql)
     validate_traffic_schema(mysql)
-
-    installer = Path(__file__).resolve().parents[2] / "install.sh"
-    blocks = re.findall(r"<<'PY'\n(.*?)\nPY", installer.read_text(), re.DOTALL)
-    guards = [block for block in blocks if "expected = {" in block]
-
-    with mysql.cursor() as cursor:
-        cursor.execute("SELECT DATABASE()")
-        name = cursor.fetchone()[0]
-
-    monkeypatch.setenv("DB_NAME", name)
-    monkeypatch.setenv("DB_USER", "synthetic-user")
-    monkeypatch.setenv("DB_PASSWORD", "synthetic-password")
-    monkeypatch.setattr(sys, "argv", ["installer", "unused", "unused"])
-
-    proxy = MagicMock(wraps=mysql)
-    proxy.close = lambda: None
-
-    monkeypatch.setattr(pymysql, "connect", lambda **kwargs: proxy)
-
-    for guard in guards:
-        exec(compile(guard, "isolated-installer-guard", "exec"), {})  # noqa: S102
 
 
 def test_runtime_account_needs_ledger_read_access_to_preserve_host_scope(mysql):

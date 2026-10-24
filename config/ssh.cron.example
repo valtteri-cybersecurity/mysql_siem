@@ -1,5 +1,0 @@
-# Replace /absolute/path/mysql_siem with the project directory.
-# Verify the current auth/detection schema and permissions before activating these jobs.
-# Both jobs run independently once per minute; MySQL named locks serialize runs.
-# * * * * * cd "/absolute/path/mysql_siem" && umask 077 && PYTHONPATH="/absolute/path/mysql_siem" "/absolute/path/mysql_siem/config/run_with_env.sh" --ssh /usr/bin/python3 -m ingestion.auth.main --allow-missing-source --log-file "/absolute/path/mysql_siem/ingestion/auth/cron.log"
-# * * * * * cd "/absolute/path/mysql_siem" && umask 077 && PYTHONPATH="/absolute/path/mysql_siem" "/absolute/path/mysql_siem/config/run_with_env.sh" --ssh /usr/bin/python3 -m detection.ssh_brute_force.main --automatic --log-file "/absolute/path/mysql_siem/detection/ssh_brute_force/cron.log"
