@@ -15,7 +15,7 @@ def isolated_installer(tmp_path):
     project = tmp_path / "existing project with spaces"
     project.mkdir()
     installer = project / "install.sh"
-    installer.write_text(INSTALLER)
+    installer.write_text(INSTALLER.replace('readonly SERVICE_DIR="/usr/local/lib/mysql_siem"', 'readonly SERVICE_DIR="$PROJECT_DIR"'))
     config = project / "config"
     config.mkdir()
     for filename in ("mysql.env", "identity.env", "ssh.env", "adguard.env"):
@@ -133,7 +133,7 @@ def test_server_reaches_existing_installation_path(isolated_installer, arguments
     # Replace the start of the existing server path with a harmless stop. No
     # packages, users, services or database commands can run in this test.
     assert INSTALLER.count(SERVER_ENTRY) == 1
-    installer.write_text(INSTALLER.replace(SERVER_ENTRY, "printf 'SERVER_ENTRY\\n'\nexit 0", 1))
+    installer.write_text(INSTALLER.replace(SERVER_ENTRY, "printf 'SERVER_ENTRY\\n'\nexit 0", 1).replace('readonly SERVICE_DIR="/usr/local/lib/mysql_siem"', 'readonly SERVICE_DIR="$PROJECT_DIR"'))
     for _attempt in range(2):
         result = run_installer(isolated_installer, arguments, selection + "yes\n")
         assert result.returncode == 0, result.stderr

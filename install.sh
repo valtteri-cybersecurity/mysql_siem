@@ -12,11 +12,17 @@ readonly CRON_BEGIN="# BEGIN mysql_siem managed jobs"
 readonly CRON_END="# END mysql_siem managed jobs"
 
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SOURCE_DIR="$PROJECT_DIR"
+readonly SERVICE_DIR="/usr/local/lib/mysql_siem"
 readonly INSTALL_USER="$APP_NAME"
 readonly APP_HOME="/var/lib/mysql_siem"
 readonly VENV_DIR="/opt/mysql_siem-venv"
-readonly APP_PYTHON="$VENV_DIR/bin/python"
+APP_PYTHON="$VENV_DIR/bin/python"
 ENV_FILE="$PROJECT_DIR/config/mysql.env"
+STAGED_PROJECT_DIR=""
+VENV_BUILD_DIR=""
+SERVICE_PUBLISHED=0
+DATABASE_SETUP_STARTED=0
 
 log()  { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -24,11 +30,15 @@ die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
 # Installation role selection (before any installation changes).
 select_installation_role() {
-    local selection stored_role=""
-    [[ ! -L "$PROJECT_DIR/config" ]] || die "Configuration directory must not be a symbolic link."
-    if [[ -e "$PROJECT_DIR/config/role.env" || -L "$PROJECT_DIR/config/role.env" ]]; then
-        stored_role="$(role_configuration read)" || die "Cannot validate the stored installation role; no installation changes were made."
-    fi
+    local selection stored_role="" role_directory found_role
+    for role_directory in "$PROJECT_DIR" "${SERVICE_DIR:-$PROJECT_DIR}"; do
+        [[ ! -L "$role_directory/config" ]] || die "Configuration directory must not be a symbolic link."
+        if [[ -e "$role_directory/config/role.env" || -L "$role_directory/config/role.env" ]]; then
+            found_role="$(role_configuration read "$role_directory")" || die "Cannot validate the stored installation role; no installation changes were made."
+            [[ -z "$stored_role" || "$found_role" == "$stored_role" ]] || die "Installation role conflict; existing roles were not changed."
+            stored_role="$found_role"
+        fi
+    done
     if [[ $# -eq 0 && -n "$stored_role" ]]; then
         INSTALL_ROLE="$stored_role"
     elif [[ $# -eq 0 ]]; then
@@ -79,11 +89,12 @@ from config.installation_role_setup import main
 main(sys.argv[2:])
 PY_ROLE
     else
-        /usr/bin/python3 -B - "$PROJECT_DIR" "$action" "$INSTALL_USER" <<'PY_ROLE'
+        /usr/bin/python3 -B - "$PROJECT_DIR" "$INSTALL_USER" "${2:-$PROJECT_DIR}" <<'PY_ROLE'
 import sys
+from pathlib import Path
 sys.path.insert(0, sys.argv[1])
-from config.installation_role_setup import main
-main(sys.argv[2:])
+from config.installation_role_setup import read_owned_role
+print(read_owned_role(sys.argv[2], path=Path(sys.argv[3]) / "config/role.env"))
 PY_ROLE
     fi
 }
@@ -111,6 +122,43 @@ select_role_cron_jobs() {
     esac
 }
 # End installation role selection.
+
+# Service copy operations use only the standard library before dependencies exist.
+service_installation() {
+    /usr/bin/python3 -I -B - "$SOURCE_DIR" "$@" <<'PY_SERVICE'
+import sys
+sys.path.insert(0, sys.argv[1])
+from config.service_installation import main
+main(sys.argv[2:])
+PY_SERVICE
+}
+
+prepare_service_installation() {
+    STAGED_PROJECT_DIR="$(service_installation stage "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER" "$INSTALL_ROLE")"
+    PROJECT_DIR="$STAGED_PROJECT_DIR"
+    ENV_FILE="$PROJECT_DIR/config/mysql.env"
+    cd -- "$PROJECT_DIR"
+}
+
+activate_service_installation() {
+    service_installation activate "$STAGED_PROJECT_DIR" "$SERVICE_DIR" "$VENV_BUILD_DIR" "$VENV_DIR"
+    SERVICE_PUBLISHED=1
+    PROJECT_DIR="$SERVICE_DIR"
+    ENV_FILE="$PROJECT_DIR/config/mysql.env"
+    APP_PYTHON="$VENV_DIR/bin/python"
+    cd -- "$PROJECT_DIR"
+}
+
+cleanup_prepared_installation() {
+    if [[ "${SERVICE_PUBLISHED:-0}" != 1 ]]; then
+        if [[ "${DATABASE_SETUP_STARTED:-0}" == 1 ]]; then
+            warn "Database setup was started; retained prepared settings at $STAGED_PROJECT_DIR and Python at $VENV_BUILD_DIR for manual recovery."
+            return
+        fi
+        if [[ -n "${STAGED_PROJECT_DIR:-}" ]]; then rm -rf -- "$STAGED_PROJECT_DIR"; fi
+        if [[ -n "${VENV_BUILD_DIR:-}" ]]; then rm -rf -- "$VENV_BUILD_DIR"; fi
+    fi
+}
 
 # Platform and dependency checks (no database writes).
 detect_distribution() {
@@ -176,43 +224,26 @@ install_dependencies() {
 }
 # Keep packages outside the application-owned project tree.
 validate_virtualenv_location() {
-    /usr/bin/python3 -I - "$VENV_DIR" "$PROJECT_DIR" <<'PY_VENV'
-import os
-import stat
-import sys
-from pathlib import Path
-
-root = Path(sys.argv[1])
-if root.is_relative_to(Path(sys.argv[2]).resolve()):
-    raise SystemExit("Virtual environment must be outside the application-owned project tree.")
-paths = [Path("/"), root.parent]
-if root.exists() or root.is_symlink():
-    paths.append(root)
-    for directory, names, files in os.walk(root, followlinks=False):
-        for name in names + files:
-            paths.append(Path(directory) / name)
-for path in paths:
-    info = path.lstat()
-    if info.st_uid != 0:
-        raise SystemExit("Virtual environment paths must be root-owned.")
-    if stat.S_ISLNK(info.st_mode):
-        if path == root or path in (Path("/"), root.parent) or not path.resolve().is_relative_to(root):
-            raise SystemExit("Unsafe virtual environment symbolic link.")
-    elif info.st_mode & 0o022:
-        raise SystemExit("Virtual environment paths must not be group/other writable.")
-PY_VENV
+    service_installation validate-environment "${1:-$VENV_DIR}" "${2:-stable}"
 }
 
 install_virtualenv() {
+    local system_version candidate_version
     validate_virtualenv_location
-    # Copies avoid external interpreter symlinks; normal users need read access.
+    VENV_BUILD_DIR="$(service_installation environment)"
+    APP_PYTHON="$VENV_BUILD_DIR/bin/python"
+    # This is the environment's final physical location; never relocate a venv.
     (
         umask 022
         cd /
-        /usr/bin/python3 -I -m venv --copies "$VENV_DIR"
+        /usr/bin/python3 -I -m venv --copies "$VENV_BUILD_DIR"
         "$APP_PYTHON" -I -m pip install -r "$PROJECT_DIR/requirements-dns.txt"
+        "$APP_PYTHON" -I -m pip check
     )
-    validate_virtualenv_location
+    validate_virtualenv_location "$VENV_BUILD_DIR" candidate
+    system_version="$(/usr/bin/python3 -I -c 'import sys; print(sys.version_info[:2])')"
+    candidate_version="$("$APP_PYTHON" -I -c 'import sys; print(sys.version_info[:2])')"
+    [[ "$system_version" == "$candidate_version" ]] || die "Virtual environment Python version mismatch."
     runuser -u "$INSTALL_USER" -- "$APP_PYTHON" -I -c 'import pymysql, requests, cryptography'
 }
 # End platform and dependency checks.
@@ -359,7 +390,7 @@ secure_project_sources() {
     link="$(find "$PROJECT_DIR" -path "$PROJECT_DIR/.git" -prune -o -type l -print -quit)"
     [[ -z "$link" ]] || die "Project contains an unsafe symbolic link: $link"
     find "$PROJECT_DIR" -path "$PROJECT_DIR/.git" -prune -o \
-        -type f ! -path "$PROJECT_DIR/config/*.env" ! -name cron.log \
+        -type f ! -path "$PROJECT_DIR/config/*.env" ! -name '*.log' ! -name '*.log.*' \
         -exec chown "root:$INSTALL_USER" {} + \
         -exec chmod 'g+rX,go-w' {} +
     find "$PROJECT_DIR" -path "$PROJECT_DIR/.git" -prune -o \
@@ -501,6 +532,8 @@ fi
 [[ $EUID -eq 0 ]] || die "Run: sudo bash install.sh"
 
 for path in \
+    requirements-dns.txt \
+    config/service_installation.py \
     database/schema.sql \
     database/schema.py \
     database/migrate.py \
@@ -529,16 +562,19 @@ do
     [[ -f "$PROJECT_DIR/$path" ]] || die "Required file is missing: $path"
 done
 
+# Recheck persistent roles before creating even the installation lock.
+service_installation check "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER"
+exec 9> /usr/local/lib/.mysql_siem-install.lock
+flock -n 9 || die "Another mysql_siem installation is running."
+service_installation check "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER"
+trap cleanup_prepared_installation EXIT
+
 detect_distribution
 select_mysql_package
 ensure_application_user
 ensure_log_access
-runuser -u "$INSTALL_USER" -- test -r "$PROJECT_DIR/install.sh" || \
-    die "mysql_siem cannot access the project; use an accessible path such as /opt/mysql_siem."
-[[ ! -L "$PROJECT_DIR/config" ]] || die "Configuration directory must not be a symbolic link."
-if [[ ! -e "$PROJECT_DIR/config/role.env" && ! -L "$PROJECT_DIR/config/role.env" ]]; then
-    install -d -m 750 -o "$INSTALL_USER" -g "$(id -gn "$INSTALL_USER")" "$PROJECT_DIR/config"
-fi
+prepare_service_installation
+runuser -u "$INSTALL_USER" -- test -r "$PROJECT_DIR/install.sh" || die "mysql_siem cannot read the prepared service copy."
 persist_installation_role
 secure_project_sources
 install_dependencies
@@ -569,6 +605,8 @@ load_mysql_env "$ENV_FILE"
 # Do not reimport existing tables when rerunning the installer.
 log "Checking database and schema."
 
+# Keep generated credentials recoverable if database provisioning fails midway.
+DATABASE_SETUP_STARTED=1
 DB_SETUP_RESULT="$("$APP_PYTHON" - "$ENV_FILE" "$PROJECT_DIR/$SCHEMA_REL" <<'PY'
 import os
 import sys
@@ -988,6 +1026,9 @@ try:
 finally:
     conn.close()
 PY
+
+# Publish only after copying, dependencies and database checks have succeeded.
+activate_service_installation
 
 # Use the shipped environment loader; keep one implementation of DNS loading.
 

@@ -59,6 +59,7 @@ runuser() { printf 'RUNUSER:%s\n' "$*"; }
 id() { printf 'mysql_siem\n'; }
 install() { :; }
 persist_installation_role() { :; }
+prepare_service_installation() { printf 'SERVICE_COPY_CHECK\n'; }
 apt-get() { printf 'APT'; printf ' <%s>' "$@"; printf '\n'; }
 ''' + functions + r'''
 install_virtualenv() { printf 'VENV_CHECK\n'; }
@@ -215,7 +216,7 @@ def test_private_runtime_environment_uses_project_requirements():
     assert "python3 python3-venv" in INSTALLER
     assert "python3-pymysql" not in INSTALLER
 
-    assert '-m venv --copies "$VENV_DIR"' in INSTALLER
+    assert '-m venv --copies "$VENV_BUILD_DIR"' in INSTALLER
 
     assert (
         '-m pip install -r "$PROJECT_DIR/requirements-dns.txt"'
@@ -252,13 +253,12 @@ def test_virtualenv_is_protected_from_application_ownership_changes():
         "validate_virtualenv_location() {", 1
     )[1].split("# End platform", 1)[0]
 
-    assert "info.st_uid != 0" in setup
-    assert "info.st_mode & 0o022" in setup
-    assert "path.resolve().is_relative_to(root)" in setup
-
-    assert setup.count(
-        "    validate_virtualenv_location\n"
-    ) == 2
+    helper = (ROOT / 'config/service_installation.py').read_text()
+    assert 'info.st_uid != 0' in helper
+    assert 'info.st_mode & 0o022' in helper
+    assert 'item.resolve(strict=True).is_relative_to(path)' in helper
+    assert 'resolved.parent != ENVIRONMENTS' in helper
+    assert 'validate_virtualenv_location "$VENV_BUILD_DIR" candidate' in setup
 
     assert "cd /" in setup
     assert '"$APP_PYTHON" -I -m pip' in setup
