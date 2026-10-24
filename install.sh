@@ -382,7 +382,9 @@ ensure_application_user() {
         die "mysql_siem home requires owner mysql_siem:mysql_siem and mode 750; review it manually."
     log "mysql_siem account verified (created=$created)."
 }
-# Grant the service account read access to Debian/Ubuntu system logs.
+
+# Grant the service account access to system logs. SSH is an optional source
+# and its configured path is checked when the SSH cron jobs are prepared.
 ensure_log_access() {
     local adm_record adm_name adm_password adm_gid adm_members account_groups source
     adm_record="$(getent group adm)" || die "The adm log-reader group is required."
@@ -396,14 +398,17 @@ ensure_log_access() {
     fi
     validate_application_user
 
-    for source in /var/log/auth.log /var/log/ufw.log; do
-        if [[ -e "$source" ]]; then
-            runuser -u "$INSTALL_USER" -- test -r "$source" ||
-                die "mysql_siem cannot read $source even with adm membership."
-        else
-            warn "Log source does not exist yet: $source"
-        fi
-    done
+    # UFW is a core log source; do not silently install an unusable UFW collector.
+    # /var/log/auth.log is optional and may be inaccessible on some Ubuntu
+    # installations even when adm membership appears correct. Do not weaken
+    # file permissions or abort the entire SIEM installation for SSH alone.
+    source=/var/log/ufw.log
+    if [[ -e "$source" ]]; then
+        runuser -u "$INSTALL_USER" -- test -r "$source" ||
+            die "mysql_siem cannot read $source even with adm membership."
+    else
+        warn "Log source does not exist yet: $source"
+    fi
 }
 
 # Keep executable source files out of the service account's control.
@@ -840,16 +845,21 @@ if [[ "${SSH_READY:-0}" == "1" ]]; then
     chmod 600 "$PROJECT_DIR/config/ssh.env"
     chown "$INSTALL_USER:$(id -gn "$INSTALL_USER")" "$PROJECT_DIR/config/ssh.env"
     SSH_LOG_SOURCE="$("$PROJECT_DIR/config/run_with_env.sh" --ssh "$APP_PYTHON" -c 'import os; print(os.getenv("SSH_AUTH_LOGFILE", "/var/log/auth.log"))')"
+    SSH_LOG_READABLE=1
     if [[ ! -e "$SSH_LOG_SOURCE" ]]; then
-        warn "SSH log source absent; collection will report SKIPPED until it appears."
+        warn "SSH log source absent: $SSH_LOG_SOURCE; the SSH collector will report SKIPPED until it appears."
     elif ! runuser -u "$INSTALL_USER" -- test -r "$SSH_LOG_SOURCE"; then
-        warn "SSH log source is not readable by the application user. Review log-group access separately."
+        SSH_LOG_READABLE=0
+        warn "SSH log source is unreadable by mysql_siem: $SSH_LOG_SOURCE. SSH collection and detection will NOT be scheduled."
+        warn "Check log ACLs, directory permissions and any access controls separately; do not loosen log permissions."
     fi
-    mkdir -p "$PROJECT_DIR/ingestion/auth" "$PROJECT_DIR/detection/ssh_brute_force"
-    prepare_runtime_log "$PROJECT_DIR/ingestion/auth/cron.log"
-    prepare_runtime_log "$PROJECT_DIR/detection/ssh_brute_force/cron.log"
-    SSH_AUTH_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh \"$APP_PYTHON\" -m ingestion.auth.main --allow-missing-source --log-file \"$PROJECT_DIR/ingestion/auth/cron.log\""
-    SSH_DETECTION_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh \"$APP_PYTHON\" -m detection.ssh_brute_force.main --automatic --log-file \"$PROJECT_DIR/detection/ssh_brute_force/cron.log\""
+    if [[ "$SSH_LOG_READABLE" == 1 ]]; then
+        mkdir -p "$PROJECT_DIR/ingestion/auth" "$PROJECT_DIR/detection/ssh_brute_force"
+        prepare_runtime_log "$PROJECT_DIR/ingestion/auth/cron.log"
+        prepare_runtime_log "$PROJECT_DIR/detection/ssh_brute_force/cron.log"
+        SSH_AUTH_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh \"$APP_PYTHON\" -m ingestion.auth.main --allow-missing-source --log-file \"$PROJECT_DIR/ingestion/auth/cron.log\""
+        SSH_DETECTION_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh \"$APP_PYTHON\" -m detection.ssh_brute_force.main --automatic --log-file \"$PROJECT_DIR/detection/ssh_brute_force/cron.log\""
+    fi
 fi
 
 # Schedule UFW Analysis; a single job runs the ready analyses with bounded logs.
@@ -954,4 +964,7 @@ trap - EXIT
 
 log "Installation steps completed. Installed official commit $SIEM_BOOTSTRAP_COMMIT."
 log "Cron: sudo crontab -u $INSTALL_USER -l"
+if [[ "${SSH_LOG_READABLE:-1}" == 0 ]]; then
+    warn "SSH ingestion and SSH detection were not enabled: unreadable SSH log source."
+fi
 log "Check the UFW log source and permissions before production use."
