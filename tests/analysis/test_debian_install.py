@@ -219,7 +219,7 @@ def test_private_runtime_environment_uses_project_requirements():
     assert '-m venv --copies "$VENV_BUILD_DIR"' in INSTALLER
 
     assert (
-        '-m pip install -r "$PROJECT_DIR/requirements-dns.txt"'
+        '-m pip install -r "$PROJECT_DIR/requirements-runtime.txt"'
         in INSTALLER
     )
 
@@ -240,7 +240,7 @@ def test_runtime_and_cron_use_absolute_virtualenv_python():
         'cat >> "$CRON_TMP" <<CRON', 1
     )[1].split("\nCRON", 1)[0]
 
-    assert cron.count('"$APP_PYTHON"') == 4
+    assert cron.count('"$APP_PYTHON"') == 6
 
     assert (
         'runuser -u "$INSTALL_USER" -- /usr/bin/python3 -B'

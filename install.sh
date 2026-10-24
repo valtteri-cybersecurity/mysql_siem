@@ -37,7 +37,18 @@ die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
 # Installation role selection (before any installation changes).
 select_installation_role() {
-    local selection stored_role="" role_directory found_role
+    local selection stored_role="" role_directory found_role argument
+    local -a role_arguments=()
+    INSTALL_OPERATION=reset
+    for argument in "$@"; do
+        if [[ "$argument" == --upgrade ]]; then
+            [[ "$INSTALL_OPERATION" == reset ]] || die "Duplicate --upgrade option."
+            INSTALL_OPERATION=upgrade
+        else
+            role_arguments+=("$argument")
+        fi
+    done
+    set -- "${role_arguments[@]}"
     for role_directory in "${SETTINGS_SOURCE_DIR:-$PROJECT_DIR}" "${SERVICE_DIR:-$PROJECT_DIR}"; do
         [[ ! -L "$role_directory/config" ]] || die "Configuration directory must not be a symbolic link."
         if [[ -e "$role_directory/config/role.env" || -L "$role_directory/config/role.env" ]]; then
@@ -69,7 +80,7 @@ select_installation_role() {
     elif [[ $# -eq 2 && "$1" == --role ]]; then
         INSTALL_ROLE="$2"
     else
-        die "Usage: sudo bash install.sh [--role server|collector]"
+        die "Usage: sudo bash install.sh [--role server|collector] [--upgrade]"
     fi
 
     case "$INSTALL_ROLE" in
@@ -141,7 +152,7 @@ PY_SERVICE
 }
 
 prepare_service_installation() {
-    STAGED_PROJECT_DIR="$(service_installation stage "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER" "$INSTALL_ROLE" "$SETTINGS_SOURCE_DIR" reset)"
+    STAGED_PROJECT_DIR="$(service_installation stage "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER" "$INSTALL_ROLE" "$SETTINGS_SOURCE_DIR" "${INSTALL_OPERATION:-reset}")"
     LOCAL_DEPLOYMENT_STARTED=1
     PROJECT_DIR="$STAGED_PROJECT_DIR"
     ENV_FILE="$PROJECT_DIR/config/mysql.env"
@@ -159,7 +170,7 @@ activate_service_installation() {
 
 cleanup_prepared_installation() {
     if [[ "${LOCAL_DEPLOYMENT_STARTED:-0}" == 1 && "${SERVICE_PUBLISHED:-0}" != 1 ]]; then
-        service_installation discard || warn "Prepared deployment retained; keep maintenance and recovery files and rerun install.sh --role server."
+        service_installation discard || warn "Prepared deployment retained; keep maintenance and recovery files and rerun the same installation command (keep --upgrade when upgrading)."
         return
     fi
     if [[ "${SERVICE_PUBLISHED:-0}" != 1 ]]; then
@@ -261,14 +272,14 @@ install_virtualenv() {
         umask 022
         cd /
         /usr/bin/python3 -I -m venv --copies "$VENV_BUILD_DIR"
-        "$APP_PYTHON" -I -m pip install -r "$PROJECT_DIR/requirements-dns.txt"
+        "$APP_PYTHON" -I -m pip install -r "$PROJECT_DIR/requirements-runtime.txt"
         "$APP_PYTHON" -I -m pip check
     )
     validate_virtualenv_location "$VENV_BUILD_DIR" candidate
     system_version="$(/usr/bin/python3 -I -c 'import sys; print(sys.version_info[:2])')"
     candidate_version="$("$APP_PYTHON" -I -c 'import sys; print(sys.version_info[:2])')"
     [[ "$system_version" == "$candidate_version" ]] || die "Virtual environment Python version mismatch."
-    runuser -u "$INSTALL_USER" -- "$APP_PYTHON" -I -c 'import pymysql, requests, cryptography'
+    runuser -u "$INSTALL_USER" -- "$APP_PYTHON" -I -c 'import pymysql, requests, cryptography, psutil'
 }
 # End platform and dependency checks.
 
@@ -551,7 +562,7 @@ load_mysql_env() {
     fi
 }
 
-trap 'rc=$?; printf "[ERROR] Installation failed (exit %s, line %s). Keep maintenance/recovery files and rerun install.sh --role server after correcting the error.\n" "$rc" "${BASH_LINENO[0]:-?}" >&2; exit "$rc"' ERR
+trap 'rc=$?; printf "[ERROR] Installation failed (exit %s, line %s). Keep maintenance/recovery files and rerun the same installation command (keep --upgrade when upgrading) after correcting the error.\n" "$rc" "${BASH_LINENO[0]:-?}" >&2; exit "$rc"' ERR
 
 select_installation_role "$@"
 if [[ "$INSTALL_ROLE" == collector ]]; then
@@ -567,6 +578,7 @@ bootstrap_latest_release
 
 for path in \
     requirements-dns.txt \
+    requirements-runtime.txt \
     config/service_installation.py \
     config/reset_installation.py \
     config/install_bootstrap.sh \
@@ -578,6 +590,11 @@ for path in \
     database/migration_steps.py \
     database/migrations/014_host_registry.sql \
     database/migrations/017_ufw_datetime_precision.sql \
+    database/migrations/018_processes.sql \
+    database/migrations/019_services.sql \
+    database/snapshot_migrations.py \
+    metrics/snapshot.py \
+    metrics/runner.py \
     config/run_with_env.sh \
     config/installation_role.py \
     config/installation_role_setup.py \
@@ -591,6 +608,12 @@ for path in \
     metrics/system/main.py \
     metrics/filesystem/main.py \
     metrics/security/main.py \
+    metrics/processes/main.py \
+    metrics/processes/get.py \
+    metrics/processes/database.py \
+    metrics/services/main.py \
+    metrics/services/get.py \
+    metrics/services/database.py \
     analysis/ufw/__init__.py \
     analysis/ufw/source_ips.py \
     analysis/ufw/ports.py \
@@ -606,7 +629,12 @@ if [[ -x /usr/bin/mysql ]]; then
         --user=root --batch --skip-column-names \
         -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='mysql_siem'")" ||
         die "Cannot inspect local MySQL. Start/check the installed server before retrying; no reset was performed."
-    if [[ "$EXISTING_DATABASE" == 1 ]]; then
+    if [[ "$EXISTING_DATABASE" == 1 && "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
+        [[ -f "$SERVICE_DIR/config/mysql.env" && -f "$SERVICE_DIR/config/identity.env" &&
+           -f /usr/local/lib/.mysql_siem-local/receipt.json ]] ||
+            die "Upgrade requires an existing protected local installation and its identity receipt."
+        log "Preserving the existing database and local identities."
+    elif [[ "$EXISTING_DATABASE" == 1 ]]; then
         printf '%s\n' 'Existing local mysql_siem database detected.' \
             'Reinstallation permanently deletes all events, metrics, alerts and database records.'
         printf 'Type RESET to continue: '
@@ -616,6 +644,9 @@ if [[ -x /usr/bin/mysql ]]; then
     elif [[ "$EXISTING_DATABASE" != 0 ]]; then
         die "Unexpected database inspection result; reset was not attempted."
     fi
+fi
+if [[ "${INSTALL_OPERATION:-reset}" == upgrade && "${EXISTING_DATABASE:-0}" != 1 ]]; then
+    die "Upgrade requires an existing MySQL database; no installation changes were made."
 fi
 
 # Recheck persistent roles before creating even the installation lock.
@@ -646,7 +677,11 @@ printf '%s\n' "$SIEM_BOOTSTRAP_COMMIT" > "$PROJECT_DIR/config/installed-version"
 chown root:"$INSTALL_USER" "$PROJECT_DIR/config/installed-version"
 chmod 640 "$PROJECT_DIR/config/installed-version"
 
+if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
+    local_identity_setup begin
+else
 local_identity_setup begin --reset
+fi
 exec 8< /usr/local/lib/.mysql_siem-local/runtime.lock
 flock -x -w 30 8 || die "Runtime jobs did not stop; collection remains paused."
 export SIEM_INSTALL_MAINTENANCE=1
@@ -672,12 +707,16 @@ load_mysql_env "$ENV_FILE"
 [[ "${DB_HOST:-}" == "localhost" ]] ||
     die "This installer requires DB_HOST=localhost."
 
-# One initialization path: always create a fresh database after explicit consent.
+# Upgrade preserves history; the original reset path still requires explicit consent.
 DATABASE_SETUP_STARTED=1
 service_installation database-started
-PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation reset --project "$PROJECT_DIR"
+if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
+    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation upgrade --project "$PROJECT_DIR"
+else
+    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation reset --project "$PROJECT_DIR"
+fi
 
-# Fresh schema: the single initializer has created every current table and rule.
+# Both schema paths have installed or verified every current table and rule.
 DETECTION_READY=1
 
 # Source IP Analysis schema: validate the fresh migrated structure.
@@ -742,6 +781,11 @@ grants = {
     "filesystem_metrics": "SELECT, INSERT, UPDATE",
     "security_metrics": "SELECT, INSERT, UPDATE",
     "system_metrics": "SELECT, INSERT",
+    "process_events": "SELECT, INSERT",
+    "service_events": "SELECT, INSERT",
+    "process_state": "SELECT, INSERT, DELETE",
+    "service_state": "SELECT, INSERT, DELETE",
+    "collector_snapshots": "SELECT, INSERT, UPDATE",
     "analysis_ufw_ports": "SELECT, INSERT, DELETE",
     "analysis_ufw_traffic": "SELECT, INSERT, UPDATE",
     "analysis_ufw_traffic_daily": "SELECT, INSERT, UPDATE",
@@ -893,6 +937,8 @@ prepare_runtime_log "$PROJECT_DIR/ingestion/cron.log"
 prepare_runtime_log "$PROJECT_DIR/metrics/system/cron.log"
 prepare_runtime_log "$PROJECT_DIR/metrics/filesystem/cron.log"
 prepare_runtime_log "$PROJECT_DIR/metrics/security/cron.log"
+# Rotation needs writable logs outside the protected code tree.
+service_installation snapshot-logs "$INSTALL_USER"
 
 log "Checking Python syntax."
 while IFS= read -r -d '' pyfile; do
@@ -948,6 +994,8 @@ $CRON_BEGIN
 */5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" "$PROJECT_DIR/metrics/system/main.py" >> "$PROJECT_DIR/metrics/system/cron.log" 2>&1
 */5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" "$PROJECT_DIR/metrics/filesystem/main.py" >> "$PROJECT_DIR/metrics/filesystem/cron.log" 2>&1
 */5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" -m metrics.security.main >> "$PROJECT_DIR/metrics/security/cron.log" 2>&1
+* * * * * cd "$PROJECT_DIR" && umask 077 && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" -m metrics.processes.main --log-file "/var/log/mysql_siem/processes/cron.log"
+* * * * * cd "$PROJECT_DIR" && umask 077 && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" -m metrics.services.main --log-file "/var/log/mysql_siem/services/cron.log"
 ${UFW_ANALYSIS_CRON:-}
 $PORT_SCAN_CRON
 ${SSH_AUTH_CRON:-}

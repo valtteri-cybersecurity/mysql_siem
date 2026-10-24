@@ -33,7 +33,9 @@ from database.identity import (
     validate_id,
 )
 
-LOCAL_TYPES = ('ufw', 'system', 'filesystem', 'security', 'auth')
+ORIGINAL_LOCAL_TYPES = ('ufw', 'system', 'filesystem', 'security', 'auth')
+EXTENSION_TYPES = ('processes', 'services')
+LOCAL_TYPES = ORIGINAL_LOCAL_TYPES + EXTENSION_TYPES
 COLLECTOR_KEY = 'SIEM_COLLECTOR_ID'
 LOCAL_KEYS = {}
 for _source_type in LOCAL_TYPES:
@@ -245,6 +247,7 @@ def require_stopped_legacy_jobs(installed, user):
         if owner == 0:
             for signature in ('ingestion/ufw_to_mysql.py', 'ingestion/auth/main.py', 'ingestion/dns/main.py',
                               'metrics/system/main.py', 'metrics/filesystem/main.py', 'metrics/security/main.py',
+                              'metrics/processes/main.py', 'metrics/services/main.py',
                               '-m ingestion.', '-m metrics.', '-m analysis.ufw.', '-m detection.'):
                 if signature in command:
                     known_root_job = True
@@ -547,6 +550,45 @@ def copy_checkpoints(cursor, settings, *, auth_reader, ufw_paths, auth_paths):
         unchanged_checkpoint_files(base, files)
 
 
+def extend_local_receipt(connection, path, receipt):
+    """Add only new source kinds to a completed old receipt, retaining every ID.
+
+    A commit before receipt publication is recovered through the approved host
+    bindings on retry. Existing disabled/ambiguous sources remain errors. This
+    transition never copies checkpoints or rewrites historical observations.
+    """
+    settings = receipt['identity']
+    if all(LOCAL_KEYS[kind] in settings for kind in EXTENSION_TYPES):
+        return receipt
+    if any(LOCAL_KEYS[kind] not in settings for kind in ORIGINAL_LOCAL_TYPES):
+        raise IdentityError('Incomplete original local bindings; administrative recovery required.')
+    connection.rollback()
+    connection.begin()
+    try:
+        result = dict(settings)
+        with connection.cursor() as cursor:
+            host = validate_bindings(cursor, result, complete=False)
+            if host != receipt['host_id']:
+                raise IdentityError('Persistent local host binding has changed.')
+            for kind in EXTENSION_TYPES:
+                key = LOCAL_KEYS[kind]
+                if key in result:
+                    continue
+                source = existing_local_source(cursor, host, result[COLLECTOR_KEY], kind)
+                if source is None:
+                    source = register_source(cursor, host, 'local.' + receipt['token'] + '.' + kind, kind, enabled=True)
+                    approve_collector_source(cursor, result[COLLECTOR_KEY], source)
+                result[key] = source
+            validate_bindings(cursor, result)
+        connection.commit()
+        updated = dict(receipt, identity=result)
+        save_receipt(path, updated)
+        return updated
+    except BaseException:
+        connection.rollback()
+        raise
+
+
 def provision(connection, receipt_path, settings, *, confirmed=False, auth_reader,
               ufw_paths, auth_paths, confirm=input):
     """Commit registry and checkpoint copies together, recover using the receipt."""
@@ -574,6 +616,7 @@ def provision(connection, receipt_path, settings, *, confirmed=False, auth_reade
         if key not in expected or expected[key] != value:
             raise IdentityError('Identity file conflicts with the persistent installation receipt.')
     if receipt['phase'] in ('database_ready', 'ready'):
+        receipt = extend_local_receipt(connection, receipt_path, receipt)
         if receipt['phase'] == 'database_ready':
             verify_pending_checkpoints(connection, receipt, auth_reader=auth_reader,
                                        ufw_paths=ufw_paths, auth_paths=auth_paths)
@@ -623,9 +666,11 @@ def provision(connection, receipt_path, settings, *, confirmed=False, auth_reade
                     raise IdentityError('Ambiguous recovery source binding.')
                 if found:
                     result[key] = found[0][0]
-                elif recovered:
+                elif recovered and source_type not in EXTENSION_TYPES:
                     raise IdentityError('Incomplete committed local registry; manual recovery required.')
                 else:
+                    if recovered:
+                        host = validate_bindings(cursor, result, complete=False)
                     source_id = existing_local_source(cursor, host, result[COLLECTOR_KEY], source_type)
                     if source_id is None:
                         source_id = register_source(cursor, host, name, source_type, enabled=True)

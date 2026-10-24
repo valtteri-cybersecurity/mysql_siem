@@ -1,4 +1,4 @@
-"""Development-only Server reset. Call only inside the installer maintenance lock."""
+"""Server reset or additive upgrade, only inside the installer maintenance lock."""
 
 import argparse
 import json
@@ -63,6 +63,7 @@ def collection_command(command):
     component = False
     for signature in ('ingestion/ufw_to_mysql.py', 'ingestion/auth/', 'ingestion/dns/',
                       'metrics/system/', 'metrics/filesystem/', 'metrics/security/',
+                      'metrics/processes/', 'metrics/services/',
                       'analysis/ufw/', 'analysis/daily_counts/', 'detection/port_scan/',
                       'detection/ssh_brute_force/', '-m ingestion.', '-m metrics.',
                       '-m analysis.ufw', '-m detection.'):
@@ -187,7 +188,7 @@ def wait_for_legacy_jobs(processes=Path('/proc'), timeout=30):
                 command = (process / 'cmdline').read_bytes().replace(b'\0', b' ').decode('utf-8', errors='replace')
             except (FileNotFoundError, ProcessLookupError):
                 continue
-            module_job = re.search(r'-m (?:ingestion\.(?:auth|dns)|metrics\.(?:system|filesystem|security)|analysis\.ufw|detection\.(?:port_scan|ssh_brute_force))(?:[.\s]|$)', command)
+            module_job = re.search(r'-m (?:ingestion\.(?:auth|dns)|metrics\.(?:system|filesystem|security|processes|services)|analysis\.ufw|detection\.(?:port_scan|ssh_brute_force))(?:[.\s]|$)', command)
             try:
                 directory = os.readlink(process / 'cwd')
             except (FileNotFoundError, ProcessLookupError):
@@ -276,9 +277,42 @@ def reset_database(connection, settings, *, approved=False, prepare=lambda: None
             cursor.execute('SELECT RELEASE_LOCK(%s)', (LOCK_NAME,))
 
 
+def upgrade_database(connection, settings):
+    """Additive upgrade only; never reset identities, passwords or event history."""
+    from database.migrate import check_ufw_utc_readiness, migrate
+
+    validate_settings(settings)
+    if not database_exists(connection):
+        raise ResetError('Upgrade requires an existing local database.')
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT VERSION()')
+        version = cursor.fetchone()[0]
+        if not re.match(r'^8\.(?:0|4)\.', version) or 'MariaDB' in version:
+            raise ResetError('Upgrade requires Oracle MySQL 8.0 or 8.4.')
+        cursor.execute("SHOW GRANTS FOR 'pythonuser'@'localhost'")
+        registry = {'hosts', 'log_sources', 'collectors', 'collector_sources',
+                    'sender_identities', 'sender_sources', 'sender_certificates', 'schema_migrations'}
+        for (grant,) in cursor.fetchall():
+            if grant.startswith('GRANT USAGE ON *.* TO '):
+                continue
+            binding = re.match(r'^GRANT ([A-Z_, ]+) ON `mysql_siem`\.`(\w+)` TO ', grant)
+            if binding is None or 'WITH GRANT OPTION' in grant:
+                raise ResetError('Unsafe runtime account grants; review before upgrading.')
+            privileges = set(binding[1].split(', '))
+            allowed = {'SELECT'} if binding[2] in registry else {'SELECT', 'INSERT', 'UPDATE', 'DELETE'}
+            if not privileges <= allowed:
+                raise ResetError('Runtime account has administrative privileges; review before upgrading.')
+    connection.select_db(DATABASE)
+    # Preserve the existing UFW time-basis policy: ambiguous historical databases
+    # stay offline and are never silently converted or reset by --upgrade.
+    check_ufw_utc_readiness(connection)
+    migrate(connection)
+    check_ufw_utc_readiness(connection)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('reset',))
+    parser.add_argument('action', choices=('reset', 'upgrade'))
     parser.add_argument('--project', type=Path, required=True)
     args = parser.parse_args(argv)
     connection = None
@@ -286,11 +320,15 @@ def main(argv=None):
         journal.require_maintenance(journal.STATE_DIR)
         journal.require_stage(journal.STATE_DIR, args.project)
         if get_installation_role(path=args.project / 'config/role.env') != 'server':
-            raise ResetError('Database reset is available only for the Server installation role.')
+            raise ResetError('Database setup is available only for the Server installation role.')
         validate_settings(os.environ)
         connection = pymysql.connect(unix_socket=SOCKET, user='root', charset='utf8mb4', autocommit=True,
                                      connect_timeout=5, read_timeout=30, write_timeout=30,
                                      init_command="SET time_zone = '+00:00'")
+        if args.action == 'upgrade':
+            upgrade_database(connection, os.environ)
+            print('Database upgraded; history and identities preserved.')
+            return 0
         exists = database_exists(connection)
         approved = os.environ.get('SIEM_DATABASE_RESET_APPROVED') == '1'
         if exists and not approved:
@@ -309,11 +347,11 @@ def main(argv=None):
         return 1
     except (OSError, ValueError, EOFError, subprocess.SubprocessError, InstallationError,
             journal.InstallationStateError):
-        print('Reset stopped: filesystem, scheduler or maintenance validation failed. Collection remains paused.', file=sys.stderr)
+        print('Database setup stopped: filesystem, scheduler or maintenance validation failed. Collection remains paused.', file=sys.stderr)
         return 1
     except (pymysql.MySQLError, MigrationError) as error:
         # SQL/driver messages can contain credentials. Report the failed operation safely.
-        print('Database reset/initialization failed (' + type(error).__name__
+        print('Database setup failed (' + type(error).__name__
               + '). Collection remains paused; correct the error and rerun the installer.', file=sys.stderr)
         return 1
     finally:

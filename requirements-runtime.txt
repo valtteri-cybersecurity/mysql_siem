@@ -1,0 +1,3 @@
+-r requirements-dns.txt
+# Local process snapshots; installed in the protected application virtualenv.
+psutil>=6,<8

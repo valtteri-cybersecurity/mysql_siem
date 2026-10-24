@@ -38,11 +38,11 @@ def test_private_mysql_fresh_and_repeated_reset_preserve_other_database(identity
         from database import local_identity as local
         receipt = tmp_path / 'receipt.json'
         identity = local.provision(connection, receipt, {}, auth_reader='test', ufw_paths=[], auth_paths=[])
-        assert len(identity) == 6
+        assert len(identity) == 8
         assert local.provision(connection, receipt, identity, auth_reader='test', ufw_paths=[], auth_paths=[]) == identity
         with connection.cursor() as cursor:
             cursor.execute('SELECT COUNT(*) FROM log_sources')
-            assert cursor.fetchone() == (5,)
+            assert cursor.fetchone() == (7,)
         app = pymysql.connect(unix_socket=identity_server, user='pythonuser', password=settings['DB_PASSWORD'])
         app.close()  # The stored runtime secret matches the installed account.
     finally:

@@ -35,6 +35,8 @@ MIGRATIONS = (
     ("015", "event_identity", ROOT / "migration_steps.py"),
     ("016", "scoped_keys", ROOT / "migration_steps.py"),
     ("017", "ufw_datetime_precision", UFW_TIME_MIGRATION),
+    ("018", "processes", ROOT / "migrations/018_processes.sql"),
+    ("019", "services", ROOT / "migrations/019_services.sql"),
 )
 
 
@@ -53,6 +55,7 @@ HISTORY_TABLES = EVENT_TABLES + ANALYSIS_TABLES + (
     "detection_state",
     "ufw_state",
     "auth_ingestion_state",
+    "process_events", "process_state", "service_events", "service_state", "collector_snapshots",
 )
 
 
@@ -256,6 +259,11 @@ def apply_one(connection, version):
 
     elif version == "017":
         upgrade_ufw_timestamp_precision(connection)
+
+    elif version in ("018", "019"):
+        from database.snapshot_migrations import upgrade_snapshots
+        path = ROOT / ("migrations/018_processes.sql" if version == "018" else "migrations/019_services.sql")
+        upgrade_snapshots(connection, path, services=version == "019")
 
     else:
         raise MigrationError(

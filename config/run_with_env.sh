@@ -136,6 +136,7 @@ load_identity_env() {
     local line key value required=0
     local -A identity_keys=()
     unset SIEM_COLLECTOR_ID SIEM_UFW_SOURCE_ID SIEM_AUTH_SOURCE_ID SIEM_DNS_SOURCE_ID
+    unset SIEM_PROCESSES_SOURCE_ID SIEM_SERVICES_SOURCE_ID
     unset SIEM_SYSTEM_SOURCE_ID SIEM_FILESYSTEM_SOURCE_ID SIEM_SECURITY_SOURCE_ID SIEM_LOCAL_IDENTITY_REQUIRED
     [[ ! -e "$LOCAL_STATE_DIR/required" ]] || required=1
     [[ ! -L "$env_file" ]] || { printf 'Unsafe identity configuration link.\n' >&2; return 1; }
@@ -154,7 +155,7 @@ load_identity_env() {
         value="${line#*=}"
         case "$key" in
             SIEM_COLLECTOR_ID|SIEM_UFW_SOURCE_ID|SIEM_AUTH_SOURCE_ID|SIEM_DNS_SOURCE_ID|\
-            SIEM_SYSTEM_SOURCE_ID|SIEM_FILESYSTEM_SOURCE_ID|SIEM_SECURITY_SOURCE_ID)
+            SIEM_SYSTEM_SOURCE_ID|SIEM_FILESYSTEM_SOURCE_ID|SIEM_SECURITY_SOURCE_ID|SIEM_PROCESSES_SOURCE_ID|SIEM_SERVICES_SOURCE_ID)
                 [[ -z "${identity_keys[$key]:-}" && "$value" =~ ^[1-9][0-9]*$ ]] || { printf 'Invalid or duplicate identity setting.\n' >&2; return 1; }
                 identity_keys[$key]=1
                 export "$key=$value" ;;
@@ -162,7 +163,7 @@ load_identity_env() {
         esac
     done < "$env_file"
     if [[ "$required" == 1 ]]; then
-        for key in SIEM_COLLECTOR_ID SIEM_UFW_SOURCE_ID SIEM_AUTH_SOURCE_ID SIEM_SYSTEM_SOURCE_ID SIEM_FILESYSTEM_SOURCE_ID SIEM_SECURITY_SOURCE_ID; do
+        for key in SIEM_COLLECTOR_ID SIEM_UFW_SOURCE_ID SIEM_AUTH_SOURCE_ID SIEM_SYSTEM_SOURCE_ID SIEM_FILESYSTEM_SOURCE_ID SIEM_SECURITY_SOURCE_ID SIEM_PROCESSES_SOURCE_ID SIEM_SERVICES_SOURCE_ID; do
             [[ -n "${!key:-}" ]] || { printf 'A required local identity binding is missing.\n' >&2; return 1; }
         done
     fi

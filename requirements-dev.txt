@@ -1,5 +1,5 @@
 -r requirements-api.txt
--r requirements-dns.txt
+-r requirements-runtime.txt
 pytest>=8,<10
 ruff
 bandit

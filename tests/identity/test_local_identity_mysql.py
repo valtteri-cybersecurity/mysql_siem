@@ -88,7 +88,7 @@ def test_fresh_setup_and_all_metric_writers_keep_registered_identity(mysql, tmp_
 
     receipt = tmp_path / 'receipt.json'
     settings = enroll(mysql, receipt)
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
     apply_environment(monkeypatch, settings)
     monkeypatch.setenv('SIEM_LOCAL_IDENTITY_REQUIRED', '1')
     save_system(mysql, [Decimal(1)] * 10)
@@ -108,9 +108,9 @@ def test_fresh_setup_and_all_metric_writers_keep_registered_identity(mysql, tmp_
             cursor.execute(f'SELECT host_id, source_id, collector_id, sender_id FROM {table}')
             assert cursor.fetchall() == ((host, settings[local.LOCAL_KEYS[source_type]], settings[local.COLLECTOR_KEY], None),)
     assert enroll(mysql, receipt, configured=settings) == settings
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
     assert enroll(mysql, receipt) == settings  # A missing file is recoverable from the trusted receipt.
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
 
 
 def test_legacy_collection_continues_exactly_once_without_rewriting_history(mysql, tmp_path, monkeypatch):
@@ -160,7 +160,7 @@ def test_legacy_collection_continues_exactly_once_without_rewriting_history(mysq
     assert {row['host_id'] for row in rows} == {None, local.read_receipt(receipt)['host_id']}
     assert {row['total_events'] for row in rows} == {1}
     assert enroll(mysql, receipt, configured=settings) == settings
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
 
 
 def test_commit_before_receipt_publication_recovers_without_duplicate_registration(mysql, tmp_path, monkeypatch):
@@ -177,10 +177,10 @@ def test_commit_before_receipt_publication_recovers_without_duplicate_registrati
         with pytest.raises(OSError):
             enroll(mysql, receipt)
     assert local.read_receipt(receipt)['phase'] == 'prepared'
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
     settings = enroll(mysql, receipt)
-    assert len(settings) == 6
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert len(settings) == 8
+    assert counts(mysql) == [1, 1, 7, 7]
     assert local.read_receipt(receipt)['phase'] == 'database_ready'
 
 
@@ -195,8 +195,8 @@ def test_checkpoint_failure_rolls_back_registry_and_can_retry(mysql, tmp_path, m
         with pytest.raises(IdentityError):
             enroll(mysql, receipt)
     assert counts(mysql) == [0, 0, 0, 0]
-    assert len(enroll(mysql, receipt)) == 6
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert len(enroll(mysql, receipt)) == 8
+    assert counts(mysql) == [1, 1, 7, 7]
 
 
 def test_registry_without_persistent_binding_is_not_adopted(mysql, tmp_path):
@@ -280,10 +280,10 @@ def test_partial_approved_config_preserves_existing_bindings(mysql, tmp_path):
     assert restored[local.COLLECTOR_KEY] == partial[local.COLLECTOR_KEY]
     assert restored[local.LOCAL_KEYS['ufw']] == partial[local.LOCAL_KEYS['ufw']]
     assert restored == first
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
     assert enroll(mysql, tmp_path / 'recovery.json', configured=partial) == first
     assert enroll(mysql, tmp_path / 'recovery.json', configured=restored) == first
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
 
 
 def test_required_missing_source_is_not_legacy(mysql, monkeypatch):
@@ -301,7 +301,7 @@ def test_missing_source_setting_reuses_its_existing_id(mysql, tmp_path, source_t
     recovery = tmp_path / 'recovery.json'
     assert enroll(mysql, recovery, configured=partial) == first
     assert enroll(mysql, recovery, configured=partial) == first
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
 
 
 @pytest.mark.parametrize('fault', ['ambiguous', 'disabled-source', 'disabled-binding', 'unbound', 'disabled-collector'])
@@ -372,19 +372,19 @@ def test_absent_sources_are_created_once_and_partial_setup_can_resume(mysql, tmp
             with pytest.raises(OSError):
                 enroll(mysql, receipt, configured=partial)
         assert local.read_receipt(receipt)['phase'] == 'prepared'
-        assert counts(mysql) == [1, 1, 5, 5]
+        assert counts(mysql) == [1, 1, 7, 7]
     restored = enroll(mysql, receipt, configured=partial)
     assert restored[local.COLLECTOR_KEY] == collector
     assert restored[local.LOCAL_KEYS['ufw']] == source
     assert enroll(mysql, receipt, configured=partial) == restored
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
 
 
 def test_partial_config_without_trusted_host_is_not_inferred(mysql, tmp_path):
     first = enroll(mysql, tmp_path / 'first.json')
     with pytest.raises(IdentityError, match='No persistent local host binding'):
         enroll(mysql, tmp_path / 'recovery.json', configured={local.COLLECTOR_KEY: first[local.COLLECTOR_KEY]})
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
 
 
 def test_partial_config_with_unknown_source_is_not_replaced(mysql, tmp_path):
@@ -392,7 +392,7 @@ def test_partial_config_with_unknown_source_is_not_replaced(mysql, tmp_path):
     partial = {local.COLLECTOR_KEY: first[local.COLLECTOR_KEY], local.LOCAL_KEYS['ufw']: 2**63}
     with pytest.raises(IdentityError):
         enroll(mysql, tmp_path / 'recovery.json', configured=partial)
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
 
 
 def legacy_log_set(mysql, tmp_path, monkeypatch, rotations=0):
@@ -540,7 +540,7 @@ def test_missing_position_can_be_repaired_by_legacy_collection_then_retried(mysq
     apply_environment(monkeypatch, settings)
     assert ufw.process_log(mysql)['inserted'] == 0
     assert collect_auth_events(mysql, str(auth), collector_id='reader')['inserted'] == 0
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
 
 
 @pytest.mark.parametrize('source_type', ['ufw', 'auth'])
@@ -687,7 +687,7 @@ def test_committed_transition_cannot_skip_checkpoint_proof_on_retry(mysql, tmp_p
     firewall.write_text(ufw_line(10) + ufw_line(11))
     with pytest.raises(IdentityError, match='Consumed log content'):
         enroll(mysql, receipt, ufw_paths=ufw_paths, auth_paths=auth_paths)
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
     assert checkpoint_snapshot(mysql) == before
     with mysql.cursor() as cursor:
         for table in ('ufw_log', 'auth_events'):
@@ -698,7 +698,7 @@ def test_committed_transition_cannot_skip_checkpoint_proof_on_retry(mysql, tmp_p
     if expected is not None:
         assert recovered == expected
     assert checkpoint_snapshot(mysql) == before
-    assert counts(mysql) == [1, 1, 5, 5]
+    assert counts(mysql) == [1, 1, 7, 7]
 
 
 def test_committed_transition_cannot_continue_while_legacy_writer_is_running(mysql, tmp_path, monkeypatch, identity_server):

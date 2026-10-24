@@ -11,6 +11,8 @@ release_git() {
 
 bootstrap_latest_release() {
     local download checkout revision origin status
+    local -a operation_arguments=()
+    if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then operation_arguments=(--upgrade); fi
     command -v git >/dev/null || die "Git is required to download the official release. Install git and retry."
     if [[ "${SIEM_BOOTSTRAP_CHECKOUT:-}" == "$SOURCE_DIR" ]]; then
         [[ "$(stat -c '%u:%a' "${SOURCE_DIR%/*}")" == 0:700 ]] || die "Unsafe downloaded checkout directory."
@@ -44,7 +46,7 @@ bootstrap_latest_release() {
     status=0
     SIEM_BOOTSTRAP_CHECKOUT="$checkout" SIEM_BOOTSTRAP_COMMIT="$revision" \
         SIEM_BOOTSTRAP_SETTINGS="$SOURCE_DIR" SIEM_BOOTSTRAP_CONFIRMED="$checkout" \
-        /bin/bash "$checkout/install.sh" --role server || status=$?
+        /bin/bash "$checkout/install.sh" --role server "${operation_arguments[@]}" || status=$?
     rm -rf -- "$download"
     exit "$status"
 }

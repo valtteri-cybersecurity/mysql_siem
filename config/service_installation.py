@@ -523,6 +523,43 @@ def discard_deployment(state):
     journal.sync_directory(state)
 
 
+def prepare_snapshot_logs(user, root=Path('/var/log/mysql_siem')):
+    """Prepare rotating logs outside code, using descriptors to reject links."""
+    account = pwd.getpwnam(user)
+    trusted_directory(root.parent)
+    if not root.exists() and not root.is_symlink():
+        root.mkdir(mode=0o750)
+        os.chown(root, 0, account.pw_gid)
+    trusted_directory(root)
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in ('processes', 'services'):
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=root_fd)
+            except FileExistsError:
+                pass
+            directory = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
+            try:
+                if os.fstat(directory).st_uid not in (0, account.pw_uid):
+                    raise InstallationError('Unsafe snapshot log directory owner.')
+                os.fchown(directory, account.pw_uid, account.pw_gid)
+                os.fchmod(directory, 0o700)
+                descriptor = os.open('cron.log', os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                     0o600, dir_fd=directory)
+                try:
+                    info = os.fstat(descriptor)
+                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid not in (0, account.pw_uid):
+                        raise InstallationError('Unsafe snapshot log file.')
+                    os.fchown(descriptor, account.pw_uid, account.pw_gid)
+                    os.fchmod(descriptor, 0o600)
+                finally:
+                    os.close(descriptor)
+            finally:
+                os.close(directory)
+    finally:
+        os.close(root_fd)
+
+
 def main(arguments):
     try:
         action = arguments[0]
@@ -533,6 +570,8 @@ def main(arguments):
             if target.exists() or target.is_symlink():
                 trusted_directory(target)
             validate_role_sources(source, target, arguments[3])
+        elif action == 'snapshot-logs':
+            prepare_snapshot_logs(arguments[1])
         elif action == 'stage':
             from config.installation_state import STATE_DIR
             print(prepare_deployment(Path(arguments[1]), Path(arguments[2]), arguments[3], arguments[4],

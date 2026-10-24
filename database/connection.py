@@ -5,7 +5,7 @@ from datetime import datetime
 import pymysql
 
 
-def get_connection(*, require_tls=False):
+def get_connection(*, require_tls=False, quiet=False):
     """Shared connection; existing no-argument calls remain supported.
 
     Remote hosts always require verified TLS. Local loopback remains compatible
@@ -70,7 +70,8 @@ def get_connection(*, require_tls=False):
             if cipher is None or not cipher[1]:
                 raise ssl.SSLError("The database did not negotiate TLS.")
 
-        print(f"{timestamp}:   Database connection successful!")
+        if not quiet:
+            print(f"{timestamp}:   Database connection successful!")
         return connection
 
     except (pymysql.MySQLError, OSError, ValueError, KeyError):
@@ -78,5 +79,6 @@ def get_connection(*, require_tls=False):
             connection.close()
 
         # Driver errors can contain usernames, host details or SQL payloads.
-        print(f"{timestamp}:   Database connection or configuration failed.")
+        if not quiet:
+            print(f"{timestamp}:   Database connection or configuration failed.")
         return None
