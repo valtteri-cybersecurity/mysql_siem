@@ -115,32 +115,59 @@ def check_system_cron(directory=Path('/etc')):
 
 
 def pause_systemd():
-    result = run_command(['systemctl', 'list-unit-files', '--type=service,timer',
-                          '--no-legend', '--no-pager'])
-    if result.returncode:
-        raise ResetError('Cannot inspect systemd jobs; the database was not reset.')
-    units = []
+    # Unit files include bare templates such as apport-coredump-hook@.service.
+    # systemctl show cannot inspect these as runnable units without an instance.
+    installed = run_command(['systemctl', 'list-unit-files', '--type=service,timer',
+                             '--no-legend', '--no-pager'])
+    if installed.returncode:
+        raise ResetError('Cannot inspect systemd unit files; the database was not reset.')
+
+    # Also inspect loaded instances (including template instances), so ignoring
+    # uninstantiated templates never skips a running mysql_siem collector.
+    loaded = run_command(['systemctl', 'list-units', '--all', '--type=service,timer',
+                          '--no-legend', '--no-pager', '--plain'])
+    if loaded.returncode:
+        raise ResetError('Cannot inspect loaded systemd units; the database was not reset.')
+
+    names = set()
+    for output in (installed.stdout, loaded.stdout):
+        for line in output.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            # A failed unit can have a leading bullet in list-units output.
+            name = parts[1] if parts[0] == '●' and len(parts) > 1 else parts[0]
+            if not name.endswith(('.service', '.timer')):
+                continue
+            if name.endswith(('@.service', '@.timer')):
+                # Bare template, not an actual instance. Real instances such
+                # as collector@host.service are included and checked below.
+                continue
+            names.add(name)
+
+    services = []
     timers = []
-    for line in result.stdout.splitlines():
-        if not line.strip():
-            continue
-        name = line.split()[0]
+    for name in sorted(names):
         if name.endswith('.service'):
-            detail = run_command(['systemctl', 'show', name, '--property=ExecStart', '--property=WorkingDirectory', '--value'])
+            detail = run_command(['systemctl', 'show', name,
+                                  '--property=ExecStart', '--property=WorkingDirectory', '--value'])
             if detail.returncode:
                 raise ResetError('Cannot inspect systemd service ' + name)
             if collection_command(detail.stdout):
-                units.append(name)
-        elif name.endswith('.timer'):
+                services.append(name)
+        else:
             timers.append(name)
+
+    matching_timers = []
     for name in timers:
         detail = run_command(['systemctl', 'show', name, '--property=Unit', '--value'])
         if detail.returncode:
             raise ResetError('Cannot inspect systemd timer ' + name)
-        if detail.stdout.strip() in units:
-            units.append(name)
-    # Stop timers first so they cannot start another collector during shutdown.
-    for name in reversed(units):
+        if detail.stdout.strip() in services:
+            matching_timers.append(name)
+
+    # Stop timers before the services they could restart.
+    for name in matching_timers + services:
         stopped = run_command(['systemctl', 'stop', name])
         if stopped.returncode:
             raise ResetError('Cannot stop legacy mysql_siem unit ' + name)
