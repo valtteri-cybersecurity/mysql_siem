@@ -97,6 +97,7 @@ def test_managed_cron_is_repeatable_and_preserves_other_jobs(project, tmp_path):
     )
     script = (
         r"""set -euo pipefail
+local_identity_setup() { :; }
 crontab() {
     if [[ "$*" == *" -l" ]]; then
         cat "$TEST_CRONTAB"

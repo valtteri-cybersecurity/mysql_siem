@@ -179,6 +179,8 @@ def configured_identity(cursor, source_type):
     source = os.getenv(f"SIEM_{source_type.upper()}_SOURCE_ID")
     collector = os.getenv("SIEM_COLLECTOR_ID")
     if source is None:
+        if source_type != 'dns' and os.getenv('SIEM_LOCAL_IDENTITY_REQUIRED') == '1':
+            raise IdentityError('A required local source identity is missing.')
         return None
     if collector is None:
         raise IdentityError("SIEM_COLLECTOR_ID is required with a configured source.")

@@ -139,6 +139,7 @@ def test_role_cron_selection_and_repeatable_managed_block(tmp_path, role):
     cron.write_text('MAILTO=keep\n17 * * * * echo external-job\n')
     block = INSTALLER.split("# Update only this installation's marked cron block.", 1)[1].split('log "Installation steps completed.', 1)[0]
     extra = '''
+local_identity_setup() { :; }
 crontab() {
     if [[ "$*" == *" -l" ]]; then cat "$PROJECT_DIR/crontab"; else cp "${@: -1}" "$PROJECT_DIR/crontab"; fi
 }

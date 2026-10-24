@@ -23,6 +23,7 @@ STAGED_PROJECT_DIR=""
 VENV_BUILD_DIR=""
 SERVICE_PUBLISHED=0
 DATABASE_SETUP_STARTED=0
+LOCAL_DEPLOYMENT_STARTED=0
 
 log()  { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -135,13 +136,14 @@ PY_SERVICE
 
 prepare_service_installation() {
     STAGED_PROJECT_DIR="$(service_installation stage "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER" "$INSTALL_ROLE")"
+    LOCAL_DEPLOYMENT_STARTED=1
     PROJECT_DIR="$STAGED_PROJECT_DIR"
     ENV_FILE="$PROJECT_DIR/config/mysql.env"
     cd -- "$PROJECT_DIR"
 }
 
 activate_service_installation() {
-    service_installation activate "$STAGED_PROJECT_DIR" "$SERVICE_DIR" "$VENV_BUILD_DIR" "$VENV_DIR"
+    service_installation activate "$STAGED_PROJECT_DIR" "$SERVICE_DIR" "$VENV_BUILD_DIR" "$VENV_DIR" prepared-identity
     SERVICE_PUBLISHED=1
     PROJECT_DIR="$SERVICE_DIR"
     ENV_FILE="$PROJECT_DIR/config/mysql.env"
@@ -150,6 +152,10 @@ activate_service_installation() {
 }
 
 cleanup_prepared_installation() {
+    if [[ "${LOCAL_DEPLOYMENT_STARTED:-0}" == 1 && "${SERVICE_PUBLISHED:-0}" != 1 ]]; then
+        service_installation discard || warn "Prepared deployment retained; keep maintenance and recovery files and rerun install.sh --role server."
+        return
+    fi
     if [[ "${SERVICE_PUBLISHED:-0}" != 1 ]]; then
         if [[ "${DATABASE_SETUP_STARTED:-0}" == 1 ]]; then
             warn "Database setup was started; retained prepared settings at $STAGED_PROJECT_DIR and Python at $VENV_BUILD_DIR for manual recovery."
@@ -158,6 +164,17 @@ cleanup_prepared_installation() {
         if [[ -n "${STAGED_PROJECT_DIR:-}" ]]; then rm -rf -- "$STAGED_PROJECT_DIR"; fi
         if [[ -n "${VENV_BUILD_DIR:-}" ]]; then rm -rf -- "$VENV_BUILD_DIR"; fi
     fi
+}
+
+# The root-owned maintenance barrier blocks new jobs; old jobs need a one-time
+# administrator confirmation. Keep the runtime lock through config and cron publication.
+local_identity_setup() {
+    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m database.local_identity "$@" \
+        --project "$PROJECT_DIR" --installed "$SERVICE_DIR" --user "$INSTALL_USER"
+}
+verify_local_identity() {
+    runuser -u "$INSTALL_USER" -- env PYTHONPATH="$PROJECT_DIR" \
+        "$APP_PYTHON" -m database.local_identity verify --project "$PROJECT_DIR"
 }
 
 # Platform and dependency checks (no database writes).
@@ -522,7 +539,7 @@ load_mysql_env() {
     fi
 }
 
-trap 'rc=$?; printf "[ERROR] Installation failed (exit %s, line %s).\n" "$rc" "${BASH_LINENO[0]:-?}" >&2; exit "$rc"' ERR
+trap 'rc=$?; printf "[ERROR] Installation failed (exit %s, line %s). Keep maintenance/recovery files and rerun install.sh --role server after correcting the error.\n" "$rc" "${BASH_LINENO[0]:-?}" >&2; exit "$rc"' ERR
 
 select_installation_role "$@"
 if [[ "$INSTALL_ROLE" == collector ]]; then
@@ -534,6 +551,8 @@ fi
 for path in \
     requirements-dns.txt \
     config/service_installation.py \
+    config/installation_state.py \
+    database/local_identity.py \
     database/schema.sql \
     database/schema.py \
     database/migrate.py \
@@ -564,8 +583,15 @@ done
 
 # Recheck persistent roles before creating even the installation lock.
 service_installation check "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER"
-exec 9> /usr/local/lib/.mysql_siem-install.lock
+[[ ! -L /usr/local/lib/.mysql_siem-install.lock ]] || die "Unsafe installation lock link."
+exec 9>> /usr/local/lib/.mysql_siem-install.lock
 flock -n 9 || die "Another mysql_siem installation is running."
+# A pending publication may need rollback before a new service copy is staged.
+if [[ -e /usr/local/lib/.mysql_siem-local/maintenance ]]; then
+    [[ ! -L /usr/local/lib/.mysql_siem-local/runtime.lock ]] || die "Unsafe runtime lock link."
+    exec 8< /usr/local/lib/.mysql_siem-local/runtime.lock
+    flock -x -w 30 8 || die "Runtime jobs did not stop; collection remains paused."
+fi
 service_installation check "$SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER"
 trap cleanup_prepared_installation EXIT
 
@@ -579,6 +605,11 @@ persist_installation_role
 secure_project_sources
 install_dependencies
 install_virtualenv
+
+local_identity_setup begin
+exec 8< /usr/local/lib/.mysql_siem-local/runtime.lock
+flock -x -w 30 8 || die "Runtime jobs did not stop; collection remains paused."
+export SIEM_INSTALL_MAINTENANCE=1
 
 log "Starting services."
 systemctl enable --now mysql
@@ -607,6 +638,7 @@ log "Checking database and schema."
 
 # Keep generated credentials recoverable if database provisioning fails midway.
 DATABASE_SETUP_STARTED=1
+service_installation database-started
 DB_SETUP_RESULT="$("$APP_PYTHON" - "$ENV_FILE" "$PROJECT_DIR/$SCHEMA_REL" <<'PY'
 import os
 import sys
@@ -1027,8 +1059,13 @@ finally:
     conn.close()
 PY
 
-# Publish only after copying, dependencies and database checks have succeeded.
+log "Preparing local identities; collection remains paused until installation completes."
+local_identity_setup prepare
+verify_local_identity
+
+# Publish only after copying, dependencies, database and identity checks succeeded.
 activate_service_installation
+verify_local_identity
 
 # Use the shipped environment loader; keep one implementation of DNS loading.
 
@@ -1175,7 +1212,10 @@ $DNS_CRON
 $CRON_END
 CRON
 
+local_identity_setup schedule --cron-file "$CRON_TMP"
 crontab -u "$INSTALL_USER" "$CRON_TMP"
+local_identity_setup finish
+unset SIEM_INSTALL_MAINTENANCE
 rm -f "$CRON_TMP"
 trap - EXIT
 

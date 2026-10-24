@@ -91,6 +91,7 @@ def test_managed_cron_replaces_old_job_once_and_preserves_other_jobs(tmp_path):
                     "1 13 * * * python analysis/attacking_ips/main.py\n"
                     "# END mysql_siem managed jobs\n")
     script = r'''set -euo pipefail
+local_identity_setup() { :; }
 crontab() {
     if [[ "$*" == *" -l" ]]; then cat "$TEST_CRONTAB"; else cp "${@: -1}" "$TEST_CRONTAB"; fi
 }
@@ -213,6 +214,7 @@ def test_standalone_retired_cron_removed_only_for_this_installation(tmp_path):
                     + '19 * * * * echo keep-unrelated\n')
     block = section("# Update only this installation's marked cron block.", 'log "Installation steps completed.')
     script = r'''set -euo pipefail
+local_identity_setup() { :; }
 crontab() {
     if [[ "$*" == *" -l" ]]; then cat "$TEST_CRONTAB"; else cp "${@: -1}" "$TEST_CRONTAB"; fi
 }

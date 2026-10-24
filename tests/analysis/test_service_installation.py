@@ -104,7 +104,7 @@ def test_reinstallation_preserves_settings_roles_and_runtime_logs(deployment):
     service.publish_service(pending, target)
     for name, text in preserved.items():
         assert (target / name).read_text() == text
-        assert (target / name).stat().st_mode & 0o777 == 0o600
+        assert (target / name).stat().st_mode & 0o777 == (0o640 if name == 'config/identity.env' else 0o600)
     assert (target / "ingestion/main.py").read_text() == "print('new collector')\n"
 
 

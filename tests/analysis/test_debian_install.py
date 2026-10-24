@@ -44,7 +44,7 @@ def dependency_setup(tmp_path, distribution, version="8.4.13", *, client=True, m
     functions = functions.replace("/usr/bin/mysql", str(binaries / "mysql"))
 
     start = INSTALLER.index("\ndetect_distribution\n")
-    end = INSTALLER.index('log "Starting services."', start)
+    end = INSTALLER.index('\nlocal_identity_setup begin\n', start)
 
     # Stub every privilege-changing, filesystem-changing and package-installing
     # operation except the package SELECTION itself. The virtualenv installer is
