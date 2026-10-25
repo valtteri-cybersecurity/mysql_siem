@@ -264,15 +264,16 @@ def test_current_rule_registration_preserves_operator_settings(setup_mysql):
     assert snapshot(connection, {"detection_rules"}) == before
 
 
-def test_fresh_initializer_failure_stops_installer_before_publication(tmp_path):
+@pytest.mark.parametrize("operation", ["reset", "upgrade"])
+def test_fresh_initializer_failure_stops_installer_before_publication(tmp_path, operation):
     import subprocess
     installer = (ROOT / "install.sh").read_text()
-    start = installer.index("# One initialization path:")
-    end = installer.index("# Fresh schema:", start)
+    start = installer.index("DATABASE_SETUP_STARTED=1\nservice_installation database-started")
+    end = installer.index("DETECTION_READY=1", start)
     block = installer[start:end]
     script = ('set -euo pipefail\nservice_installation() { :; }\n'
               'failed_schema_setup() { return 1; }\n' + block + '\nprintf "UNREACHABLE\n"')
     result = subprocess.run(['bash', '-c', script],
-                            env={'PROJECT_DIR': str(tmp_path), 'APP_PYTHON': 'failed_schema_setup'},
+                            env={'PROJECT_DIR': str(tmp_path), 'APP_PYTHON': 'failed_schema_setup', 'INSTALL_OPERATION': operation},
                             capture_output=True, text=True, check=False)
     assert result.returncode != 0 and 'UNREACHABLE' not in result.stdout

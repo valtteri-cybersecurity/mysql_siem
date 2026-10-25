@@ -533,7 +533,7 @@ def prepare_snapshot_logs(user, root=Path('/var/log/mysql_siem')):
     trusted_directory(root)
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        for component in ('processes', 'services'):
+        for component in ('processes', 'services', 'audit'):
             try:
                 os.mkdir(component, mode=0o700, dir_fd=root_fd)
             except FileExistsError:

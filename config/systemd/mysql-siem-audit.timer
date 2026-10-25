@@ -1,0 +1,13 @@
+# Managed by mysql_siem Audit; administrator installation only.
+[Unit]
+Description=Read mysql_siem Audit logs every minute
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+RandomizedDelaySec=5s
+Unit=mysql-siem-audit.service
+
+[Install]
+WantedBy=timers.target

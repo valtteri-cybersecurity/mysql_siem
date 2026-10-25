@@ -1,13 +1,11 @@
-"""Processes use their own source, current state and shared transaction protocol."""
+"""Processes database operations, using the shared snapshot SQL."""
 
-import psutil
-
-from metrics.processes.get import get_events, get_processes
-from metrics.snapshot import SnapshotError, collect_snapshot
+from metrics import snapshot
 
 
-def collect_processes(connection):
-    try:
-        return collect_snapshot(connection, 'processes', get_processes, get_events)
-    except psutil.Error as error:
-        raise SnapshotError('Process observation failed.') from error
+def begin_collection(connection):
+    return snapshot.begin_snapshot(connection, 'processes')
+
+
+def save_collection(connection, identity, current, events):
+    snapshot.save_snapshot(connection, 'processes', identity, current, events, snapshot.utc_now())

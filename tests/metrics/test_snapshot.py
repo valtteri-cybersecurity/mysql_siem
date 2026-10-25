@@ -1,11 +1,23 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pymysql
 import pytest
 
 from database.identity import EventIdentity, IdentityError
-from metrics import runner, snapshot
+from metrics import snapshot
+from metrics.processes import main as processes_main
+from metrics.services import main as services_main
 from metrics.services.get import get_events
+
+
+def collect_snapshot(connection, kind, observe, diff):
+    # Test adapter: run the same pre-refactor scenarios through main.py.
+    if kind == 'services':
+        with patch.object(services_main, 'get_services', observe), patch.object(services_main, 'get_events', diff):
+            return services_main.collect_services(connection)
+    with patch.object(processes_main, 'get_processes', observe), patch.object(processes_main, 'get_events', diff):
+        return processes_main.collect_processes(connection)
+
 
 IDENTITY = EventIdentity(10, 20, 30)
 
@@ -24,7 +36,7 @@ def protocol(monkeypatch, *, baseline=False, lock=1):
 def test_first_baseline_commits_state_without_started_events(monkeypatch):
     connection, cursor, save = protocol(monkeypatch)
     current = {'example.service': {'active_state': 'active'}}
-    assert snapshot.collect_snapshot(connection, 'services', lambda old: current, get_events) == 0
+    assert collect_snapshot(connection, 'services', lambda old: current, get_events) == 0
     assert save.call_args.args[3:5] == (current, [])
     connection.commit.assert_called_once()
     assert any('RELEASE_LOCK' in call.args[0] for call in cursor.execute.call_args_list)
@@ -39,7 +51,7 @@ def test_interruption_before_commit_rolls_back_and_releases(monkeypatch, error):
         raise error
 
     with pytest.raises(type(error)):
-        snapshot.collect_snapshot(connection, 'services', fail, get_events)
+        collect_snapshot(connection, 'services', fail, get_events)
     connection.commit.assert_not_called()
     assert connection.rollback.call_count == 3
     save.assert_not_called()
@@ -50,7 +62,7 @@ def test_database_write_failure_rolls_back(monkeypatch):
     connection, _, save = protocol(monkeypatch)
     save.side_effect = pymysql.IntegrityError(1452, 'foreign key')
     with pytest.raises(pymysql.IntegrityError):
-        snapshot.collect_snapshot(connection, 'services', lambda _: {}, get_events)
+        collect_snapshot(connection, 'services', lambda _: {}, get_events)
     connection.commit.assert_not_called()
     assert connection.rollback.call_count == 3
 
@@ -59,7 +71,7 @@ def test_overlapping_run_does_not_collect_or_write(monkeypatch):
     connection, cursor, save = protocol(monkeypatch, lock=0)
     collect = MagicMock()
     with pytest.raises(snapshot.CollectionBusy):
-        snapshot.collect_snapshot(connection, 'services', collect, get_events)
+        collect_snapshot(connection, 'services', collect, get_events)
     collect.assert_not_called()
     save.assert_not_called()
     assert all('RELEASE_LOCK' not in call.args[0] for call in cursor.execute.call_args_list)
@@ -103,11 +115,13 @@ def test_sender_and_all_identity_fields_are_bound_in_every_write():
     connection.commit.assert_not_called()
 
 
+@pytest.mark.parametrize('module,kind', [(services_main, 'services'), (processes_main, 'processes')])
 @pytest.mark.parametrize('failure,exit_code', [(None, 0), (snapshot.CollectionBusy(), 75),
                                               (IdentityError(), 1), (pymysql.OperationalError(), 1)])
-def test_cli_closes_connection_and_returns_failure(monkeypatch, failure, exit_code):
+def test_cli_closes_connection_and_returns_failure(monkeypatch, failure, exit_code, module, kind):
     connection = MagicMock()
-    monkeypatch.setattr(runner, 'get_connection', lambda **kwargs: connection)
+    monkeypatch.setattr(module, 'get_connection', lambda **kwargs: connection)
     collect = MagicMock(return_value=0, side_effect=failure)
-    assert runner.run('services', collect, []) == exit_code
+    monkeypatch.setattr(module, 'collect_' + kind, collect)
+    assert module.main([]) == exit_code
     connection.close.assert_called_once()

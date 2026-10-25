@@ -1,8 +1,11 @@
-"""Services use the shared identity, locking and atomic snapshot protocol."""
+"""Services database operations, using the shared snapshot SQL."""
 
-from metrics.services.get import get_events, get_services
-from metrics.snapshot import collect_snapshot
+from metrics import snapshot
 
 
-def collect_services(connection):
-    return collect_snapshot(connection, 'services', get_services, get_events)
+def begin_collection(connection):
+    return snapshot.begin_snapshot(connection, 'services')
+
+
+def save_collection(connection, identity, current, events):
+    snapshot.save_snapshot(connection, 'services', identity, current, events, snapshot.utc_now())

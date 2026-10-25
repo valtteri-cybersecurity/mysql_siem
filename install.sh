@@ -250,6 +250,11 @@ install_dependencies() {
     if [[ -n "$MYSQL_PACKAGE" ]]; then
         packages+=("$MYSQL_PACKAGE")
     fi
+    # auditd includes auditctl, ausearch and augenrules on Debian/Ubuntu/Mint.
+    # apt does not reinstall an already installed package; do not request it twice.
+    if [[ "$(dpkg-query -W -f='${Status}' auditd 2>/dev/null || true)" != 'install ok installed' ]]; then
+        packages+=(auditd)
+    fi
     export DEBIAN_FRONTEND=noninteractive
     log "Updating package lists."
     apt-get update
@@ -593,8 +598,18 @@ for path in \
     database/migrations/018_processes.sql \
     database/migrations/019_services.sql \
     database/snapshot_migrations.py \
+    database/audit_migrations.py \
+    database/migrations/020_audit.sql \
+    ingestion/audit/main.py \
+    ingestion/audit/get.py \
+    ingestion/audit/parser.py \
+    ingestion/audit/database.py \
+    ingestion/audit/targets.py \
+    config/audit_setup.py \
+    config/audit_launcher.py \
+    config/systemd/mysql-siem-audit.service \
+    config/systemd/mysql-siem-audit.timer \
     metrics/snapshot.py \
-    metrics/runner.py \
     config/run_with_env.sh \
     config/installation_role.py \
     config/installation_role_setup.py \
@@ -786,6 +801,9 @@ grants = {
     "process_state": "SELECT, INSERT, DELETE",
     "service_state": "SELECT, INSERT, DELETE",
     "collector_snapshots": "SELECT, INSERT, UPDATE",
+    "audit_events": "SELECT, INSERT",
+    "audit_checkpoints": "SELECT, INSERT, UPDATE",
+    "audit_targets": "SELECT",
     "analysis_ufw_ports": "SELECT, INSERT, DELETE",
     "analysis_ufw_traffic": "SELECT, INSERT, UPDATE",
     "analysis_ufw_traffic_daily": "SELECT, INSERT, UPDATE",
@@ -845,6 +863,11 @@ PY
 log "Preparing local identities; collection remains paused until installation completes."
 local_identity_setup prepare
 verify_local_identity
+
+# Only the approved installer performs privileged Audit preparation, while all
+# runtime jobs are behind the existing maintenance barrier. Never reload all
+# audit rules or erase other programs' rules. Conflicts leave maintenance intact.
+PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.audit_setup prepare --project "$PROJECT_DIR"
 
 # Publish only after copying, dependencies, database and identity checks succeeded.
 activate_service_installation
@@ -1007,6 +1030,9 @@ CRON
 local_identity_setup schedule --cron-file "$CRON_TMP"
 crontab -u "$INSTALL_USER" "$CRON_TMP"
 local_identity_setup finish
+# Audit uses a fixed status preflight then permanently drops root. The service
+# account receives no sudo/capabilities and all DB work uses run_with_env.sh.
+PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.audit_setup activate --project "$PROJECT_DIR"
 unset SIEM_INSTALL_MAINTENANCE
 rm -f "$CRON_TMP"
 trap - EXIT
@@ -1017,4 +1043,5 @@ if [[ "${SSH_LOG_READABLE:-1}" == 0 ]]; then
     warn "SSH ingestion and SSH detection were not enabled: unreadable SSH log source."
 fi
 log "Check the UFW log source and permissions before production use."
+log "Audit: systemctl status mysql-siem-audit.timer; validate live auditd/service-user/MySQL behavior before production."
 

@@ -34,7 +34,7 @@ from database.identity import (
 )
 
 ORIGINAL_LOCAL_TYPES = ('ufw', 'system', 'filesystem', 'security', 'auth')
-EXTENSION_TYPES = ('processes', 'services')
+EXTENSION_TYPES = ('processes', 'services', 'audit')
 LOCAL_TYPES = ORIGINAL_LOCAL_TYPES + EXTENSION_TYPES
 COLLECTOR_KEY = 'SIEM_COLLECTOR_ID'
 LOCAL_KEYS = {}
@@ -220,6 +220,8 @@ def begin_maintenance(state, installed, user, *, confirm=input, reset=False):
 
 
 def is_collection_command(command):
+    if 'config/audit_launcher.py' in command:
+        return True
     for name in ('ingestion', 'metrics', 'analysis', 'detection'):
         if name + '/' in command or '-m ' + name + '.' in command:
             return True
@@ -248,6 +250,7 @@ def require_stopped_legacy_jobs(installed, user):
             for signature in ('ingestion/ufw_to_mysql.py', 'ingestion/auth/main.py', 'ingestion/dns/main.py',
                               'metrics/system/main.py', 'metrics/filesystem/main.py', 'metrics/security/main.py',
                               'metrics/processes/main.py', 'metrics/services/main.py',
+                              'ingestion/audit/main.py', 'config/audit_launcher.py',
                               '-m ingestion.', '-m metrics.', '-m analysis.ufw.', '-m detection.'):
                 if signature in command:
                     known_root_job = True

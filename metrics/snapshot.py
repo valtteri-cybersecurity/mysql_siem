@@ -1,6 +1,6 @@
 """Shared transactional snapshot protocol for local state collectors.
 
-The caller supplies collection/diff functions. SQL identifiers are constants;
+Only Processes and Services use these SQL and locking helpers. SQL identifiers are constants;
 payloads and identities are always parameters. No runtime DDL or registry writes.
 """
 
@@ -94,12 +94,8 @@ def save_snapshot(connection, kind, identity, current, events, observed_at):
         )
 
 
-def collect_snapshot(connection, kind, collect, diff):
-    """Serialize the entire observation and commit exactly once, including baseline.
-
-    Re-resolve after acquiring the lock: previous SELECTs must not create a stale
-    repeatable-read view while another collector finishes its transaction.
-    """
+def begin_snapshot(connection, kind):
+    """Read the last snapshot inside a fresh transaction and a host-specific lock."""
     lock = None
     try:
         identity = get_identity(connection, kind)
@@ -113,24 +109,22 @@ def collect_snapshot(connection, kind, collect, diff):
             if cursor.fetchone() != (1,):
                 raise CollectionBusy('Another snapshot collection is running.')
             lock = name
+        # Discard preliminary reads so repeatable-read cannot reuse stale state.
         connection.rollback()
         connection.begin()
         if get_identity(connection, kind) != identity:
-            raise IdentityError('Identity changed while waiting for the snapshot lock.')
+            raise IdentityError('Identity changed while acquiring the snapshot lock.')
         previous, baseline = get_previous(connection, kind, identity)
-        current = collect(previous)
-        events = diff(current, previous) if baseline else []
-        save_snapshot(connection, kind, identity, current, events, utc_now())
-        connection.commit()
-        return len(events)
+        return identity, previous, baseline, lock
     except BaseException:
         connection.rollback()
+        release_snapshot_lock(connection, lock)
         raise
-    finally:
-        if lock is not None:
-            # A lost connection releases its MySQL locks. Failure to release on a
-            # live connection is still an error; the CLI closes it in all cases.
-            with connection.cursor() as cursor:
-                cursor.execute('SELECT RELEASE_LOCK(%s)', (lock,))
-                if cursor.fetchone() != (1,):
-                    raise SnapshotError('Snapshot lock release failed.')
+
+
+def release_snapshot_lock(connection, lock):
+    if lock is not None:
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT RELEASE_LOCK(%s)', (lock,))
+            if cursor.fetchone() != (1,):
+                raise SnapshotError('Snapshot lock release failed.')

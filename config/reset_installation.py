@@ -63,7 +63,7 @@ def collection_command(command):
     component = False
     for signature in ('ingestion/ufw_to_mysql.py', 'ingestion/auth/', 'ingestion/dns/',
                       'metrics/system/', 'metrics/filesystem/', 'metrics/security/',
-                      'metrics/processes/', 'metrics/services/',
+                      'metrics/processes/', 'metrics/services/', 'ingestion/audit/', 'config/audit_launcher.py',
                       'analysis/ufw/', 'analysis/daily_counts/', 'detection/port_scan/',
                       'detection/ssh_brute_force/', '-m ingestion.', '-m metrics.',
                       '-m analysis.ufw', '-m detection.'):
@@ -188,7 +188,7 @@ def wait_for_legacy_jobs(processes=Path('/proc'), timeout=30):
                 command = (process / 'cmdline').read_bytes().replace(b'\0', b' ').decode('utf-8', errors='replace')
             except (FileNotFoundError, ProcessLookupError):
                 continue
-            module_job = re.search(r'-m (?:ingestion\.(?:auth|dns)|metrics\.(?:system|filesystem|security|processes|services)|analysis\.ufw|detection\.(?:port_scan|ssh_brute_force))(?:[.\s]|$)', command)
+            module_job = re.search(r'-m (?:ingestion\.(?:auth|dns|audit)|metrics\.(?:system|filesystem|security|processes|services)|analysis\.ufw|detection\.(?:port_scan|ssh_brute_force))(?:[.\s]|$)', command)
             try:
                 directory = os.readlink(process / 'cwd')
             except (FileNotFoundError, ProcessLookupError):
@@ -291,7 +291,7 @@ def upgrade_database(connection, settings):
             raise ResetError('Upgrade requires Oracle MySQL 8.0 or 8.4.')
         cursor.execute("SHOW GRANTS FOR 'pythonuser'@'localhost'")
         registry = {'hosts', 'log_sources', 'collectors', 'collector_sources',
-                    'sender_identities', 'sender_sources', 'sender_certificates', 'schema_migrations'}
+                    'sender_identities', 'sender_sources', 'sender_certificates', 'schema_migrations', 'audit_targets'}
         for (grant,) in cursor.fetchall():
             if grant.startswith('GRANT USAGE ON *.* TO '):
                 continue

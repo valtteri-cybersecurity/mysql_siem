@@ -103,7 +103,7 @@ def update_host(cursor, host_id, *, reported_hostname, current_ip):
                    (reported_hostname, current_ip, host_id))
 
 
-SOURCE_TYPES = {"ufw", "auth", "dns", "system", "filesystem", "security", "processes", "services"}
+SOURCE_TYPES = {"ufw", "auth", "dns", "system", "filesystem", "security", "processes", "services", "audit"}
 
 
 def register_source(cursor, host_id, source_name, source_type, *, enabled=False):

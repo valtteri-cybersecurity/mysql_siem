@@ -3,6 +3,7 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
+from unittest.mock import patch
 from uuid import uuid4
 
 import pymysql
@@ -17,8 +18,19 @@ from database.identity import (
     register_source,
 )
 from metrics import snapshot
+from metrics.processes import main as processes_main
 from metrics.processes.get import get_events as process_diff
+from metrics.services import main as services_main
 from metrics.services.get import get_events
+
+
+def collect_snapshot(connection, kind, observe, diff):
+    # Test adapter: run the same pre-refactor scenarios through main.py.
+    if kind == 'services':
+        with patch.object(services_main, 'get_services', observe), patch.object(services_main, 'get_events', diff):
+            return services_main.collect_services(connection)
+    with patch.object(processes_main, 'get_processes', observe), patch.object(processes_main, 'get_events', diff):
+        return processes_main.collect_processes(connection)
 
 
 @pytest.fixture(scope='module')
@@ -81,26 +93,29 @@ def rows(connection, table):
 
 
 def connect_like(connection):
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT DATABASE()")
+        database = cursor.fetchone()[0]
     return pymysql.connect(unix_socket=connection._sock.getpeername(), user='root',
-                           database=connection.db.decode(), autocommit=False,
+                           database=database, autocommit=False,
                            read_timeout=10, write_timeout=10, init_command="SET time_zone = '+00:00'")
 
 
 def test_baseline_events_two_hosts_and_history(mysql, monkeypatch):
     first = enroll(mysql, monkeypatch)
-    assert snapshot.collect_snapshot(mysql, 'services', lambda _: {'same.service': service('active')}, get_events) == 0
+    assert collect_snapshot(mysql, 'services', lambda _: {'same.service': service('active')}, get_events) == 0
     second = enroll(mysql, monkeypatch)
-    assert snapshot.collect_snapshot(mysql, 'services', lambda _: {'same.service': service()}, get_events) == 0
-    assert snapshot.collect_snapshot(mysql, 'services', lambda _: {'same.service': service('active', 'enabled')}, get_events) == 1
+    assert collect_snapshot(mysql, 'services', lambda _: {'same.service': service()}, get_events) == 0
+    assert collect_snapshot(mysql, 'services', lambda _: {'same.service': service('active', 'enabled')}, get_events) == 1
     assert len(rows(mysql, 'service_state')) == 2
     history = rows(mysql, 'service_events')
     assert len(history) == 1
     assert history[0][1:4] == second
     assert first[0] != second[0]
     assert history[0][6] == 'STARTED'
-    assert snapshot.collect_snapshot(mysql, 'services', lambda _: {'same.service': service('failed')}, get_events) == 1
-    assert snapshot.collect_snapshot(mysql, 'services', lambda _: {'same.service': service('active')}, get_events) == 1
-    assert snapshot.collect_snapshot(mysql, 'services', lambda _: {}, get_events) == 1
+    assert collect_snapshot(mysql, 'services', lambda _: {'same.service': service('failed')}, get_events) == 1
+    assert collect_snapshot(mysql, 'services', lambda _: {'same.service': service('active')}, get_events) == 1
+    assert collect_snapshot(mysql, 'services', lambda _: {}, get_events) == 1
     assert len(rows(mysql, 'service_events')) == 4
     assert len(rows(mysql, 'service_state')) == 1  # other host remains
     assert migrate.migrate(mysql) == []
@@ -125,14 +140,14 @@ def test_invalid_or_disabled_identity_prevents_collection(mysql, monkeypatch, ta
             monkeypatch.delenv('SIEM_SERVICES_SOURCE_ID')
     mysql.commit()
     with pytest.raises(IdentityError):
-        snapshot.collect_snapshot(mysql, 'services', lambda _: pytest.fail('must not collect'), get_events)
+        collect_snapshot(mysql, 'services', lambda _: pytest.fail('must not collect'), get_events)
     assert rows(mysql, 'service_state') == ()
 
 
 @pytest.mark.parametrize('fault', ['write', 'interrupt', 'commit-lost-before', 'commit-lost-after'])
 def test_snapshot_atomicity_and_uncertain_commit(mysql, monkeypatch, fault):
     enroll(mysql, monkeypatch)
-    snapshot.collect_snapshot(mysql, 'services', lambda _: {'x.service': service()}, get_events)
+    collect_snapshot(mysql, 'services', lambda _: {'x.service': service()}, get_events)
     original_save, original_commit = snapshot.save_snapshot, mysql.commit
 
     def fail_write(*args):
@@ -150,12 +165,12 @@ def test_snapshot_atomicity_and_uncertain_commit(mysql, monkeypatch, fault):
         else:
             patch.setattr(mysql, 'commit', fail_commit)
         with pytest.raises((KeyboardInterrupt, pymysql.OperationalError)):
-            snapshot.collect_snapshot(mysql, 'services', lambda _: {'x.service': service('active')}, get_events)
+            collect_snapshot(mysql, 'services', lambda _: {'x.service': service('active')}, get_events)
     # A successful server commit stays successful even when acknowledgement was
     # lost. Retry reads current state and never duplicates its transition.
     expected = 1 if fault == 'commit-lost-after' else 0
     assert len(rows(mysql, 'service_events')) == expected
-    assert snapshot.collect_snapshot(mysql, 'services', lambda _: {'x.service': service('active')}, get_events) == 1 - expected
+    assert collect_snapshot(mysql, 'services', lambda _: {'x.service': service('active')}, get_events) == 1 - expected
     assert len(rows(mysql, 'service_events')) == 1
 
 
@@ -172,12 +187,12 @@ def test_concurrent_collectors_use_separate_locks_but_overlap_is_rejected(mysql,
 
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
-            pending = executor.submit(snapshot.collect_snapshot, other, 'services', observe, get_events)
+            pending = executor.submit(collect_snapshot, other, 'services', observe, get_events)
             assert started.wait(10)
             try:
                 with pytest.raises(snapshot.CollectionBusy):
-                    snapshot.collect_snapshot(mysql, 'services', lambda _: pytest.fail('overlap'), get_events)
-                assert snapshot.collect_snapshot(mysql, 'processes', lambda _: {}, process_diff) == 0
+                    collect_snapshot(mysql, 'services', lambda _: pytest.fail('overlap'), get_events)
+                assert collect_snapshot(mysql, 'processes', lambda _: {}, process_diff) == 0
             finally:
                 finish.set()
             assert pending.result(timeout=10) == 0
@@ -250,3 +265,58 @@ def test_old_receipt_is_read_and_safely_extended(mysql, tmp_path, monkeypatch, p
         assert cursor.fetchone() == (1, 7)
     assert local_identity.provision(mysql, receipt, result, **kwargs) == result
     assert json.loads(receipt.read_text())['identity'] == result
+
+
+def test_both_cli_collectors_restore_real_mysql_state(mysql, monkeypatch):
+    """Mock only Linux reads; exercise main, identity, diff, SQL and the next run."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from metrics.processes import get as process_get
+    from metrics.services import get as service_get
+
+    host, _, _ = enroll(mysql, monkeypatch)
+    enroll(mysql, monkeypatch, 'processes', host)
+    observed = {'active': 'inactive', 'name': 'worker', 'created': 1000.25, 'failure': False}
+
+    def systemctl(arguments, **kwargs):
+        if observed['failure']:
+            return SimpleNamespace(returncode=1, stdout='', stderr='synthetic failure')
+        if 'list-units' in arguments:
+            output = 'example.service loaded inactive dead Example\n'
+        elif 'list-unit-files' in arguments:
+            output = 'example.service disabled -\n'
+        else:
+            output = ('Id=example.service\nNames=example.service\nDescription=Example\n'
+                      'LoadState=loaded\nActiveState=' + observed['active'] + '\nSubState=dead\n')
+        return SimpleNamespace(returncode=0, stdout=output, stderr='')
+
+    def processes(*args, **kwargs):
+        info = {'pid': 12, 'name': observed['name'], 'create_time': observed['created'],
+                'username': 'synthetic', 'cpu_percent': 0, 'memory_percent': 1,
+                'memory_info': SimpleNamespace(rss=1048576), 'status': 'running', 'exe': '/synthetic'}
+        return [SimpleNamespace(pid=12, info=info)]
+
+    monkeypatch.setattr(service_get.subprocess, 'run', systemctl)
+    monkeypatch.setattr(process_get.psutil, 'pids', lambda: [12])
+    monkeypatch.setattr(process_get.psutil, 'process_iter', MagicMock(side_effect=processes))
+    monkeypatch.setattr(services_main, 'get_connection', lambda **kwargs: connect_like(mysql))
+    monkeypatch.setattr(processes_main, 'get_connection', lambda **kwargs: connect_like(mysql))
+    assert services_main.main([]) == processes_main.main([]) == 0
+    mysql.rollback()
+    assert not rows(mysql, 'service_events') and not rows(mysql, 'process_events')
+    observed.update(active='active', name='renamed')
+    assert services_main.main([]) == processes_main.main([]) == 0
+    mysql.rollback()
+    assert rows(mysql, 'service_events')[0][6] == 'STARTED'
+    assert rows(mysql, 'process_events')[0][6] == 'CHANGED'
+    observed['created'] = 2000.5
+    assert processes_main.main([]) == 0
+    mysql.rollback()
+    assert {row[6] for row in rows(mysql, 'process_events')} == {'CHANGED', 'STARTED', 'STOPPED'}
+    assert len(rows(mysql, 'process_state')) == 1
+    before = rows(mysql, 'service_state')
+    observed['failure'] = True
+    assert services_main.main([]) == 1
+    mysql.rollback()
+    assert rows(mysql, 'service_state') == before
