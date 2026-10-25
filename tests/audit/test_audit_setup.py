@@ -1,3 +1,4 @@
+
 """Audit installation failures use temporary files and fake OS commands only."""
 
 import json
@@ -24,7 +25,7 @@ def installation(tmp_path, monkeypatch):
     unit_dir = tmp_path / 'systemd'
     unit_dir.mkdir()
     config = tmp_path / 'auditd.conf'
-    config.write_text('log_group = root\nwrite_logs = yes\n')
+    config.write_text('log_group = adm\nwrite_logs = yes\n')
     state_dir = tmp_path / 'state'
     state_dir.mkdir()
     state = {'project': project, 'rules': rules, 'config': config, 'directory': state_dir,
@@ -72,26 +73,28 @@ def prepare(state):
     setup.install_audit(state['project'], state['targets'])
 
 
-def test_repeated_prepare_preserves_original_backup_and_unrelated_rules(installation):
+def test_repeated_prepare_preserves_original_configuration_and_unrelated_rules(installation):
     state = installation
     unrelated = '-a always,exit -F arch=b64 -F path=/other -F perm=wa -k other_program'
     state['active'].append(unrelated)
     original = state['config'].read_text()
     prepare(state)
-    backup = state['config'].with_name('.mysql-siem-auditd.conf.original')
-    assert backup.read_text() == original
     first = list(state['active'])
     prepare(state)
     assert state['active'] == first
     assert unrelated in state['active']
-    assert backup.read_text() == original
-    assert backup.stat().st_mode & 0o777 == 0o600
-    assert state['config'].read_text() == 'log_group = mysql_siem\nwrite_logs = yes\n'
-    for command in state['commands']:
-        assert '-D' not in command
-        assert '--load' not in command
+    assert state['config'].read_text() == original
+    assert not state['config'].with_name('.mysql-siem-auditd.conf.original').exists()
+    for arguments in state['commands']:
+        assert '-D' not in arguments
+        assert '--load' not in arguments
+        assert arguments != ['/usr/sbin/auditctl', '--signal', 'reload']
     manifest = state['project'] / 'config/audit-runtime.json'
     assert json.loads(manifest.read_text())['target_statuses'] == {'/etc/passwd': 'PRESENT'}
+    setup.grant_log_read_access.assert_called_with(
+        setup.audit_logfile({'log_group': 'adm'}),
+        SimpleNamespace(pw_uid=1001, pw_gid=1001, pw_name='mysql_siem')
+    )
 
 
 @pytest.mark.parametrize('active', [
@@ -126,8 +129,10 @@ def test_existing_unmanaged_rule_file_is_preserved(installation):
     assert installation['writes'] == []
 
 
-@pytest.mark.parametrize('fault', ['reload', 'permissions', 'rule', 'read-probe'])
-def test_partial_preparation_failure_keeps_maintenance_and_does_not_publish_manifest(installation, monkeypatch, fault):
+@pytest.mark.parametrize('fault', ['permissions', 'rule', 'read-probe'])
+def test_partial_preparation_failure_keeps_maintenance_and_does_not_publish_manifest(
+    installation, monkeypatch, fault
+):
     state = installation
     maintenance = state['directory'] / 'maintenance'
     maintenance.write_text(setup.installation_state.MAINTENANCE_TEXT)
@@ -137,15 +142,13 @@ def test_partial_preparation_failure_keeps_maintenance_and_does_not_publish_mani
     connection = MagicMock()
     monkeypatch.setattr(pymysql, 'connect', Mock(return_value=connection))
     monkeypatch.setattr(database, 'load_targets', Mock(return_value=state['targets']))
-    if fault == 'reload':
-        state['fail'] = ['/usr/sbin/auditctl', '--signal', 'reload']
-    elif fault == 'permissions':
+    if fault == 'permissions':
         setup.grant_log_read_access.side_effect = OSError('synthetic permission error')
     elif fault == 'rule':
         state['fail'] = ['/usr/sbin/auditctl', '-a', 'always,exit', '-F', 'arch=b64',
                          '-F', 'path=/etc/passwd', '-F', 'perm=wa', '-k', 'siem_passwd']
     else:
-        state['fail'] = ['/usr/sbin/runuser', '-u', 'mysql_siem', '--', '/usr/bin/head', '-c', '1', '/var/log/audit/audit.log']
+        setup.grant_log_read_access.side_effect = RuntimeError('synthetic read probe failed')
     assert setup.main(['prepare', '--project', str(state['project'])]) == 1
     assert maintenance.read_text() == setup.installation_state.MAINTENANCE_TEXT
     assert not (state['project'] / 'config/audit-runtime.json').exists()

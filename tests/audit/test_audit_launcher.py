@@ -1,3 +1,4 @@
+
 import json
 import stat
 from pathlib import Path
@@ -39,7 +40,7 @@ def test_invalid_manifest_is_rejected(field, value):
 
 
 def test_installer_manifest_reaches_unprivileged_worker(monkeypatch):
-    """Exercise the actual writer and launcher with all OS operations mocked."""
+    """Exercise the writer and launcher with all OS operations mocked."""
     project = Path('/synthetic/mysql_siem')
     account = SimpleNamespace(pw_uid=1001, pw_gid=1001, pw_name='mysql_siem', pw_dir='/var/lib/mysql_siem')
     targets = []
@@ -53,7 +54,7 @@ def test_installer_manifest_reaches_unprivileged_worker(monkeypatch):
                 statuses[path] = 'PRESENT'
     expected = setup.rule_lines(targets, ['b64'])
     rules = setup.MARKER + '\n'.join(expected) + '\n'
-    configuration = 'log_group = mysql_siem\n'
+    configuration = 'log_group = adm\n'
     written = {}
 
     def record_write(path, content, **options):
@@ -114,8 +115,19 @@ def test_installer_manifest_reaches_unprivileged_worker(monkeypatch):
         calls.append('exec')
         raise SystemExit(0)
 
+    def open_log_as_collector(path, flags, *args, **kwargs):
+        assert str(path) == '/var/log/audit/audit.log'
+        assert current_ids['uid'] == (1001, 1001, 1001)
+        assert current_ids['gid'] == (1001, 1001, 1001)
+        assert flags & launcher.os.O_NOFOLLOW
+        calls.append('open')
+        return 123
+
+    def close_log(descriptor):
+        assert descriptor == 123
+        calls.append('close')
+
     monkeypatch.setattr(launcher, 'PROJECT', project)
-    monkeypatch.setenv('PATH', launcher.os.environ.get('PATH', ''))
     monkeypatch.setattr(launcher.sys, 'argv', ['audit_launcher.py'])
     monkeypatch.setattr(launcher.sys, 'path', list(launcher.sys.path))
     monkeypatch.setattr(launcher.Path, 'lstat', Mock(return_value=SimpleNamespace(st_mode=stat.S_IFDIR | 0o750, st_uid=0)))
@@ -128,8 +140,11 @@ def test_installer_manifest_reaches_unprivileged_worker(monkeypatch):
     monkeypatch.setattr(launcher.os, 'setresuid', drop_uid)
     monkeypatch.setattr(launcher.os, 'getresgid', lambda: current_ids['gid'])
     monkeypatch.setattr(launcher.os, 'getresuid', lambda: current_ids['uid'])
+    monkeypatch.setattr(launcher.os, 'open', open_log_as_collector)
+    monkeypatch.setattr(launcher.os, 'close', close_log)
     monkeypatch.setattr(launcher.os, 'execve', exec_worker)
     with pytest.raises(SystemExit) as result:
         launcher.launch()
     assert result.value.code == 0
-    assert calls == ['groups', 'gid', 'uid', 'exec']
+    assert calls == ['groups', 'gid', 'uid', 'open', 'close', 'exec']
+    setup.grant_log_read_access.assert_called()

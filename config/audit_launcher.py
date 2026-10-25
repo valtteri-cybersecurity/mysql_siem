@@ -1,9 +1,3 @@
-"""Fixed systemd entrypoint: check kernel status, then permanently drop root.
-
-No parameters, database access, audit rule changes or sudo grants. Execute with
-/usr/bin/python3 -I -B. Only root may edit this file and its parent source tree.
-"""
-
 import hashlib
 import json
 import os
@@ -63,6 +57,7 @@ def launch():
         RULES_FILE,
         audit_configuration,
         command,
+        grant_log_read_access,
         read_root_text,
         verify_rules,
     )
@@ -87,6 +82,11 @@ def launch():
     account = pwd.getpwnam('mysql_siem')
     if account.pw_uid == 0 or account.pw_gid == 0:
         raise ValueError('Audit requires a dedicated non-root service account.')
+
+    # auditd may change the ACL mask when rotating its log.
+    # Refresh read-only ACLs while still root, then drop all root privileges.
+    grant_log_read_access(logfile, account)
+
     environment = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': account.pw_dir,
                    'USER': account.pw_name, 'LOGNAME': account.pw_name, 'LANG': 'C.UTF-8',
                    'PYTHONPATH': str(PROJECT), 'PYTHONDONTWRITEBYTECODE': '1',
@@ -98,6 +98,11 @@ def launch():
     os.setresuid(account.pw_uid, account.pw_uid, account.pw_uid)
     if os.getresuid() != (account.pw_uid,) * 3 or os.getresgid() != (account.pw_gid,) * 3:
         raise ValueError('Audit privilege drop failed.')
+
+    # Verify OPEN after dropping privileges, without the adm group.
+    descriptor = os.open(logfile, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    os.close(descriptor)
+
     wrapper = str(PROJECT / 'config/run_with_env.sh')
     os.execve(wrapper, [wrapper, PYTHON, '-m', 'ingestion.audit.main', '--automatic',
                         '--log-file', '/var/log/mysql_siem/audit/cron.log'], environment)

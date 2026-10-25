@@ -1,3 +1,4 @@
+
 import argparse
 import hashlib
 import json
@@ -55,10 +56,11 @@ def write_managed(path, content, *, gid=0):
     return True
 
 
-def command(arguments):
+def command(arguments, *, pass_fds=()):
     # Fixed executables; no argument originates in an audit record.
     result = subprocess.run(arguments, capture_output=True, text=True, check=False, timeout=15,
-                            env=dict(os.environ, PATH='/usr/sbin:/usr/bin:/sbin:/bin', LC_ALL='C'))
+                            env=dict(os.environ, PATH='/usr/sbin:/usr/bin:/sbin:/bin', LC_ALL='C'),
+                            pass_fds=pass_fds)
     if result.returncode != 0:
         raise RuntimeError('Audit installation command failed: ' + arguments[0])
     return result.stdout
@@ -205,8 +207,9 @@ def validate_audit_log_settings(values):
 
 
 def validate_audit_log_group(values, group):
-    if values.get('log_group', 'root') not in ('root', '0', group):
-        raise ValueError('Existing audit log reader group must be preserved; approve a dedicated read-access plan manually.')
+    """Allow the supported local groups without changing auditd.conf."""
+    if values.get('log_group', 'root') not in ('root', '0', 'adm', group):
+        raise ValueError('Unknown Audit log reader group; review permissions manually.')
 
 
 def audit_logfile(values):
@@ -219,21 +222,11 @@ def audit_logfile(values):
 
 
 def audit_configuration(text, group):
+    """Validate and preserve auditd.conf, including its current log_group."""
     values = parse_audit_configuration(text)
     validate_audit_log_settings(values)
     validate_audit_log_group(values, group)
-    logfile = audit_logfile(values)
-    if values.get('log_group') == group:
-        return text, logfile
-    lines = []
-    for line in text.splitlines():
-        if line.split('#', 1)[0].partition('=')[0].strip().lower() == 'log_group':
-            lines.append('log_group = ' + group)
-        else:
-            lines.append(line)
-    if 'log_group' not in values:
-        lines.append('log_group = ' + group)
-    return '\n'.join(lines) + '\n', logfile
+    return text, audit_logfile(values)
 
 
 def inspect_audit_log_directory(logfile):
@@ -288,8 +281,6 @@ def audit_preflight():
             results.append(('UNKNOWN', name, 'auditd.conf cannot be inspected'))
         return results
 
-    # Parsing is a separate observation: malformed syntax must not hide the
-    # statuses of unrelated environment prerequisites.
     values = record('auditd.conf syntax', lambda: parse_audit_configuration(text))
     if values is None:
         for name in ('audit log settings', 'audit log reader group',
@@ -332,8 +323,6 @@ def _preflight_auditd_active():
 
 
 def _preflight_kernel_audit_status():
-    # auditctl -s only reads status. Never call commands that change Audit
-    # rules, auditd settings, or the kernel audit mode in preflight.
     output = command(['/usr/sbin/auditctl', '-s'])
     match = re.search(r'^enabled\s+([012])\s*$', output, re.MULTILINE)
     if not match:
@@ -351,7 +340,10 @@ def _preflight_logging(values):
 
 def _preflight_reader_group(values, group):
     validate_audit_log_group(values, group)
-    return f'current log_group={values.get("log_group", "root")}, allowed for {group}'
+    for executable in ('setfacl', 'setpriv'):
+        if not os.access('/usr/bin/' + executable, os.X_OK):
+            raise ValueError('Audit ACL tool is missing: ' + executable)
+    return f'current log_group={values.get("log_group", "root")}; ACL reader={group}'
 
 
 def print_audit_preflight(results, *, stream=None):
@@ -359,7 +351,6 @@ def print_audit_preflight(results, *, stream=None):
         stream = sys.stdout
     print('mysql_siem Audit environment preflight (read-only)', file=stream)
     for status, name, detail in results:
-        # Do not print auditd.conf content or secrets.
         if name == 'auditd.conf integrity' and status == 'PASS':
             detail = str(CONFIG_FILE) + ' (safe root-owned file)'
         if name == 'auditd.conf syntax' and status == 'PASS':
@@ -372,31 +363,55 @@ def print_audit_preflight(results, *, stream=None):
     return ok
 
 
+def set_audit_acl(descriptor, user_id, permissions, *, default=False):
+    """Change only mysql_siem's ACL entry on a safely opened object."""
+    arguments = ['/usr/bin/setfacl']
+    if default:
+        arguments.append('-d')
+    arguments.extend(['-m', f'u:{user_id}:{permissions}', '--',
+                      f'/proc/self/fd/{descriptor}'])
+    command(arguments, pass_fds=(descriptor,))
+
+
 def grant_log_read_access(logfile, account):
+    """Preserve root:adm; give the service UID only the needed ACL access."""
     from ingestion.audit.get import log_inventory
 
     trusted_directory(logfile.parent)
+    inventory = log_inventory(logfile)
+    if not inventory:
+        raise ValueError('Audit log inventory is empty.')
     for path in logfile.parent.iterdir():
         suffix = path.name[len(logfile.name) + 1:] if path.name.startswith(logfile.name + '.') else ''
         if path != logfile and not (suffix.isascii() and suffix.isdigit()):
             raise ValueError('Audit log directory contains unrelated/compressed files; review access manually.')
+
     directory = os.open(logfile.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        os.fchown(directory, 0, account.pw_gid)
-        os.fchmod(directory, 0o750)
+        info = os.fstat(directory)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise ValueError('Audit log directory changed or has unsafe permissions.')
+        set_audit_acl(directory, account.pw_uid, 'r-x')
+        set_audit_acl(directory, account.pw_uid, 'r-x', default=True)
     finally:
         os.close(directory)
-    for item in log_inventory(logfile):
+
+    for item in inventory:
         descriptor = os.open(item['path'], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
             info = os.fstat(descriptor)
             if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_nlink != 1
+                    or info.st_mode & 0o022
                     or (info.st_dev, info.st_ino) != (item['device'], item['inode'])):
                 raise ValueError('Audit log changed during permission preparation.')
-            os.fchown(descriptor, 0, account.pw_gid)
-            os.fchmod(descriptor, 0o640)
+            set_audit_acl(descriptor, account.pw_uid, 'r--')
         finally:
             os.close(descriptor)
+
+    # Verify access without the supplementary adm group.
+    command(['/usr/bin/setpriv', f'--reuid={account.pw_uid}',
+             f'--regid={account.pw_gid}', '--clear-groups', '--',
+             '/usr/bin/head', '-c', '1', str(logfile)])
 
 
 def install_audit(project, targets):
@@ -422,15 +437,9 @@ def install_audit(project, targets):
     if re.search(r'^enabled\s+2\s*$', status_text, re.MULTILINE) and missing:
         raise ValueError('Audit is immutable. Persistent rules prepared; approved maintenance/reboot required.')
     original = read_root_text(CONFIG_FILE)
-    updated, logfile = audit_configuration(original, account.pw_name)
-    if updated != original:
-        backup = CONFIG_FILE.with_name('.mysql-siem-auditd.conf.original')
-        if not backup.exists() and not backup.is_symlink():
-            atomic_write(backup, original, mode=0o600)
-        else:
-            read_root_text(backup)
-        atomic_write(CONFIG_FILE, updated, mode=0o640)
-        command(['/usr/sbin/auditctl', '--signal', 'reload'])
+    unchanged, logfile = audit_configuration(original, account.pw_name)
+    if unchanged != original:
+        raise ValueError('Audit configuration must remain unchanged.')
     grant_log_read_access(logfile, account)
     for line in missing:
         command(['/usr/sbin/auditctl', *shlex.split(line)])
@@ -439,8 +448,6 @@ def install_audit(project, targets):
     command(['/usr/sbin/augenrules', '--check'])
     for name in UNIT_NAMES:
         write_managed(UNIT_DIR / name, read_root_text(project / 'config/systemd' / name))
-    # Probe OPEN/READ as the service UID; never display/copy raw log data.
-    command(['/usr/sbin/runuser', '-u', account.pw_name, '--', '/usr/bin/head', '-c', '1', str(logfile)])
     digest = hashlib.sha256('\n'.join(expected).encode()).hexdigest()
     manifest = {'version': 1, 'logfile': str(logfile), 'rules_sha256': digest,
                 'target_statuses': dict(sorted(target_statuses.items()))}
@@ -477,8 +484,6 @@ def main(argv=None):
             command(['/usr/bin/systemctl', 'daemon-reload'])
             command(['/usr/bin/systemctl', 'enable', '--now', 'mysql-siem-audit.timer'])
         else:
-            # Report every prerequisite before any installation write, database
-            # connection or migration. Do not relax requirements to proceed.
             if not print_audit_preflight(audit_preflight()):
                 raise ValueError('Audit environment preflight failed; no Audit installation changes were made.')
             installation_state.require_maintenance(installation_state.STATE_DIR)
