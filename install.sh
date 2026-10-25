@@ -247,7 +247,7 @@ select_mysql_package() {
 install_dependencies() {
     local packages=(
         python3 python3-venv
-        rsyslog cron acl ca-certificates openssl coreutils
+        rsyslog cron ca-certificates openssl coreutils
     )
     if [[ -n "$MYSQL_PACKAGE" ]]; then
         packages+=("$MYSQL_PACKAGE")
@@ -710,7 +710,10 @@ systemctl enable --now rsyslog
 
 # Validate Audit prerequisites before any database reset or upgrade.
 # This check only reads the environment; it never changes Audit rules.
-audit_installation check
+audit_installation check --operation "$INSTALL_OPERATION"
+
+# Read-only log validation also runs when resuming a staged installation.
+service_installation snapshot-logs-check "$INSTALL_USER"
 
 "$APP_PYTHON" -c 'import pymysql; print("PyMySQL OK")'
 

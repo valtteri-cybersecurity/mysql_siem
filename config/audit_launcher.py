@@ -1,7 +1,6 @@
 import hashlib
 import json
 import os
-import pwd
 import re
 import stat
 import sys
@@ -55,9 +54,10 @@ def launch():
         CONFIG_FILE,
         MARKER,
         RULES_FILE,
+        _preflight_account,
         audit_configuration,
+        audit_group_files,
         command,
-        grant_log_read_access,
         read_root_text,
         verify_rules,
     )
@@ -79,13 +79,7 @@ def launch():
         raise ValueError('Audit disk logging configuration changed; maintenance required.')
     health = source_status(time.monotonic() + 5)
     health['observed_at'] = time.time()
-    account = pwd.getpwnam('mysql_siem')
-    if account.pw_uid == 0 or account.pw_gid == 0:
-        raise ValueError('Audit requires a dedicated non-root service account.')
-
-    # auditd may change the ACL mask when rotating its log.
-    # Refresh read-only ACLs while still root, then drop all root privileges.
-    grant_log_read_access(logfile, account)
+    account = _preflight_account()
 
     environment = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'HOME': account.pw_dir,
                    'USER': account.pw_name, 'LOGNAME': account.pw_name, 'LANG': 'C.UTF-8',
@@ -96,12 +90,11 @@ def launch():
     os.setgroups([])
     os.setresgid(account.pw_gid, account.pw_gid, account.pw_gid)
     os.setresuid(account.pw_uid, account.pw_uid, account.pw_uid)
-    if os.getresuid() != (account.pw_uid,) * 3 or os.getresgid() != (account.pw_gid,) * 3:
+    if os.getresuid() != (account.pw_uid,) * 3 or os.getresgid() != (account.pw_gid,) * 3 or os.getgroups():
         raise ValueError('Audit privilege drop failed.')
 
-    # Verify OPEN after dropping privileges, without the adm group.
-    descriptor = os.open(logfile, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    os.close(descriptor)
+    # The active file AND every retained rotation must be readable without adm.
+    audit_group_files(Path(manifest['logfile']), account, read=True)
 
     wrapper = str(PROJECT / 'config/run_with_env.sh')
     os.execve(wrapper, [wrapper, PYTHON, '-m', 'ingestion.audit.main', '--automatic',

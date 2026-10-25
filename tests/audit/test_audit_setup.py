@@ -25,7 +25,7 @@ def installation(tmp_path, monkeypatch):
     unit_dir = tmp_path / 'systemd'
     unit_dir.mkdir()
     config = tmp_path / 'auditd.conf'
-    config.write_text('log_group = adm\nwrite_logs = yes\n')
+    config.write_text('log_group = mysql_siem\nwrite_logs = yes\n')
     state_dir = tmp_path / 'state'
     state_dir.mkdir()
     state = {'project': project, 'rules': rules, 'config': config, 'directory': state_dir,
@@ -62,9 +62,10 @@ def installation(tmp_path, monkeypatch):
     monkeypatch.setattr(setup, 'inspect_audit_targets', Mock(return_value=({'/etc/passwd'}, {'/etc/passwd': 'PRESENT'})))
     account = SimpleNamespace(pw_uid=1001, pw_gid=1001, pw_name='mysql_siem')
     monkeypatch.setattr(setup.pwd, 'getpwnam', Mock(return_value=account))
+    monkeypatch.setattr(setup.grp, 'getgrnam', Mock(return_value=SimpleNamespace(gr_gid=1001)))
     monkeypatch.setattr(setup.os, 'access', Mock(return_value=True))
     monkeypatch.setattr(setup, 'source_status', Mock(return_value={}))
-    monkeypatch.setattr(setup, 'grant_log_read_access', Mock())
+    monkeypatch.setattr(setup, 'check_audit_log_access', Mock())
     monkeypatch.setattr(local_identity, 'atomic_write', write)
     return state
 
@@ -91,8 +92,8 @@ def test_repeated_prepare_preserves_original_configuration_and_unrelated_rules(i
         assert arguments != ['/usr/sbin/auditctl', '--signal', 'reload']
     manifest = state['project'] / 'config/audit-runtime.json'
     assert json.loads(manifest.read_text())['target_statuses'] == {'/etc/passwd': 'PRESENT'}
-    setup.grant_log_read_access.assert_called_with(
-        setup.audit_logfile({'log_group': 'adm'}),
+    setup.check_audit_log_access.assert_called_with(
+        setup.audit_logfile({'log_group': 'mysql_siem'}),
         SimpleNamespace(pw_uid=1001, pw_gid=1001, pw_name='mysql_siem')
     )
 
@@ -106,19 +107,20 @@ def test_conflicting_or_suppressing_rule_stops_before_writes(installation, activ
     with pytest.raises(ValueError):
         prepare(installation)
     assert installation['writes'] == []
-    setup.grant_log_read_access.assert_not_called()
+    setup.check_audit_log_access.assert_not_called()
 
 
-def test_immutable_missing_rule_only_prepares_persistent_rules(installation):
+def test_immutable_missing_rule_stops_before_any_writes(installation):
     installation['immutable'] = True
     original = installation['config'].read_text()
     with pytest.raises(ValueError, match='immutable'):
         prepare(installation)
-    assert installation['rules'].read_text().startswith(setup.MARKER)
+    assert not installation['rules'].exists()
+    assert installation['writes'] == []
     assert installation['config'].read_text() == original
     assert installation['active'] == []
     assert not (installation['project'] / 'config/audit-runtime.json').exists()
-    setup.grant_log_read_access.assert_not_called()
+    setup.check_audit_log_access.assert_not_called()
 
 
 def test_existing_unmanaged_rule_file_is_preserved(installation):
@@ -143,12 +145,12 @@ def test_partial_preparation_failure_keeps_maintenance_and_does_not_publish_mani
     monkeypatch.setattr(pymysql, 'connect', Mock(return_value=connection))
     monkeypatch.setattr(database, 'load_targets', Mock(return_value=state['targets']))
     if fault == 'permissions':
-        setup.grant_log_read_access.side_effect = OSError('synthetic permission error')
+        setup.check_audit_log_access.side_effect = OSError('synthetic permission error')
     elif fault == 'rule':
         state['fail'] = ['/usr/sbin/auditctl', '-a', 'always,exit', '-F', 'arch=b64',
                          '-F', 'path=/etc/passwd', '-F', 'perm=wa', '-k', 'siem_passwd']
     else:
-        setup.grant_log_read_access.side_effect = RuntimeError('synthetic read probe failed')
+        setup.check_audit_log_access.side_effect = RuntimeError('synthetic read probe failed')
     assert setup.main(['prepare', '--project', str(state['project'])]) == 1
     assert maintenance.read_text() == setup.installation_state.MAINTENANCE_TEXT
     assert not (state['project'] / 'config/audit-runtime.json').exists()

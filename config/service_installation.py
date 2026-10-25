@@ -1,9 +1,11 @@
 """Prepare and publish a service copy without editing the downloaded checkout."""
 
+import grp
 import os
 import pwd
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -19,6 +21,8 @@ class InstallationError(RuntimeError):
 EXCLUDED = {'.git', '.venv', 'venv', '__pycache__', '.pytest_cache', '.ruff_cache',
             '.mypy_cache', '.idea', '.vscode', 'tests', 'docs'}
 ENVIRONMENTS = Path('/opt/.mysql_siem-environments')
+LOG_PARENT = Path('/var/log')
+LOG_COMPONENTS = ('processes', 'services', 'audit')
 
 
 def trusted_directory(path):
@@ -523,41 +527,144 @@ def discard_deployment(state):
     journal.sync_directory(state)
 
 
-def prepare_snapshot_logs(user, root=Path('/var/log/mysql_siem')):
-    """Prepare rotating logs outside code, using descriptors to reject links."""
-    account = pwd.getpwnam(user)
-    trusted_directory(root.parent)
-    if not root.exists() and not root.is_symlink():
-        root.mkdir(mode=0o750)
-        os.chown(root, 0, account.pw_gid)
-    trusted_directory(root)
-    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+def validate_log_parent(info, *, allow_syslog=False):
+    """Only the designated log parent may use root:syslog 0775."""
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0:
+        raise InstallationError('Log parent must be a root-owned directory.')
+    if info.st_mode & 0o022:
+        if not allow_syslog or stat.S_IMODE(info.st_mode) != 0o775:
+            raise InstallationError('Unsafe log parent permissions.')
+        try:
+            syslog_gid = grp.getgrnam('syslog').gr_gid
+        except KeyError:
+            raise InstallationError('Required syslog group is missing.') from None
+        if info.st_gid != syslog_gid or syslog_gid == 0:
+            raise InstallationError('Writable log parent must belong to the syslog group.')
+
+
+def validate_snapshot_entry(info, account, *, shared=False, directory=False):
+    """Check ownership, type and write permissions before any mutation."""
+    owners = (0,) if shared else (0, account.pw_uid)
+    valid_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    if (not valid_type or info.st_uid not in owners or info.st_gid not in (0, account.pw_gid)
+            or info.st_mode & 0o022 or (not directory and info.st_nlink != 1)):
+        raise InstallationError('Unsafe snapshot log owner, permissions, type or hard link.')
+
+
+def open_snapshot_directory(parent, name, account, *, create=False, shared=False):
+    if create:
+        try:
+            os.mkdir(name, mode=0o750 if shared else 0o700, dir_fd=parent)
+        except FileExistsError:
+            pass
+    descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
     try:
-        for component in ('processes', 'services', 'audit'):
-            try:
-                os.mkdir(component, mode=0o700, dir_fd=root_fd)
-            except FileExistsError:
-                pass
-            directory = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd)
-            try:
-                if os.fstat(directory).st_uid not in (0, account.pw_uid):
-                    raise InstallationError('Unsafe snapshot log directory owner.')
-                os.fchown(directory, account.pw_uid, account.pw_gid)
-                os.fchmod(directory, 0o700)
-                descriptor = os.open('cron.log', os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                                     0o600, dir_fd=directory)
+        info = os.fstat(descriptor)
+        validate_snapshot_entry(info, account, shared=shared, directory=True)
+        verify_snapshot_name(parent, name, descriptor)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def verify_snapshot_name(parent, name, descriptor):
+    opened = os.fstat(descriptor)
+    named = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+        raise InstallationError('Snapshot log path changed during preparation; retry under maintenance.')
+
+
+def set_snapshot_permissions(descriptor, uid, gid, mode):
+    info = os.fstat(descriptor)
+    if (info.st_uid, info.st_gid) != (uid, gid):
+        os.fchown(descriptor, uid, gid)
+    if stat.S_IMODE(info.st_mode) != mode:
+        os.fchmod(descriptor, mode)
+
+
+def prepare_snapshot_logs(user, root=Path('/var/log/mysql_siem'), *, check_only=False):
+    """Check or prepare only our fixed log tree; never change /var/log itself."""
+    root = Path(root)
+    if root != LOG_PARENT / 'mysql_siem':
+        raise InstallationError('Snapshot logs require the dedicated /var/log/mysql_siem layout.')
+    account = pwd.getpwnam(user)
+    if account.pw_uid == 0 or account.pw_gid == 0:
+        raise InstallationError('Snapshot logs require a dedicated non-root account and group.')
+    trusted_directory(LOG_PARENT.parent)
+    for ancestor in LOG_PARENT.parents:
+        info = ancestor.lstat()
+        execute = stat.S_IXGRP if info.st_gid == account.pw_gid else stat.S_IXOTH
+        if not info.st_mode & execute:
+            raise InstallationError('Service group cannot traverse log ancestor: ' + str(ancestor))
+    parent = os.open(LOG_PARENT, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        opened_parent = os.fstat(parent)
+        validate_log_parent(opened_parent, allow_syslog=True)
+        execute = stat.S_IXGRP if opened_parent.st_gid == account.pw_gid else stat.S_IXOTH
+        if not opened_parent.st_mode & execute:
+            raise InstallationError('Service group cannot traverse /var/log; parent permissions were not changed.')
+        named_parent = LOG_PARENT.lstat()
+        if (named_parent.st_dev, named_parent.st_ino) != (opened_parent.st_dev, opened_parent.st_ino):
+            raise InstallationError('Log parent changed during validation.')
+        try:
+            root_fd = open_snapshot_directory(parent, root.name, account, create=not check_only, shared=True)
+        except FileNotFoundError:
+            if check_only:
+                return
+            raise
+        try:
+            for name in os.listdir(root_fd):
+                if name not in LOG_COMPONENTS:
+                    raise InstallationError('Unexpected entry in snapshot log root: ' + name)
+            if not check_only:
+                set_snapshot_permissions(root_fd, 0, account.pw_gid, 0o750)
+            for component in LOG_COMPONENTS:
                 try:
-                    info = os.fstat(descriptor)
-                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid not in (0, account.pw_uid):
-                        raise InstallationError('Unsafe snapshot log file.')
-                    os.fchown(descriptor, account.pw_uid, account.pw_gid)
-                    os.fchmod(descriptor, 0o600)
+                    directory = open_snapshot_directory(root_fd, component, account, create=not check_only)
+                except FileNotFoundError:
+                    if check_only:
+                        continue
+                    raise
+                try:
+                    for name in os.listdir(directory):
+                        suffix = name.removeprefix('cron.log.')
+                        if name != 'cron.log' and not (name.startswith('cron.log.') and suffix.isascii() and suffix.isdigit()):
+                            raise InstallationError('Unexpected snapshot log entry: ' + component + '/' + name)
+                        info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                        validate_snapshot_entry(info, account)
+                    if not check_only:
+                        set_snapshot_permissions(directory, account.pw_uid, account.pw_gid, 0o700)
+                    flags = os.O_RDONLY if check_only else os.O_WRONLY | os.O_APPEND | os.O_CREAT
+                    try:
+                        descriptor = os.open('cron.log', flags | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                             0o600, dir_fd=directory)
+                    except FileNotFoundError:
+                        if check_only:
+                            continue
+                        raise
+                    try:
+                        validate_snapshot_entry(os.fstat(descriptor), account)
+                        verify_snapshot_name(directory, 'cron.log', descriptor)
+                        if not check_only:
+                            set_snapshot_permissions(descriptor, account.pw_uid, account.pw_gid, 0o600)
+                    finally:
+                        os.close(descriptor)
+                    verify_snapshot_name(root_fd, component, directory)
                 finally:
-                    os.close(descriptor)
-            finally:
-                os.close(directory)
+                    os.close(directory)
+            verify_snapshot_name(parent, root.name, root_fd)
+        finally:
+            os.close(root_fd)
     finally:
-        os.close(root_fd)
+        os.close(parent)
+    if not check_only:
+        for component in LOG_COMPONENTS:
+            result = subprocess.run(['/usr/sbin/runuser', '-u', user, '--', '/usr/bin/head', '-c', '0', '--',
+                                     str(root / component / 'cron.log')], stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=5, check=False)
+            if result.returncode != 0:
+                raise InstallationError('Service account cannot open snapshot log: ' + component)
 
 
 def main(arguments):
@@ -570,8 +677,8 @@ def main(arguments):
             if target.exists() or target.is_symlink():
                 trusted_directory(target)
             validate_role_sources(source, target, arguments[3])
-        elif action == 'snapshot-logs':
-            prepare_snapshot_logs(arguments[1])
+        elif action in ('snapshot-logs', 'snapshot-logs-check'):
+            prepare_snapshot_logs(arguments[1], check_only=action == 'snapshot-logs-check')
         elif action == 'stage':
             from config.installation_state import STATE_DIR
             print(prepare_deployment(Path(arguments[1]), Path(arguments[2]), arguments[3], arguments[4],

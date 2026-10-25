@@ -1,8 +1,6 @@
 """Integration of protected files, settings, grants and schedules; no real install."""
 
 import ast
-import os
-import pwd
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -10,7 +8,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from config import reset_installation as setup
-from config import service_installation
 from database import migrate
 from database.snapshot_migrations import source_clause
 
@@ -40,45 +37,6 @@ def test_cron_grants_and_required_sources_cover_both_collectors():
     assert grants['collector_snapshots'] == 'SELECT, INSERT, UPDATE'
     assert 'service_installation snapshot-logs "$INSTALL_USER"' in installer
 
-
-@pytest.mark.parametrize('fault', [None, 'file-link', 'directory-link', 'hardlink'])
-def test_safe_log_preparation_and_rotation(tmp_path, monkeypatch, fault):
-    from config.run_logging import close_log, open_log
-
-    account = pwd.getpwuid(os.getuid())
-    monkeypatch.setattr(service_installation, 'trusted_directory', lambda _: None)
-    monkeypatch.setattr(service_installation.os, 'chown', lambda *args: None)
-    monkeypatch.setattr(service_installation.os, 'fchown', lambda *args: None)
-    root = tmp_path / 'logs'
-    (root / 'processes').mkdir(parents=True)
-    untouched = tmp_path / 'untouched'
-    untouched.write_text('preserve\n')
-    if fault == 'file-link':
-        (root / 'processes/cron.log').symlink_to(untouched)
-    elif fault == 'hardlink':
-        os.link(untouched, root / 'processes/cron.log')
-    elif fault == 'directory-link':
-        (root / 'processes').rmdir()
-        (root / 'processes').symlink_to(tmp_path, target_is_directory=True)
-    if fault:
-        with pytest.raises((OSError, service_installation.InstallationError)):
-            service_installation.prepare_snapshot_logs(account.pw_name, root)
-        assert untouched.read_text() == 'preserve\n'
-        return
-    service_installation.prepare_snapshot_logs(account.pw_name, root)
-    service_installation.prepare_snapshot_logs(account.pw_name, root)
-    for kind in ('processes', 'services'):
-        path = root / kind / 'cron.log'
-        assert path.stat().st_mode & 0o777 == 0o600
-        logger, handler = open_log('test.' + kind, path)
-        try:
-            handler.maxBytes = 100
-            for _ in range(20):
-                logger.info('synthetic log entry for rollover')
-        finally:
-            close_log(logger, handler)
-        assert path.with_suffix('.log.1').exists()
-        assert len(list(path.parent.glob('cron.log*'))) <= 4
 
 
 def upgrade_connection(grants=None):

@@ -39,7 +39,8 @@ def test_invalid_manifest_is_rejected(field, value):
         launcher.validate_manifest(data)
 
 
-def test_installer_manifest_reaches_unprivileged_worker(monkeypatch):
+@pytest.mark.parametrize('failure', [None, 'groups-remain', 'read-denied'])
+def test_installer_manifest_reaches_unprivileged_worker(monkeypatch, failure):
     """Exercise the writer and launcher with all OS operations mocked."""
     project = Path('/synthetic/mysql_siem')
     account = SimpleNamespace(pw_uid=1001, pw_gid=1001, pw_name='mysql_siem', pw_dir='/var/lib/mysql_siem')
@@ -54,7 +55,7 @@ def test_installer_manifest_reaches_unprivileged_worker(monkeypatch):
                 statuses[path] = 'PRESENT'
     expected = setup.rule_lines(targets, ['b64'])
     rules = setup.MARKER + '\n'.join(expected) + '\n'
-    configuration = 'log_group = adm\n'
+    configuration = 'log_group = mysql_siem\n'
     written = {}
 
     def record_write(path, content, **options):
@@ -78,6 +79,7 @@ def test_installer_manifest_reaches_unprivileged_worker(monkeypatch):
 
     health = {'boot_id': '00000000-0000-0000-0000-000000000001', 'lost': 0, 'daemon_pid': 42}
     monkeypatch.setattr(setup.pwd, 'getpwnam', Mock(return_value=account))
+    monkeypatch.setattr(setup.grp, 'getgrnam', Mock(return_value=SimpleNamespace(gr_gid=1001)))
     monkeypatch.setattr(setup.os, 'access', Mock(return_value=True))
     monkeypatch.setattr(setup, 'source_status', Mock(return_value=dict(health)))
     monkeypatch.setattr(setup, 'architectures', Mock(return_value=['b64']))
@@ -85,7 +87,7 @@ def test_installer_manifest_reaches_unprivileged_worker(monkeypatch):
     monkeypatch.setattr(setup, 'command', command)
     monkeypatch.setattr(setup, 'read_root_text', read_text)
     monkeypatch.setattr(setup, 'write_managed', Mock())
-    monkeypatch.setattr(setup, 'grant_log_read_access', Mock())
+    monkeypatch.setattr(setup, 'check_audit_log_access', Mock())
     monkeypatch.setattr(local_identity, 'atomic_write', record_write)
     setup.install_audit(project, targets)
     data = json.loads(written[str(project / 'config/audit-runtime.json')])
@@ -115,18 +117,18 @@ def test_installer_manifest_reaches_unprivileged_worker(monkeypatch):
         calls.append('exec')
         raise SystemExit(0)
 
-    def open_log_as_collector(path, flags, *args, **kwargs):
-        assert str(path) == '/var/log/audit/audit.log'
+    def read_logs_as_collector(logfile, reader, *, read=False):
+        assert str(logfile) == '/var/log/audit/audit.log'
+        assert reader == account and read is True
         assert current_ids['uid'] == (1001, 1001, 1001)
         assert current_ids['gid'] == (1001, 1001, 1001)
-        assert flags & launcher.os.O_NOFOLLOW
-        calls.append('open')
-        return 123
+        assert launcher.os.getgroups() == []
+        calls.append('read-active-and-rotations')
+        if failure == 'read-denied':
+            raise PermissionError('synthetic denied rotation')
+        return []
 
-    def close_log(descriptor):
-        assert descriptor == 123
-        calls.append('close')
-
+    monkeypatch.setattr(setup, 'audit_group_files', read_logs_as_collector)
     monkeypatch.setattr(launcher, 'PROJECT', project)
     monkeypatch.setattr(launcher.sys, 'argv', ['audit_launcher.py'])
     monkeypatch.setattr(launcher.sys, 'path', list(launcher.sys.path))
@@ -140,11 +142,16 @@ def test_installer_manifest_reaches_unprivileged_worker(monkeypatch):
     monkeypatch.setattr(launcher.os, 'setresuid', drop_uid)
     monkeypatch.setattr(launcher.os, 'getresgid', lambda: current_ids['gid'])
     monkeypatch.setattr(launcher.os, 'getresuid', lambda: current_ids['uid'])
-    monkeypatch.setattr(launcher.os, 'open', open_log_as_collector)
-    monkeypatch.setattr(launcher.os, 'close', close_log)
+    monkeypatch.setattr(launcher.os, 'getgroups', Mock(return_value=[4] if failure == 'groups-remain' else []))
     monkeypatch.setattr(launcher.os, 'execve', exec_worker)
-    with pytest.raises(SystemExit) as result:
-        launcher.launch()
-    assert result.value.code == 0
-    assert calls == ['groups', 'gid', 'uid', 'open', 'close', 'exec']
-    setup.grant_log_read_access.assert_called()
+    if failure is None:
+        with pytest.raises(SystemExit) as result:
+            launcher.launch()
+        assert result.value.code == 0
+        assert calls == ['groups', 'gid', 'uid', 'read-active-and-rotations', 'exec']
+    else:
+        with pytest.raises((ValueError, PermissionError)):
+            launcher.launch()
+        assert 'exec' not in calls
+        assert calls[:3] == ['groups', 'gid', 'uid']
+    setup.check_audit_log_access.assert_called()

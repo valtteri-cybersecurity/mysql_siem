@@ -15,10 +15,9 @@ import time
 from pathlib import Path
 
 from config import installation_state
-from config.service_installation import trusted_directory
+from config.service_installation import trusted_directory, validate_log_parent
 from ingestion.audit.get import source_status
-from ingestion.audit.targets import validate_targets
-
+from ingestion.audit.targets import DEFAULT_TARGETS, validate_targets
 
 MARKER = '# Managed by mysql_siem Audit; administrator installation only.\n'
 RULES_FILE = Path('/etc/audit/rules.d/50-mysql-siem.rules')
@@ -54,28 +53,30 @@ def read_root_text(path, maximum=1024 * 1024):
         os.close(descriptor)
 
 
-def write_managed(path, content, *, gid=0):
-    """Do not replace another program's file."""
-    from database.local_identity import atomic_write
-
+def managed_file_text(path):
+    """Check an installation destination without changing it."""
     trusted_directory(path.parent)
-
     if path.exists() or path.is_symlink():
         previous = read_root_text(path)
-
         if not previous.startswith(MARKER):
             raise ValueError(
                 'Audit installation filename belongs to another administrator/program.'
             )
+        return previous
+    return None
 
-        if previous == content:
-            return False
 
+def write_managed(path, content, *, gid=0):
+    """Do not replace another program's file."""
+    from database.local_identity import atomic_write
+
+    if managed_file_text(path) == content:
+        return False
     atomic_write(path, content, gid=gid, mode=0o640)
     return True
 
 
-def command(arguments, *, pass_fds=()):
+def command(arguments):
     result = subprocess.run(
         arguments,
         capture_output=True,
@@ -87,7 +88,6 @@ def command(arguments, *, pass_fds=()):
             PATH='/usr/sbin:/usr/bin:/sbin:/bin',
             LC_ALL='C',
         ),
-        pass_fds=pass_fds,
     )
 
     if result.returncode != 0:
@@ -329,6 +329,104 @@ def verify_rules(expected, output, *, owned_keys=()):
     ]
 
 
+def audit_rule_plan(targets, arches=None):
+    """Read and validate the same rule plan used before and after DB setup."""
+    if arches is None:
+        arches = architectures()
+    present, statuses = inspect_audit_targets(targets)
+    expected = rule_lines(targets, arches, present_paths=present)
+    keys = set()
+    for target in targets:
+        keys.add(target['audit_key'])
+    missing = verify_rules(expected, command(['/usr/sbin/auditctl', '-l']), owned_keys=keys)
+    status = command(['/usr/sbin/auditctl', '-s'])
+    enabled = re.search(r'^enabled\s+([012])\s*$', status, re.MULTILINE)
+    if enabled is None or enabled[1] == '0':
+        raise ValueError('Cannot establish an enabled Audit kernel; rules not ready.')
+    if enabled[1] == '2' and missing:
+        raise ValueError('Audit is immutable and required rules are missing. Administrator rule '
+                         'provisioning and an approved reboot are required before database setup.')
+    return expected, missing, statuses
+
+
+def preflight_targets(operation):
+    """Predict targets for this operation using only SELECTs on an existing DB."""
+    defaults = []
+    for target in DEFAULT_TARGETS:
+        defaults.append(dict(target, audit_key='siem_' + target['name']))
+    if operation == 'reset':
+        return validate_targets(defaults)
+    if operation != 'upgrade':
+        raise ValueError('Unknown Audit preflight operation.')
+
+    import pymysql
+
+    connection = None
+    try:
+        connection = pymysql.connect(unix_socket='/run/mysqld/mysqld.sock', user='root',
+                                     database='mysql_siem', autocommit=True, charset='utf8mb4',
+                                     connect_timeout=5, read_timeout=15, write_timeout=15)
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT table_name FROM information_schema.tables '
+                           "WHERE table_schema = DATABASE() AND table_name IN ('audit_targets', 'schema_migrations')")
+            tables = set()
+            for row in cursor.fetchall():
+                tables.add(row[0])
+            applied = False
+            if 'schema_migrations' in tables:
+                cursor.execute("SELECT status FROM schema_migrations WHERE version = '020'")
+                row = cursor.fetchone()
+                if row is not None and row[0] not in ('APPLIED', 'RUNNING', 'FAILED'):
+                    raise ValueError('Unknown Audit migration state; target scope is not verified.')
+                applied = row == ('APPLIED',)
+            if 'audit_targets' not in tables:
+                if applied:
+                    raise ValueError('Audit migration 020 is applied but audit_targets is missing.')
+                return validate_targets(defaults)
+            cursor.execute('SELECT target_name, audit_key, definition, enabled FROM audit_targets ORDER BY target_name')
+            rows = cursor.fetchall()
+        targets = []
+        names = set()
+        keys = set()
+        for name, key, raw, enabled in rows:
+            names.add(name)
+            keys.add(key)
+            if enabled not in (0, 1):
+                raise ValueError('Invalid Audit target enabled status.')
+            if enabled:
+                definition = json.loads(raw)
+                if not isinstance(definition, dict) or set(definition) != {'files', 'directories', 'executables'}:
+                    raise ValueError('Invalid stored Audit target definition.')
+                targets.append(dict(definition, name=name, audit_key=key))
+        if not applied:
+            # Migration 020 inserts defaults, preserving existing names/unique keys
+            # and disabled rows. Model only that existing seeding behavior.
+            for target in defaults:
+                if target['name'] not in names and target['audit_key'] not in keys:
+                    targets.append(target)
+        return validate_targets(targets)
+    except pymysql.MySQLError:
+        raise ValueError('Cannot read existing Audit targets for upgrade; preflight is not ready. '
+                         'No database or rules were changed.') from None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def preflight_rules(targets, arches):
+    expected, missing, statuses = audit_rule_plan(targets, arches)
+    absent = []
+    for path, status in statuses.items():
+        if status == 'NOT_INSTALLED':
+            absent.append(path)
+    detail = f'{len(expected)} expected rules; {len(missing)} missing'
+    if missing:
+        detail += ' (kernel is mutable; activation still required during preparation)'
+    if absent:
+        detail += '; optional paths not watched: ' + ', '.join(sorted(absent))
+    return detail
+
+
 def parse_audit_configuration(text):
     """Validate syntax and duplicates without changing auditd configuration."""
     values = {}
@@ -365,13 +463,14 @@ def validate_audit_log_settings(values):
 
 
 def validate_audit_log_group(values, group):
-    """Allow supported groups without modifying auditd.conf."""
-    if values.get('log_group', 'root') not in (
-        'root', '0', 'adm', group
-    ):
-        raise ValueError(
-            'Unknown Audit log reader group; review permissions manually.'
-        )
+    """Require the private reader group; never rewrite auditd.conf."""
+    try:
+        gid = grp.getgrnam(group).gr_gid
+    except KeyError:
+        raise ValueError('Audit reader group is missing: ' + group) from None
+    if gid == 0 or values.get('log_group', 'root') not in (group, str(gid)):
+        raise ValueError('Audit requires log_group=mysql_siem. Review docs/audit-permissions.md; '
+                         'existing adm readers and permissions were not changed.')
 
 
 def audit_logfile(values):
@@ -415,30 +514,10 @@ def inspect_audit_log_directory(logfile):
     # Only /var/log has the narrowly defined syslog exception.
     trusted_directory(Path('/var'))
 
-    parent = Path('/var/log').lstat()
-
-    if not stat.S_ISDIR(parent.st_mode) or parent.st_uid != 0:
-        raise ValueError(
-            'Audit log parent /var/log must be a root-owned directory.'
-        )
-
-    if parent.st_mode & 0o022:
-        try:
-            syslog_gid = grp.getgrnam('syslog').gr_gid
-
-        except KeyError as error:
-            raise ValueError(
-                'Required syslog group is missing.'
-            ) from error
-
-        if (
-            directory != Path('/var/log/audit')
-            or parent.st_gid != syslog_gid
-            or stat.S_IMODE(parent.st_mode) != 0o775
-        ):
-            raise ValueError(
-                'Unsafe /var/log permissions for Audit access.'
-            )
+    validate_log_parent(
+        Path('/var/log').lstat(),
+        allow_syslog=directory == Path('/var/log/audit'),
+    )
 
     info = directory.lstat()
 
@@ -480,7 +559,7 @@ def inspect_audit_log_directory(logfile):
     return f'{directory} (root owned; no unrelated files)'
 
 
-def audit_preflight():
+def audit_preflight(operation='upgrade'):
     """Inspect prerequisites without changing the system."""
     results = []
 
@@ -524,15 +603,21 @@ def audit_preflight():
         _preflight_auditd_active,
     )
 
-    record(
-        'kernel ABI configuration',
-        lambda: ', '.join(architectures()),
-    )
+    arches = record('kernel ABI configuration', architectures)
 
     record(
         'kernel Audit status',
         _preflight_kernel_audit_status,
     )
+
+    record('persistent Audit rules destination',
+           lambda: 'managed file' if managed_file_text(RULES_FILE) is not None else 'safe directory; file absent')
+
+    targets = record('Audit target definitions (' + operation + ')', lambda: preflight_targets(operation))
+    if targets is None or arches is None:
+        results.append(('UNKNOWN', 'Audit watch rules', 'target definitions or kernel ABI could not be verified'))
+    else:
+        record('Audit watch rules', lambda: preflight_rules(targets, arches))
 
     text = record(
         'auditd.conf integrity',
@@ -599,29 +684,29 @@ def audit_preflight():
         lambda: audit_logfile(values),
     )
 
-    if logfile is None:
+    if logfile is None or account is None:
         results.append((
             'UNKNOWN',
             'audit log directory',
-            'log path invalid',
+            'log path or reader account unavailable',
         ))
     else:
         record(
             'audit log directory',
-            lambda: inspect_audit_log_directory(logfile),
+            lambda: check_audit_log_access(logfile, account),
         )
 
     return results
 
 
 def _preflight_account():
-    account = pwd.getpwnam('mysql_siem')
-
-    if account.pw_uid == 0 or account.pw_gid == 0:
-        raise ValueError(
-            'Audit requires a non-root mysql_siem account/group.'
-        )
-
+    try:
+        account = pwd.getpwnam('mysql_siem')
+        group = grp.getgrnam('mysql_siem')
+    except KeyError:
+        raise ValueError('Audit requires the mysql_siem account and private group.') from None
+    if account.pw_uid == 0 or group.gr_gid == 0 or account.pw_gid != group.gr_gid:
+        raise ValueError('Audit requires a non-root account with primary group mysql_siem.')
     return account
 
 
@@ -658,32 +743,10 @@ def _preflight_auditd_active():
 
 
 def _preflight_kernel_audit_status():
-    output = command([
-        '/usr/sbin/auditctl',
-        '-s',
-    ])
-
-    match = re.search(
-        r'^enabled\s+([012])\s*$',
-        output,
-        re.MULTILINE,
-    )
-
-    if not match:
-        raise ValueError(
-            'Cannot establish Linux Audit enabled status.'
-        )
-
-    if match.group(1) == '0':
-        raise ValueError(
-            'Linux Audit is disabled in the kernel.'
-        )
-
-    return (
-        'Linux Audit active (immutable mode)'
-        if match.group(1) == '2'
-        else 'Linux Audit active'
-    )
+    # Use the installer's existing full health check: auditd PID, enabled kernel,
+    # lost records and backlog. This only reads status and the boot ID.
+    source_status(time.monotonic() + 5)
+    return 'Audit enabled, auditd running, no reported loss or queued records'
 
 
 def _preflight_logging(values):
@@ -694,20 +757,9 @@ def _preflight_logging(values):
 
 def _preflight_reader_group(values, group):
     validate_audit_log_group(values, group)
-
-    for executable in ('setfacl', 'setpriv'):
-        if not os.access(
-            '/usr/bin/' + executable,
-            os.X_OK,
-        ):
-            raise ValueError(
-                'Audit ACL tool is missing: ' + executable
-            )
-
-    return (
-        f'current log_group={values.get("log_group", "root")}; '
-        f'ACL reader={group}'
-    )
+    if not os.access('/usr/bin/setpriv', os.X_OK):
+        raise ValueError('Audit read verification requires /usr/bin/setpriv.')
+    return 'auditd log_group=mysql_siem; no supplementary groups required'
 
 
 def print_audit_preflight(results, *, stream=None):
@@ -753,151 +805,96 @@ def print_audit_preflight(results, *, stream=None):
 
     print(
         'Audit environment: '
-        + ('READY' if ok else 'NOT READY'),
+        + ('READY FOR PREPARATION' if ok else 'NOT READY'),
         file=stream,
     )
 
     return ok
 
 
-def set_audit_acl(descriptor, user_id, permissions, *, default=False):
-    """Change only mysql_siem's ACL entry on a safely opened object."""
-    arguments = ['/usr/bin/setfacl']
+# This small program runs AFTER setpriv has dropped every root ID and group.
+# It opens the same inode independently; it never inherits a root-opened log FD.
+READ_PROBE = """import os
+import stat
+import sys
+uid = int(sys.argv[2])
+gid = int(sys.argv[3])
+device = int(sys.argv[4])
+inode = int(sys.argv[5])
+if os.getresuid() != (uid, uid, uid) or os.getresgid() != (gid, gid, gid) or os.getgroups():
+    raise SystemExit(1)
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+try:
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != (device, inode):
+        raise SystemExit(1)
+    os.read(fd, 1)
+finally:
+    os.close(fd)
+"""
 
-    if default:
-        arguments.append('-d')
 
-    arguments.extend([
-        '-m',
-        f'u:{user_id}:{permissions}',
-        '--',
-        f'/proc/self/fd/{descriptor}',
-    ])
-
-    command(
-        arguments,
-        pass_fds=(descriptor,),
-    )
+def validate_audit_log_permissions(info, gid, *, directory=False):
+    valid_type = stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode)
+    modes = (0o750,) if directory else (0o640, 0o440)
+    if (not valid_type or info.st_uid != 0 or info.st_gid != gid
+            or stat.S_IMODE(info.st_mode) not in modes or (not directory and info.st_nlink != 1)):
+        raise ValueError('Audit requires root:mysql_siem, directory 0750 and logs 0640/0440. '
+                         'Check old rotations separately; no permissions were changed.')
 
 
-def grant_log_read_access(logfile, account):
-    """Grant ACL read access without changing root:adm ownership."""
-    from ingestion.audit.get import log_inventory
+def audit_group_files(logfile, account, *, read=False):
+    """Validate every retained log, optionally reading as the already dropped UID."""
+    from ingestion.audit.get import log_inventory, open_log_source
 
-    # Use the dedicated Audit directory inspection.
+    if read and (os.getresuid() != (account.pw_uid,) * 3
+                 or os.getresgid() != (account.pw_gid,) * 3 or os.getgroups()):
+        raise ValueError('Audit log reads require permanently dropped IDs and no supplementary groups.')
     inspect_audit_log_directory(logfile)
-
-    inventory = log_inventory(logfile)
-
-    if not inventory:
-        raise ValueError(
-            'Audit log inventory is empty.'
-        )
-
-    for path in logfile.parent.iterdir():
-        suffix = (
-            path.name[len(logfile.name) + 1:]
-            if path.name.startswith(logfile.name + '.')
-            else ''
-        )
-
-        if path != logfile and not (
-            suffix.isascii() and suffix.isdigit()
-        ):
-            raise ValueError(
-                'Audit log directory contains unrelated/compressed files; '
-                'review access manually.'
-            )
-
-    directory = os.open(
-        logfile.parent,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
-    )
-
+    logfile = Path(logfile)
+    descriptor = os.open(logfile.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
-        info = os.fstat(directory)
+        info = os.fstat(descriptor)
+        validate_audit_log_permissions(info, account.pw_gid, directory=True)
+        named = logfile.parent.lstat()
+        if (info.st_dev, info.st_ino) != (named.st_dev, named.st_ino):
+            raise ValueError('Audit log directory changed during validation; retry.')
+        inventory = log_inventory(logfile)
+        for item in inventory:
+            with open_log_source(item) as source:
+                validate_audit_log_permissions(os.fstat(source.fileno()), account.pw_gid)
+                if read:
+                    source.read(1)
         current = logfile.parent.lstat()
-
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != 0
-            or info.st_mode & 0o022
-            or (info.st_dev, info.st_ino)
-            != (current.st_dev, current.st_ino)
-        ):
-            raise ValueError(
-                'Audit log directory changed or has unsafe permissions.'
-            )
-
-        set_audit_acl(
-            directory,
-            account.pw_uid,
-            'r-x',
-        )
-
-        set_audit_acl(
-            directory,
-            account.pw_uid,
-            'r-x',
-            default=True,
-        )
-
+        if (info.st_dev, info.st_ino) != (current.st_dev, current.st_ino):
+            raise ValueError('Audit log directory changed during validation; retry.')
+        return inventory
     finally:
-        os.close(directory)
+        os.close(descriptor)
 
+
+def check_audit_log_access(logfile, account):
+    """Read-only preflight: prove actual access without root or adm groups."""
+    if os.geteuid() != 0:
+        raise PermissionError('Run the Audit preflight as root to verify a complete privilege drop.')
+    inventory = audit_group_files(logfile, account)
     for item in inventory:
-        descriptor = os.open(
-            item['path'],
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
-        )
-
+        arguments = ['/usr/bin/setpriv', f'--reuid={account.pw_uid}', f'--regid={account.pw_gid}',
+                     '--clear-groups', '--', '/usr/bin/python3', '-I', '-B', '-c', READ_PROBE,
+                     str(item['path']), str(account.pw_uid), str(account.pw_gid),
+                     str(item['device']), str(item['inode'])]
         try:
-            info = os.fstat(descriptor)
-
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_uid != 0
-                or info.st_nlink != 1
-                or info.st_mode & 0o022
-                or (info.st_dev, info.st_ino)
-                != (item['device'], item['inode'])
-            ):
-                raise ValueError(
-                    'Audit log changed during permission preparation.'
-                )
-
-            set_audit_acl(
-                descriptor,
-                account.pw_uid,
-                'r--',
-            )
-
-        finally:
-            os.close(descriptor)
-
-    # Verify reading without supplementary adm group membership.
-    command([
-        '/usr/bin/setpriv',
-        f'--reuid={account.pw_uid}',
-        f'--regid={account.pw_gid}',
-        '--clear-groups',
-        '--',
-        '/usr/bin/head',
-        '-c',
-        '1',
-        str(logfile),
-    ])
+            command(arguments)
+        except RuntimeError:
+            raise ValueError('mysql_siem cannot read Audit log without supplementary groups: '
+                             + str(item['path']) + '. No permissions were changed.') from None
+    return f'{len(inventory)} Audit logs readable with primary group mysql_siem only'
 
 
 def install_audit(project, targets):
     from database.local_identity import atomic_write
 
-    account = pwd.getpwnam('mysql_siem')
-
-    if account.pw_uid == 0 or account.pw_gid == 0:
-        raise ValueError(
-            'Audit requires the non-root mysql_siem account/group.'
-        )
+    account = _preflight_account()
 
     for executable in (
         'auditd',
@@ -922,20 +919,7 @@ def install_audit(project, targets):
 
     source_status(time.monotonic() + 5)
 
-    present_paths, target_statuses = inspect_audit_targets(
-        targets
-    )
-
-    expected = rule_lines(
-        targets,
-        architectures(),
-        present_paths=present_paths,
-    )
-
-    owned_keys = {
-        target['audit_key']
-        for target in targets
-    }
+    expected, missing, target_statuses = audit_rule_plan(targets)
 
     for path, status in sorted(target_statuses.items()):
         if status == 'NOT_INSTALLED':
@@ -943,35 +927,6 @@ def install_audit(project, targets):
                 'Audit target NOT_INSTALLED (rule omitted): ' + path,
                 file=sys.stderr,
             )
-
-    missing = verify_rules(
-        expected,
-        command(['/usr/sbin/auditctl', '-l']),
-        owned_keys=owned_keys,
-    )
-
-    write_managed(
-        RULES_FILE,
-        MARKER + '\n'.join(expected) + '\n',
-    )
-
-    status_text = command([
-        '/usr/sbin/auditctl',
-        '-s',
-    ])
-
-    if (
-        re.search(
-            r'^enabled\s+2\s*$',
-            status_text,
-            re.MULTILINE,
-        )
-        and missing
-    ):
-        raise ValueError(
-            'Audit is immutable. Persistent rules prepared; '
-            'approved maintenance/reboot required.'
-        )
 
     original = read_root_text(CONFIG_FILE)
 
@@ -985,7 +940,12 @@ def install_audit(project, targets):
             'Audit configuration must remain unchanged.'
         )
 
-    grant_log_read_access(logfile, account)
+    check_audit_log_access(logfile, account)
+
+    write_managed(
+        RULES_FILE,
+        MARKER + '\n'.join(expected) + '\n',
+    )
 
     for line in missing:
         command([
@@ -993,6 +953,9 @@ def install_audit(project, targets):
             *shlex.split(line),
         ])
 
+    owned_keys = set()
+    for target in targets:
+        owned_keys.add(target['audit_key'])
     if verify_rules(
         expected,
         command(['/usr/sbin/auditctl', '-l']),
@@ -1046,6 +1009,9 @@ def main(argv=None):
         choices=('check', 'prepare', 'activate'),
     )
 
+    parser.add_argument('--operation', choices=('reset', 'upgrade'), default='upgrade',
+                        help='Target scope for the read-only check; defaults to an existing installation.')
+
     parser.add_argument(
         '--project',
         type=Path,
@@ -1056,7 +1022,7 @@ def main(argv=None):
     if args.action == 'check':
         return (
             0
-            if print_audit_preflight(audit_preflight())
+            if print_audit_preflight(audit_preflight(operation=args.operation))
             else 1
         )
 
@@ -1109,7 +1075,7 @@ def main(argv=None):
 
         else:
             if not print_audit_preflight(
-                audit_preflight()
+                audit_preflight(operation='upgrade')
             ):
                 raise ValueError(
                     'Audit environment preflight failed; '

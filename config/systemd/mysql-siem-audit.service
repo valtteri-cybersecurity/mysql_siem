@@ -10,16 +10,15 @@ ConditionPathExists=!/usr/local/lib/.mysql_siem-local/maintenance
 Type=oneshot
 User=root
 Group=root
-# The fixed entrypoint renews ACLs, then permanently drops UID/GID.
+# The fixed entrypoint verifies Audit status, then permanently drops UID/GID.
 ExecStart=/usr/bin/python3 -I -B /usr/local/lib/mysql_siem/config/audit_launcher.py
 TimeoutStartSec=55
 SuccessExitStatus=75
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_AUDIT_CONTROL CAP_SETUID CAP_SETGID
 ProtectSystem=strict
-# ACL renewal needs access to auditd log files.
-# The collector UID receives only read access via POSIX ACL.
-ReadWritePaths=/var/log/mysql_siem/audit /var/log/audit
+# Audit input stays read-only; only the application log is writable.
+ReadWritePaths=/var/log/mysql_siem/audit
 ProtectHome=true
 PrivateTmp=true
 RestrictSUIDSGID=true
