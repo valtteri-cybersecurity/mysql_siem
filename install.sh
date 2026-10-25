@@ -247,7 +247,7 @@ select_mysql_package() {
 install_dependencies() {
     local packages=(
         python3 python3-venv
-        rsyslog cron ca-certificates openssl coreutils
+        rsyslog cron acl ca-certificates openssl coreutils
     )
     if [[ -n "$MYSQL_PACKAGE" ]]; then
         packages+=("$MYSQL_PACKAGE")
@@ -308,7 +308,7 @@ validate_application_user() {
     [[ "$group_name" == "$INSTALL_USER" && "$group_gid" =~ ^[0-9]+$ && "$group_gid" != 0 && "$account_gid" == "$group_gid" ]] ||
         die "mysql_siem has a conflicting primary group; existing GID was not changed."
     [[ -z "$group_members" || "$group_members" == "$INSTALL_USER" ]] ||
-        die "The mysql_siem group is shared with other users; review it manually instead of granting broad access."
+        die "The mysql_siem group is shared with other users; review it manually."
 
     expected_uid="$account_uid"
     accounts="$(getent passwd)" || die "Cannot check mysql_siem UID/group ownership."
@@ -339,7 +339,7 @@ validate_application_user() {
     status="$(LC_ALL=C passwd -S "$INSTALL_USER")" || die "Cannot verify mysql_siem password status."
     IFS=' ' read -r status_name password_state rest <<< "$status"
     [[ "$status_name" == "$INSTALL_USER" && "$password_state" == L ]] ||
-        die "mysql_siem must have a locked password; existing account was not changed."
+        die "mysql_siem must have a locked password; existing password was not changed."
     if command -v sudo >/dev/null 2>&1; then
         local sudo_status=0 sudo_denial_prefix sudo_denial_host
         sudo_output="$(LC_ALL=C sudo -n -l -U "$INSTALL_USER" 2>&1)" || sudo_status=$?
@@ -381,7 +381,7 @@ ensure_application_user() {
             done <<< "$accounts"
         else
             status=$?
-            [[ "$status" == 2 ]] || die "Group lookup failed; no account was created."
+            [[ "$status" == 2 ]] || die "Group lookup failed; no group was created."
             groupadd --system "$INSTALL_USER" || die "Failed to create the mysql_siem system group."
         fi
         useradd --system --gid "$INSTALL_USER" --home-dir "$APP_HOME" \
@@ -694,6 +694,13 @@ printf '%s\n' "$SIEM_BOOTSTRAP_COMMIT" > "$PROJECT_DIR/config/installed-version"
 chown root:"$INSTALL_USER" "$PROJECT_DIR/config/installed-version"
 chmod 640 "$PROJECT_DIR/config/installed-version"
 
+# Preflight is read-only: do not start a new maintenance period or alter the
+# database when Audit configuration or snapshot-log permissions are unsuitable.
+# Audit log ownership and auditd.conf must be reviewed by an administrator.
+audit_installation check --operation "$INSTALL_OPERATION"
+service_installation snapshot-logs-check "$INSTALL_USER"
+
+# Only after successful preflight may the installer pause the collectors.
 if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
     local_identity_setup begin
 else
@@ -703,17 +710,11 @@ exec 8< /usr/local/lib/.mysql_siem-local/runtime.lock
 flock -x -w 30 8 || die "Runtime jobs did not stop; collection remains paused."
 export SIEM_INSTALL_MAINTENANCE=1
 
+# Enable services only after the installation maintenance barrier is active.
 log "Starting services."
 systemctl enable --now mysql
 systemctl enable --now cron
 systemctl enable --now rsyslog
-
-# Validate Audit prerequisites before any database reset or upgrade.
-# This check only reads the environment; it never changes Audit rules.
-audit_installation check --operation "$INSTALL_OPERATION"
-
-# Read-only log validation also runs when resuming a staged installation.
-service_installation snapshot-logs-check "$INSTALL_USER"
 
 "$APP_PYTHON" -c 'import pymysql; print("PyMySQL OK")'
 
@@ -819,7 +820,6 @@ grants = {
     "ufw_log": "SELECT, INSERT",
     "ufw_state": "SELECT, INSERT, UPDATE",
 }
-
 conn = pymysql.connect(unix_socket="/run/mysqld/mysqld.sock", user="root")
 try:
     with conn.cursor() as cur:
@@ -950,7 +950,6 @@ elif [[ "${PORT_ANALYSIS_READY:-0}" == "1" ]]; then
 elif [[ "${SOURCE_IP_ANALYSIS_READY:-0}" == "1" ]]; then
     UFW_ANALYSIS_OPTIONS="--recent-hours 2"
 fi
-
 if [[ "${TRAFFIC_ANALYSIS_READY:-0}" == "1" ]]; then
     if [[ "$UFW_ANALYSIS_OPTIONS" != "--all --recent-hours 3" ]]; then
         # --traffic combines with an explicitly selected legacy-compatible analysis.
@@ -960,7 +959,6 @@ if [[ "${TRAFFIC_ANALYSIS_READY:-0}" == "1" ]]; then
         UFW_ANALYSIS_OPTIONS="${UFW_ANALYSIS_OPTIONS:+$UFW_ANALYSIS_OPTIONS }--traffic"
     fi
 fi
-
 if [[ -n "$UFW_ANALYSIS_OPTIONS" ]]; then
     mkdir -p "$PROJECT_DIR/analysis/ufw"
     prepare_runtime_log "$PROJECT_DIR/analysis/ufw/cron.log"
@@ -1014,7 +1012,6 @@ if ! CRON_EXISTING="$(LC_ALL=C crontab -u "$INSTALL_USER" -l 2>"$CRON_TMP")"; th
         die "Cannot read the existing crontab; no cron changes were made."
     CRON_EXISTING=""
 fi
-
 printf '%s\n' "$CRON_EXISTING" |
     awk -v begin="$CRON_BEGIN" -v end="$CRON_END" -v project="$PROJECT_DIR" '
         $0 == begin { skip=1; next }
@@ -1057,4 +1054,3 @@ if [[ "${SSH_LOG_READABLE:-1}" == 0 ]]; then
 fi
 log "Check the UFW log source and permissions before production use."
 log "Audit: systemctl status mysql-siem-audit.timer; validate live auditd/service-user/MySQL behavior before production."
-

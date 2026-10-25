@@ -1,5 +1,3 @@
-"""Prepare and publish a service copy without editing the downloaded checkout."""
-
 import grp
 import os
 import pwd
@@ -427,6 +425,10 @@ def prepare_deployment(source, target, user, role, stable, state, *, settings_so
             trusted_directory(Path(record['stage']))
             restore_missing_staged_settings(Path(record['stage']), target)
             if not reset:
+                # This retry has not started database work. Preserve the older
+                # database history while clearing only the per-attempt flag.
+                record['database_started_current'] = False
+                journal.save_deployment(state, record)
                 return Path(record['stage'])
             settings_source = Path(record['stage'])
         if record['phase'] == 'staged' and not Path(record['stage']).exists() and not target.exists():
@@ -442,7 +444,8 @@ def prepare_deployment(source, target, user, role, stable, state, *, settings_so
     stage = stage_service(source, target, account.pw_uid, account.pw_gid, role=role, settings_source=settings_source)
     record = {'version': 1, 'stage': str(stage), 'target': str(target), 'stable': str(stable),
               'user': user, 'candidate': None, 'phase': 'staged', 'identity': {}, 'publication': None,
-              'database_started': previous_database_started, 'cron_digest': None, 'checkpoint_transition': pending_transition}
+              'database_started': previous_database_started, 'database_started_current': False,
+              'cron_digest': None, 'checkpoint_transition': pending_transition}
     journal.save_deployment(state, record)
     return stage
 
@@ -514,7 +517,10 @@ def discard_deployment(state):
         raise InstallationError('Only an uncommitted staged installation may be discarded.')
     deployment_paths(record, Path(record['target']), Path(record['stable']), record['user'])
     if record['database_started']:
-        print('Database setup has started; staged settings and the deployment journal were retained.', file=sys.stderr)
+        when = ('during this installation attempt' if record['database_started_current']
+                else 'during an earlier interrupted installation attempt')
+        print('Database setup was started ' + when +
+              '; staged settings and the recovery journal were retained.', file=sys.stderr)
         return
     stable = Path(record['stable'])
     if (record['candidate'] is not None and stable.is_symlink()
@@ -707,6 +713,7 @@ def main(arguments):
             if record is None or record['phase'] != 'staged':
                 raise InstallationError('Database setup requires a staged deployment.')
             record['database_started'] = True
+            record['database_started_current'] = True
             journal.save_deployment(journal.STATE_DIR, record)
         elif action == 'discard':
             from config.installation_state import STATE_DIR

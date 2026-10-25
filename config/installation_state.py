@@ -1,5 +1,3 @@
-"""Root-owned deployment journal and inherited installer lock checks."""
-
 import fcntl
 import json
 import os
@@ -119,7 +117,13 @@ def read_deployment(state):
         return None
     record = json.loads(read_file(path))
     fields = {'version', 'stage', 'target', 'stable', 'user', 'candidate', 'phase', 'identity', 'publication', 'database_started', 'cron_digest', 'checkpoint_transition'}
-    if not isinstance(record, dict) or set(record) != fields or type(record['version']) is not int or record['version'] != 1:
+    if not isinstance(record, dict):
+        raise InstallationStateError('Invalid deployment recovery journal.')
+    # Older journals lack the per-attempt field. Keep their recovery history.
+    if set(record) == fields:
+        record['database_started_current'] = False
+    fields.add('database_started_current')
+    if set(record) != fields or type(record['version']) is not int or record['version'] != 1:
         raise InstallationStateError('Invalid deployment recovery journal.')
     if record['phase'] not in ('staged', 'publishing', 'activated', 'complete'):
         raise InstallationStateError('Unknown deployment recovery phase.')
@@ -128,6 +132,8 @@ def read_deployment(state):
         if not isinstance(value, str) or not Path(value).is_absolute() or os.path.abspath(value) != value:
             raise InstallationStateError('Invalid deployment recovery path.')
     if (type(record['database_started']) is not bool
+            or type(record['database_started_current']) is not bool
+            or (record['database_started_current'] and not record['database_started'])
             or record['checkpoint_transition'] is not None and type(record['checkpoint_transition']) is not bool
             or record['cron_digest'] is not None and not isinstance(record['cron_digest'], str)):
         raise InstallationStateError('Invalid deployment progress metadata.')
