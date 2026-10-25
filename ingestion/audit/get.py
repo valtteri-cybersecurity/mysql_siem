@@ -230,12 +230,10 @@ def log_inventory(logfile):
     return inventory
 
 
-def log_fingerprint(infile, offset):
-    saved = infile.tell()
-    infile.seek(max(0, offset - 256))
-    value = hashlib.sha256(infile.read(min(offset, 256))).hexdigest()
-    infile.seek(saved)
-    return value
+def log_position(item, offset, preceding_bytes):
+    """Keep the fingerprint of bytes actually read, not a later file version."""
+    return {'device': item['device'], 'inode': item['inode'], 'offset': offset,
+            'fingerprint': hashlib.sha256(preceding_bytes).hexdigest()}
 
 
 def open_log_source(item):
@@ -249,6 +247,35 @@ def open_log_source(item):
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def verify_log_reads(logfile, checks, deadline):
+    """Recheck every read range, allowing appends and ordinary rename rotation."""
+    retained = {}
+    for item in log_inventory(logfile):
+        retained[(item['device'], item['inode'])] = item
+    for check in checks:
+        if time.monotonic() >= deadline:
+            raise TimeoutError('Audit file verification timed out; checkpoint unchanged.')
+        item = retained.get((check['device'], check['inode']))
+        if item is None:
+            raise RuntimeError('Audit log disappeared during collection; no checkpoint proposed.')
+        with open_log_source(item) as infile:
+            if os.fstat(infile.fileno()).st_size < check['start'] + check['length']:
+                raise RuntimeError('Audit log truncated during collection.')
+            infile.seek(check['start'])
+            remaining = check['length']
+            digest = hashlib.sha256()
+            while remaining > 0:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Audit file verification timed out; checkpoint unchanged.')
+                chunk = infile.read(min(65536, remaining))
+                if not chunk:
+                    raise RuntimeError('Audit log truncated during collection.')
+                digest.update(chunk)
+                remaining -= len(chunk)
+            if digest.hexdigest() != check['digest']:
+                raise RuntimeError('Audit log bytes changed during collection; checkpoint unchanged.')
 
 
 def runtime_health():
@@ -297,6 +324,8 @@ def read_log_batch(*, logfile='/var/log/audit/audit.log', checkpoint=None, sourc
     It is never written to a checkpoint file. Recent or split groups stay before
     the proposed offset. Complete events interleaved with them are replayed too.
     Appended records are read by position even if their audit timestamp is old.
+    Every read range is hashed while reading and checked again before return.
+    Checkpoint fingerprints always describe the original read, not newer bytes.
     """
     if (type(max_bytes) is not int or not 65536 <= max_bytes <= 8 * 1024 * 1024
             or type(max_events) is not int or not 1 <= max_events <= 10000
@@ -331,6 +360,7 @@ def read_log_batch(*, logfile='/var/log/audit/audit.log', checkpoint=None, sourc
     pending = False
     boundary = None
     end_position = None
+    read_checks = []
     for index in range(first, len(inventory)):
         item = inventory[index]
         with open_log_source(item) as infile:
@@ -338,24 +368,31 @@ def read_log_batch(*, logfile='/var/log/audit/audit.log', checkpoint=None, sourc
             offset = checkpoint['offset'] if checkpoint is not None and index == first else 0
             if offset > size:
                 raise RuntimeError('Audit log was truncated; checkpoint unchanged.')
+            start = max(0, offset - 256)
+            infile.seek(start)
+            preceding_bytes = infile.read(offset - start)
+            if len(preceding_bytes) != offset - start:
+                raise RuntimeError('Audit log truncated during collection.')
+            end_position = log_position(item, offset, preceding_bytes)
             if checkpoint is not None and index == first:
-                if log_fingerprint(infile, offset) != checkpoint['fingerprint']:
+                if end_position['fingerprint'] != checkpoint['fingerprint']:
                     raise RuntimeError('Audit checkpoint bytes changed; possible truncation or corruption.')
-                if offset:
-                    infile.seek(offset - 1)
-                    if infile.read(1) != b'\n':
-                        raise ValueError('Audit checkpoint is not a record boundary.')
+                if offset and preceding_bytes[-1:] != b'\n':
+                    raise ValueError('Audit checkpoint is not a record boundary.')
+            digest = hashlib.sha256(preceding_bytes)
+            read_length = len(preceding_bytes)
             infile.seek(offset)
-            end_position = {'device': item['device'], 'inode': item['inode'], 'offset': offset}
             while infile.tell() < size:
                 if time.monotonic() >= deadline:
                     raise TimeoutError('Audit file read timed out; checkpoint unchanged.')
-                before = {'device': item['device'], 'inode': item['inode'], 'offset': infile.tell()}
+                before = log_position(item, infile.tell(), preceding_bytes)
                 remaining = max_bytes - bytes_read
                 if remaining <= 0:
                     limited = True
                     break
                 raw = infile.readline(min(65537, remaining + 1, size - infile.tell()))
+                digest.update(raw)
+                read_length += len(raw)
                 if len(raw) > remaining:
                     limited = True
                     break
@@ -367,6 +404,7 @@ def read_log_batch(*, logfile='/var/log/audit/audit.log', checkpoint=None, sourc
                     pending = True
                     break
                 bytes_read += len(raw)
+                preceding_bytes = (preceding_bytes + raw)[-256:]
                 line = raw.decode('utf-8').rstrip('\r\n')
                 match = HEADER.fullmatch(line)
                 if match is None:
@@ -382,9 +420,11 @@ def read_log_batch(*, logfile='/var/log/audit/audit.log', checkpoint=None, sourc
                     groups[key]['lines'].append(line)
                     groups[key]['last'] = lines_read
                 lines_read += 1
-                end_position = {'device': item['device'], 'inode': item['inode'], 'offset': infile.tell()}
+                end_position = log_position(item, infile.tell(), preceding_bytes)
             if index != len(inventory) - 1 and os.fstat(infile.fileno()).st_size != size:
                 raise RuntimeError('Rotated Audit log is still changing; retry.')
+            read_checks.append({'device': item['device'], 'inode': item['inode'],
+                                'start': start, 'length': read_length, 'digest': digest.hexdigest()})
         if limited or pending:
             break
     # Find the first group that cannot yet be committed. Never split interleaved groups.
@@ -415,18 +455,7 @@ def read_log_batch(*, logfile='/var/log/audit/audit.log', checkpoint=None, sourc
         if boundary is None or group['first'] < boundary['first']:
             output.extend(group['lines'])
     position = dict(boundary['position'] if boundary is not None else end_position)
-    # Re-find the inode after parsing: a rotation may have renamed its pathname.
-    retained = None
-    for item in log_inventory(logfile):
-        if (item['device'], item['inode']) == (position['device'], position['inode']):
-            retained = item
-            break
-    if retained is None:
-        raise RuntimeError('Audit log disappeared during collection; no checkpoint proposed.')
-    with open_log_source(retained) as infile:
-        if os.fstat(infile.fileno()).st_size < position['offset']:
-            raise RuntimeError('Audit log truncated during collection.')
-        position['fingerprint'] = log_fingerprint(infile, position['offset'])
+    verify_log_reads(logfile, read_checks, deadline)
     if limited and checkpoint is not None and all(position[key] == checkpoint[key] for key in ('device', 'inode', 'offset')):
         raise ValueError('One Audit group exceeds the read budget; manual recovery required.')
     position.update(version=2, source_id=source_id, reader_boot_id=health['boot_id'],

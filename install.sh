@@ -189,6 +189,9 @@ local_identity_setup() {
     PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m database.local_identity "$@" \
         --project "$PROJECT_DIR" --installed "$SERVICE_DIR" --user "$INSTALL_USER"
 }
+audit_installation() {
+    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.audit_setup "$@" --project "$PROJECT_DIR"
+}
 verify_local_identity() {
     runuser -u "$INSTALL_USER" -- env PYTHONPATH="$PROJECT_DIR" \
         "$APP_PYTHON" -m database.local_identity verify --project "$PROJECT_DIR"
@@ -867,7 +870,7 @@ verify_local_identity
 # Only the approved installer performs privileged Audit preparation, while all
 # runtime jobs are behind the existing maintenance barrier. Never reload all
 # audit rules or erase other programs' rules. Conflicts leave maintenance intact.
-PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.audit_setup prepare --project "$PROJECT_DIR"
+audit_installation prepare
 
 # Publish only after copying, dependencies, database and identity checks succeeded.
 activate_service_installation
@@ -1032,7 +1035,7 @@ crontab -u "$INSTALL_USER" "$CRON_TMP"
 local_identity_setup finish
 # Audit uses a fixed status preflight then permanently drops root. The service
 # account receives no sudo/capabilities and all DB work uses run_with_env.sh.
-PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.audit_setup activate --project "$PROJECT_DIR"
+audit_installation activate
 unset SIEM_INSTALL_MAINTENANCE
 rm -f "$CRON_TMP"
 trap - EXIT

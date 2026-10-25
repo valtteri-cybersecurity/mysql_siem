@@ -1,9 +1,3 @@
-"""Administrator-only Audit provisioning, executed only by an approved installer.
-
-Importing the module performs no system changes. Tests supply temporary paths
-and mock every service, privilege and audit command.
-"""
-
 import argparse
 import hashlib
 import json
@@ -28,6 +22,7 @@ RULES_FILE = Path('/etc/audit/rules.d/50-mysql-siem.rules')
 CONFIG_FILE = Path('/etc/audit/auditd.conf')
 UNIT_DIR = Path('/etc/systemd/system')
 UNIT_NAMES = ('mysql-siem-audit.service', 'mysql-siem-audit.timer')
+REQUIRED_TARGET_PATHS = frozenset(('/etc/passwd', '/etc/shadow', '/etc/group'))
 
 
 def read_root_text(path, maximum=1024 * 1024):
@@ -85,7 +80,45 @@ def architectures(machine=None, kernel_config=None):
     raise ValueError('Cannot determine kernel compatibility ABI support; review boot kernel configuration.')
 
 
-def rule_lines(targets, arches):
+def inspect_audit_target(path, *, kind, optional=False):
+    """Inspect a target without creating it or following the final symlink."""
+    if kind not in ('files', 'directories', 'executables'):
+        raise ValueError('Unknown Audit target kind.')
+    path = Path(path)
+    try:
+        mode = path.lstat().st_mode
+    except FileNotFoundError as error:
+        if not optional:
+            raise ValueError('Required Audit target is missing: ' + str(path)) from error
+        return 'NOT_INSTALLED'
+    except OSError as error:
+        raise ValueError('Cannot inspect Audit target: ' + str(path)) from error
+    valid = stat.S_ISDIR(mode) if kind == 'directories' else stat.S_ISREG(mode)
+    if not valid:
+        raise ValueError('Audit target has an unsupported file type: ' + str(path))
+    return 'PRESENT'
+
+
+def inspect_audit_targets(targets):
+    """Return present paths and explicit presence states for configured targets."""
+    validate_targets(targets)
+    statuses = {}
+    present = set()
+    for target in targets:
+        for kind in ('files', 'directories', 'executables'):
+            for path in target[kind]:
+                status = inspect_audit_target(
+                    path, kind=kind, optional=path not in REQUIRED_TARGET_PATHS,
+                )
+                if path in statuses and statuses[path] != status:
+                    raise ValueError('Audit target has inconsistent types: ' + path)
+                statuses[path] = status
+                if status == 'PRESENT':
+                    present.add(path)
+    return present, statuses
+
+
+def rule_lines(targets, arches, *, present_paths=None):
     validate_targets(targets)
     if not arches or any(arch not in ('b64', 'b32') for arch in arches):
         raise ValueError('Invalid Audit rule architecture.')
@@ -94,6 +127,8 @@ def rule_lines(targets, arches):
         for arch in arches:
             for kind, field in (('files', 'path'), ('directories', 'dir'), ('executables', 'exe')):
                 for path in target[kind]:
+                    if present_paths is not None and path not in present_paths:
+                        continue
                     syscall_filter = ' -S all' if kind == 'executables' else ''
                     lines.append(f'-a always,exit -F arch={arch}{syscall_filter} '
                                  f'-F {field}={path} -F perm=wa -k ' + target['audit_key'])
@@ -125,9 +160,9 @@ def rule_signature(line):
     return fields
 
 
-def verify_rules(expected, output):
+def verify_rules(expected, output, *, owned_keys=()):
     wanted = [rule_signature(line) for line in expected]
-    keys = {rule['key'] for rule in wanted}
+    keys = {rule['key'] for rule in wanted} | set(owned_keys)
     found = []
     for line in output.splitlines():
         if line.strip() in ('', 'No rules'):
@@ -147,7 +182,8 @@ def verify_rules(expected, output):
     return [line for line, signature in zip(expected, wanted) if signature not in found]
 
 
-def audit_configuration(text, group):
+def parse_audit_configuration(text):
+    """Validate syntax and duplicates without changing auditd configuration."""
     values = {}
     for line in text.splitlines():
         body = line.split('#', 1)[0].strip()
@@ -158,19 +194,37 @@ def audit_configuration(text, group):
         if not separator or key in values:
             raise ValueError('Duplicate or invalid auditd configuration; review manually.')
         values[key] = value.strip()
+    return values
+
+
+def validate_audit_log_settings(values):
     if (values.get('write_logs', 'yes').lower() != 'yes'
             or values.get('local_events', 'yes').lower() != 'yes'
             or values.get('log_format', 'raw').lower() not in ('raw', 'enriched')):
         raise ValueError('Audit requires local RAW/ENRICHED disk logging.')
+
+
+def validate_audit_log_group(values, group):
     if values.get('log_group', 'root') not in ('root', '0', group):
         raise ValueError('Existing audit log reader group must be preserved; approve a dedicated read-access plan manually.')
+
+
+def audit_logfile(values):
     logfile = values.get('log_file', '/var/log/audit/audit.log')
     if (not re.fullmatch(r'/var/log/[a-zA-Z0-9_./+-]+', logfile)
             or Path(logfile).parent == Path('/var/log') or str(Path(logfile)) != logfile
             or '..' in Path(logfile).parts):
         raise ValueError('Audit log requires a dedicated canonical directory under /var/log.')
+    return Path(logfile)
+
+
+def audit_configuration(text, group):
+    values = parse_audit_configuration(text)
+    validate_audit_log_settings(values)
+    validate_audit_log_group(values, group)
+    logfile = audit_logfile(values)
     if values.get('log_group') == group:
-        return text, Path(logfile)
+        return text, logfile
     lines = []
     for line in text.splitlines():
         if line.split('#', 1)[0].partition('=')[0].strip().lower() == 'log_group':
@@ -179,7 +233,143 @@ def audit_configuration(text, group):
             lines.append(line)
     if 'log_group' not in values:
         lines.append('log_group = ' + group)
-    return '\n'.join(lines) + '\n', Path(logfile)
+    return '\n'.join(lines) + '\n', logfile
+
+
+def inspect_audit_log_directory(logfile):
+    """Read-only check of the prerequisites grant_log_read_access expects."""
+    directory = logfile.parent
+    info = directory.lstat()  # Does not follow a symlink at the final component.
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+            or info.st_mode & 0o022):
+        raise ValueError('Audit log directory is not a trusted root-owned directory.')
+    logfile_info = logfile.lstat()
+    if (not stat.S_ISREG(logfile_info.st_mode) or logfile_info.st_uid != 0
+            or logfile_info.st_nlink != 1):
+        raise ValueError('Audit log must be a root-owned regular file with one link.')
+    for path in directory.iterdir():
+        suffix = path.name[len(logfile.name) + 1:] if path.name.startswith(logfile.name + '.') else ''
+        if path != logfile and not (suffix.isascii() and suffix.isdigit()):
+            raise ValueError('Audit log directory contains unrelated/compressed files; review access manually.')
+    return f'{directory} (root owned; no unrelated files)'
+
+
+def audit_preflight():
+    """Inspect prerequisites. No write, chmod, service change or installation.
+
+    FAIL: prerequisite does not meet the installer's requirements.
+    UNKNOWN: observation blocked, e.g. non-root access to protected config.
+    """
+    results = []
+
+    def record(name, action):
+        try:
+            detail = action()
+        except PermissionError as error:
+            results.append(('UNKNOWN', name, f'access denied: {error}'))
+            return None
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError,
+                KeyError) as error:
+            results.append(('FAIL', name, str(error)))
+            return None
+        results.append(('PASS', name, str(detail)))
+        return detail
+
+    account = record('service account', _preflight_account)
+    record('auditd executables', _preflight_executables)
+    record('auditd service', _preflight_auditd_active)
+    record('kernel ABI configuration', lambda: ', '.join(architectures()))
+    record('kernel Audit status', _preflight_kernel_audit_status)
+
+    text = record('auditd.conf integrity', lambda: read_root_text(CONFIG_FILE))
+    if text is None:
+        for name in ('audit log settings', 'audit log reader group',
+                     'audit log path', 'audit log directory'):
+            results.append(('UNKNOWN', name, 'auditd.conf cannot be inspected'))
+        return results
+
+    # Parsing is a separate observation: malformed syntax must not hide the
+    # statuses of unrelated environment prerequisites.
+    values = record('auditd.conf syntax', lambda: parse_audit_configuration(text))
+    if values is None:
+        for name in ('audit log settings', 'audit log reader group',
+                     'audit log path', 'audit log directory'):
+            results.append(('UNKNOWN', name, 'auditd.conf syntax invalid'))
+        return results
+
+    record('audit log settings', lambda: _preflight_logging(values))
+    if account is None:
+        results.append(('UNKNOWN', 'audit log reader group', 'service account unavailable'))
+    else:
+        record('audit log reader group',
+               lambda: _preflight_reader_group(values, account.pw_name))
+    logfile = record('audit log path', lambda: audit_logfile(values))
+    if logfile is None:
+        results.append(('UNKNOWN', 'audit log directory', 'log path invalid'))
+    else:
+        record('audit log directory', lambda: inspect_audit_log_directory(logfile))
+    return results
+
+
+def _preflight_account():
+    account = pwd.getpwnam('mysql_siem')
+    if account.pw_uid == 0 or account.pw_gid == 0:
+        raise ValueError('Audit requires a non-root mysql_siem account/group.')
+    return account
+
+
+def _preflight_executables():
+    absent = [name for name in ('auditd', 'auditctl', 'ausearch', 'augenrules')
+              if not os.access('/usr/sbin/' + name, os.X_OK)]
+    if absent:
+        raise ValueError('auditd executables missing or not executable: ' + ', '.join(absent))
+    return 'auditd, auditctl, ausearch, augenrules'
+
+
+def _preflight_auditd_active():
+    command(['/usr/bin/systemctl', 'is-active', '--quiet', 'auditd.service'])
+    return 'auditd.service active'
+
+
+def _preflight_kernel_audit_status():
+    # auditctl -s only reads status. Never call commands that change Audit
+    # rules, auditd settings, or the kernel audit mode in preflight.
+    output = command(['/usr/sbin/auditctl', '-s'])
+    match = re.search(r'^enabled\s+([012])\s*$', output, re.MULTILINE)
+    if not match:
+        raise ValueError('Cannot establish Linux Audit enabled status.')
+    if match.group(1) == '0':
+        raise ValueError('Linux Audit is disabled in the kernel.')
+    return ('Linux Audit active (immutable mode)' if match.group(1) == '2'
+            else 'Linux Audit active')
+
+
+def _preflight_logging(values):
+    validate_audit_log_settings(values)
+    return 'local disk logging, RAW/ENRICHED'
+
+
+def _preflight_reader_group(values, group):
+    validate_audit_log_group(values, group)
+    return f'current log_group={values.get("log_group", "root")}, allowed for {group}'
+
+
+def print_audit_preflight(results, *, stream=None):
+    if stream is None:
+        stream = sys.stdout
+    print('mysql_siem Audit environment preflight (read-only)', file=stream)
+    for status, name, detail in results:
+        # Do not print auditd.conf content or secrets.
+        if name == 'auditd.conf integrity' and status == 'PASS':
+            detail = str(CONFIG_FILE) + ' (safe root-owned file)'
+        if name == 'auditd.conf syntax' and status == 'PASS':
+            detail = 'valid configuration entries'
+        if name == 'service account' and status == 'PASS':
+            detail = 'non-root mysql_siem account'
+        print(f'[{status}] {name}: {detail}', file=stream)
+    ok = bool(results) and all(status == 'PASS' for status, _, _ in results)
+    print('Audit environment: ' + ('READY' if ok else 'NOT READY'), file=stream)
+    return ok
 
 
 def grant_log_read_access(logfile, account):
@@ -220,15 +410,13 @@ def install_audit(project, targets):
             raise ValueError('The distribution auditd package is incomplete.')
     command(['/usr/bin/systemctl', 'is-active', '--quiet', 'auditd.service'])
     source_status(time.monotonic() + 5)
-    expected = rule_lines(targets, architectures())
-    for target in targets:
-        for kind in ('files', 'directories', 'executables'):
-            for path in target[kind]:
-                mode = Path(path).lstat().st_mode
-                valid = stat.S_ISDIR(mode) if kind == 'directories' else stat.S_ISREG(mode)
-                if not valid:
-                    raise ValueError('Audit target has an unsupported file type.')
-    missing = verify_rules(expected, command(['/usr/sbin/auditctl', '-l']))
+    present_paths, target_statuses = inspect_audit_targets(targets)
+    expected = rule_lines(targets, architectures(), present_paths=present_paths)
+    owned_keys = {target['audit_key'] for target in targets}
+    for path, status in sorted(target_statuses.items()):
+        if status == 'NOT_INSTALLED':
+            print('Audit target NOT_INSTALLED (rule omitted): ' + path, file=sys.stderr)
+    missing = verify_rules(expected, command(['/usr/sbin/auditctl', '-l']), owned_keys=owned_keys)
     write_managed(RULES_FILE, MARKER + '\n'.join(expected) + '\n')
     status_text = command(['/usr/sbin/auditctl', '-s'])
     if re.search(r'^enabled\s+2\s*$', status_text, re.MULTILINE) and missing:
@@ -246,7 +434,7 @@ def install_audit(project, targets):
     grant_log_read_access(logfile, account)
     for line in missing:
         command(['/usr/sbin/auditctl', *shlex.split(line)])
-    if verify_rules(expected, command(['/usr/sbin/auditctl', '-l'])):
+    if verify_rules(expected, command(['/usr/sbin/auditctl', '-l']), owned_keys=owned_keys):
         raise ValueError('Audit rules did not become active.')
     command(['/usr/sbin/augenrules', '--check'])
     for name in UNIT_NAMES:
@@ -254,30 +442,45 @@ def install_audit(project, targets):
     # Probe OPEN/READ as the service UID; never display/copy raw log data.
     command(['/usr/sbin/runuser', '-u', account.pw_name, '--', '/usr/bin/head', '-c', '1', str(logfile)])
     digest = hashlib.sha256('\n'.join(expected).encode()).hexdigest()
-    manifest = {'version': 1, 'logfile': str(logfile), 'rules_sha256': digest}
+    manifest = {'version': 1, 'logfile': str(logfile), 'rules_sha256': digest,
+                'target_statuses': dict(sorted(target_statuses.items()))}
     atomic_write(project / 'config/audit-runtime.json', json.dumps(manifest) + '\n',
                  gid=account.pw_gid, mode=0o640)
 
 
 def main(argv=None):
+    parser = argparse.ArgumentParser(description='Prepare protected Linux Audit integration during installation.')
+    parser.add_argument('action', choices=('check', 'prepare', 'activate'))
+    parser.add_argument('--project', type=Path)
+    args = parser.parse_args(argv)
+
+    if args.action == 'check':
+        return 0 if print_audit_preflight(audit_preflight()) else 1
+
+    if args.project is None:
+        parser.error('--project is required for prepare and activate')
+
     import pymysql
 
-    parser = argparse.ArgumentParser(description='Prepare protected Linux Audit integration during installation.')
-    parser.add_argument('action', choices=('prepare', 'activate'))
-    parser.add_argument('--project', type=Path, required=True)
-    args = parser.parse_args(argv)
     connection = None
     try:
         if os.geteuid() != 0:
             raise ValueError('Audit installation requires administrator privileges.')
         trusted_directory(args.project)
         if args.action == 'activate':
+            from config.audit_launcher import validate_manifest
+
             if (installation_state.STATE_DIR / 'maintenance').exists():
                 raise ValueError('Audit activation is blocked by installation maintenance.')
-            read_root_text(args.project / 'config/audit-runtime.json')
+            manifest = json.loads(read_root_text(args.project / 'config/audit-runtime.json'))
+            validate_manifest(manifest)
             command(['/usr/bin/systemctl', 'daemon-reload'])
             command(['/usr/bin/systemctl', 'enable', '--now', 'mysql-siem-audit.timer'])
         else:
+            # Report every prerequisite before any installation write, database
+            # connection or migration. Do not relax requirements to proceed.
+            if not print_audit_preflight(audit_preflight()):
+                raise ValueError('Audit environment preflight failed; no Audit installation changes were made.')
             installation_state.require_maintenance(installation_state.STATE_DIR)
             from ingestion.audit.database import load_targets
 
@@ -293,7 +496,7 @@ def main(argv=None):
         print('Audit installation database validation failed; keep maintenance and recovery files.', file=sys.stderr)
         return 1
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-        if args.action == 'activate':
+        if args.action == 'activate' and os.geteuid() == 0:
             from database.local_identity import atomic_write
 
             atomic_write(installation_state.STATE_DIR / 'maintenance', installation_state.MAINTENANCE_TEXT, mode=0o644)

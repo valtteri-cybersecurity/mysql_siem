@@ -201,7 +201,7 @@ def test_concurrent_collectors_use_separate_locks_but_overlap_is_rejected(mysql,
         other.close()
 
 
-@pytest.mark.parametrize('version', ['018', '019'])
+@pytest.mark.parametrize('version', ['018', '019', '020'])
 @pytest.mark.parametrize('fault', ['ddl-committed', 'process-exit'])
 def test_new_migrations_resume_without_changing_history(empty_mysql, monkeypatch, version, fault):
     original = migrate.apply_one
@@ -224,9 +224,21 @@ def test_new_migrations_resume_without_changing_history(empty_mysql, monkeypatch
         with pytest.raises((SystemExit, RuntimeError)):
             migrate.migrate(empty_mysql)
     assert rows(empty_mysql, 'hosts') == history
-    assert migrate.migrate(empty_mysql) == (['018', '019'] if version == '018' else ['019'])
+    audit_targets = None
+    if version == '020':
+        with empty_mysql.cursor() as cursor:
+            cursor.execute("UPDATE audit_targets SET enabled = 0 WHERE target_name = 'passwd'")
+        empty_mysql.commit()
+        audit_targets = rows(empty_mysql, 'audit_targets')
+    remaining = []
+    for step in ('018', '019', '020'):
+        if step >= version:
+            remaining.append(step)
+    assert migrate.migrate(empty_mysql) == remaining
     assert migrate.migrate(empty_mysql) == []
     assert rows(empty_mysql, 'hosts') == history
+    if audit_targets is not None:
+        assert rows(empty_mysql, 'audit_targets') == audit_targets
 
 
 @pytest.mark.parametrize('phase', ['ready', 'database_ready', 'prepared'])
@@ -262,7 +274,7 @@ def test_old_receipt_is_read_and_safely_extended(mysql, tmp_path, monkeypatch, p
     assert set(result) == set(local_identity.LOCAL_KEYS.values()) | {local_identity.COLLECTOR_KEY}
     with mysql.cursor() as cursor:
         cursor.execute('SELECT COUNT(DISTINCT host_id), COUNT(*) FROM log_sources')
-        assert cursor.fetchone() == (1, 7)
+        assert cursor.fetchone() == (1, 8)
     assert local_identity.provision(mysql, receipt, result, **kwargs) == result
     assert json.loads(receipt.read_text())['identity'] == result
 
@@ -295,7 +307,8 @@ def test_both_cli_collectors_restore_real_mysql_state(mysql, monkeypatch):
         info = {'pid': 12, 'name': observed['name'], 'create_time': observed['created'],
                 'username': 'synthetic', 'cpu_percent': 0, 'memory_percent': 1,
                 'memory_info': SimpleNamespace(rss=1048576), 'status': 'running', 'exe': '/synthetic'}
-        return [SimpleNamespace(pid=12, info=info)]
+        return [SimpleNamespace(pid=12, info=info, cpu_percent=MagicMock(return_value=0.0),
+                                is_running=MagicMock(return_value=True))]
 
     monkeypatch.setattr(service_get.subprocess, 'run', systemctl)
     monkeypatch.setattr(process_get.psutil, 'pids', lambda: [12])

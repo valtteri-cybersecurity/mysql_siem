@@ -277,36 +277,188 @@ def reset_database(connection, settings, *, approved=False, prepare=lambda: None
             cursor.execute('SELECT RELEASE_LOCK(%s)', (LOCK_NAME,))
 
 
+def check_ufw_before_upgrade(connection):
+    """Validate legacy UFW history without changing the database."""
+
+    from database.migrate import (
+        ANALYSIS_TABLES,
+        check_ufw_utc_readiness,
+        history_counts,
+        migration_status,
+    )
+
+    # Check whether migration 017 is already complete.
+    state = migration_status(connection).get(
+        "017", (None, None)
+    )[1]
+
+    if state == "APPLIED":
+        check_ufw_utc_readiness(connection)
+        return
+
+    if state not in (None, "RUNNING", "FAILED"):
+        raise ResetError(
+            "Unknown UFW migration 017 state; upgrade stopped."
+        )
+
+    # These tables may contain historical UFW-related data.
+    tables = ("ufw_log",) + ANALYSIS_TABLES + (
+        "detection_state",
+        "detection_alerts",
+        "alert_evidence",
+    )
+
+    # Read current row counts without modifying anything.
+    counts = history_counts(connection)
+
+    # An interrupted migration may have stored older row counts.
+    # Check those too before allowing the migration to resume.
+    if state in ("RUNNING", "FAILED"):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT row_counts FROM schema_migrations "
+                "WHERE version = %s",
+                ("017",),
+            )
+            row = cursor.fetchone()
+
+        if row is None:
+            raise ResetError(
+                "UFW migration 017 ledger is missing; "
+                "upgrade stopped."
+            )
+
+        try:
+            saved = json.loads(row[0])
+
+            if not isinstance(saved, dict):
+                raise TypeError
+
+            for table in tables:
+                value = saved.get(table, 0)
+
+                if type(value) is not int or value < 0:
+                    raise ValueError
+
+                counts[table] = max(
+                    counts.get(table, 0),
+                    value,
+                )
+
+        except (TypeError, ValueError):
+            raise ResetError(
+                "UFW migration 017 history counts are invalid; "
+                "upgrade stopped."
+            ) from None
+
+    # Do not migrate ambiguous historical timestamps.
+    for table in tables:
+        if counts.get(table, 0):
+            raise ResetError(
+                "UFW-related history predates a verified UTC migration. "
+                "Upgrade stopped before schema changes. "
+                "Review historical timestamps offline; "
+                "no data was converted or deleted."
+            )
+
+
 def upgrade_database(connection, settings):
-    """Additive upgrade only; never reset identities, passwords or event history."""
-    from database.migrate import check_ufw_utc_readiness, migrate
+    """Additive upgrade without deleting existing data."""
+
+    from database.migrate import (
+        check_ufw_utc_readiness,
+        migrate,
+    )
 
     validate_settings(settings)
+
     if not database_exists(connection):
-        raise ResetError('Upgrade requires an existing local database.')
+        raise ResetError(
+            "Upgrade requires an existing local database."
+        )
+
+    # Validate MySQL version and runtime account permissions.
     with connection.cursor() as cursor:
-        cursor.execute('SELECT VERSION()')
+        cursor.execute("SELECT VERSION()")
         version = cursor.fetchone()[0]
-        if not re.match(r'^8\.(?:0|4)\.', version) or 'MariaDB' in version:
-            raise ResetError('Upgrade requires Oracle MySQL 8.0 or 8.4.')
-        cursor.execute("SHOW GRANTS FOR 'pythonuser'@'localhost'")
-        registry = {'hosts', 'log_sources', 'collectors', 'collector_sources',
-                    'sender_identities', 'sender_sources', 'sender_certificates', 'schema_migrations', 'audit_targets'}
+
+        if (
+            not re.match(r"^8\.(?:0|4)\.", version)
+            or "MariaDB" in version
+        ):
+            raise ResetError(
+                "Upgrade requires Oracle MySQL 8.0 or 8.4."
+            )
+
+        cursor.execute(
+            "SHOW GRANTS FOR 'pythonuser'@'localhost'"
+        )
+
+        registry = {
+            "hosts",
+            "log_sources",
+            "collectors",
+            "collector_sources",
+            "sender_identities",
+            "sender_sources",
+            "sender_certificates",
+            "schema_migrations",
+            "audit_targets",
+        }
+
         for (grant,) in cursor.fetchall():
-            if grant.startswith('GRANT USAGE ON *.* TO '):
+
+            if grant.startswith(
+                "GRANT USAGE ON *.* TO "
+            ):
                 continue
-            binding = re.match(r'^GRANT ([A-Z_, ]+) ON `mysql_siem`\.`(\w+)` TO ', grant)
-            if binding is None or 'WITH GRANT OPTION' in grant:
-                raise ResetError('Unsafe runtime account grants; review before upgrading.')
-            privileges = set(binding[1].split(', '))
-            allowed = {'SELECT'} if binding[2] in registry else {'SELECT', 'INSERT', 'UPDATE', 'DELETE'}
+
+            binding = re.match(
+                r"^GRANT ([A-Z_, ]+) "
+                r"ON `mysql_siem`\.`(\w+)` TO ",
+                grant,
+            )
+
+            if (
+                binding is None
+                or "WITH GRANT OPTION" in grant
+            ):
+                raise ResetError(
+                    "Unsafe runtime account grants; "
+                    "review before upgrading."
+                )
+
+            privileges = set(
+                binding[1].split(", ")
+            )
+
+            if binding[2] in registry:
+                allowed = {"SELECT"}
+            else:
+                allowed = {
+                    "SELECT",
+                    "INSERT",
+                    "UPDATE",
+                    "DELETE",
+                }
+
             if not privileges <= allowed:
-                raise ResetError('Runtime account has administrative privileges; review before upgrading.')
+                raise ResetError(
+                    "Runtime account has administrative "
+                    "privileges; review before upgrading."
+                )
+
     connection.select_db(DATABASE)
-    # Preserve the existing UFW time-basis policy: ambiguous historical databases
-    # stay offline and are never silently converted or reset by --upgrade.
-    check_ufw_utc_readiness(connection)
+
+    # NEW: Check historical data before modifying the schema.
+    # Migration 017 is not required to be complete yet.
+    check_ufw_before_upgrade(connection)
+
+    # Apply missing migrations using the existing framework.
     migrate(connection)
+
+    # REQUIRED: Verify UTC readiness after migration 017.
+    # Never bypass the existing historical timestamp policy.
     check_ufw_utc_readiness(connection)
 
 

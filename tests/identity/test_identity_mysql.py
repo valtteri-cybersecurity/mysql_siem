@@ -57,7 +57,7 @@ def ufw_line(index=0):
 
 
 def test_empty_database_and_repeat_run(empty_mysql):
-    assert migrations.migrate(empty_mysql) == ["013", "014", "015", "016", "017", "018", "019"]
+    assert migrations.migrate(empty_mysql) == ["013", "014", "015", "016", "017", "018", "019", "020"]
     assert migrations.migrate(empty_mysql) == []
     assert {state for _, state in migrations.migration_status(empty_mysql).values()} == {"APPLIED"}
 
@@ -136,7 +136,7 @@ def test_all_legacy_rows_ids_timestamps_hashes_and_counts_survive(empty_mysql):
     before = {table: snapshot(connection, table, fields) for table, fields in old_columns.items()}
     assert all(before.values()), "Every original table must contain representative history."
 
-    assert migrations.migrate(connection) == ["013", "014", "015", "016", "017", "018", "019"]
+    assert migrations.migrate(connection) == ["013", "014", "015", "016", "017", "018", "019", "020"]
 
     after = {table: snapshot(connection, table, fields) for table, fields in old_columns.items()}
     assert {table: len(rows) for table, rows in after.items()} == {table: len(rows) for table, rows in before.items()}
@@ -183,7 +183,7 @@ def test_ufw_datetime_precision_and_historical_rows(empty_mysql):
 
     connection.commit()
 
-    assert migrations.migrate(connection) == ["013", "014", "015", "016", "017", "018", "019"]
+    assert migrations.migrate(connection) == ["013", "014", "015", "016", "017", "018", "019", "020"]
 
     with connection.cursor() as cursor:
         cursor.execute(
@@ -241,7 +241,7 @@ def test_ufw_datetime_migration_recovers_after_interruption(empty_mysql, monkeyp
 
     monkeypatch.setattr(migrations, "apply_one", original_apply_one)
 
-    assert migrations.migrate(empty_mysql) == ["017", "018", "019"]
+    assert migrations.migrate(empty_mysql) == ["017", "018", "019", "020"]
     assert migrations.migrate(empty_mysql) == []
 
 
@@ -507,7 +507,7 @@ def test_running_migration_after_process_exit_can_resume(empty_mysql, monkeypatc
 
     monkeypatch.setattr(migrations, "apply_one", original)
 
-    assert migrations.migrate(empty_mysql) == ["015", "016", "017", "018", "019"]
+    assert migrations.migrate(empty_mysql) == ["015", "016", "017", "018", "019", "020"]
 
 
 def test_migrated_analysis_validators(mysql):
@@ -588,7 +588,7 @@ def test_017_running_after_process_exit_can_resume(empty_mysql, monkeypatch):
     assert migrations.migration_status(empty_mysql)["017"][1] == "RUNNING"
     assert migrations.ufw_timestamp_schema(empty_mysql) == ("datetime", 6, "YES", None)
     monkeypatch.setattr(migrations, "apply_one", original)
-    assert migrations.migrate(empty_mysql) == ["017", "018", "019"]
+    assert migrations.migrate(empty_mysql) == ["017", "018", "019", "020"]
     assert migrations.migrate(empty_mysql) == []
 
 

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import pwd
+import re
 import stat
 import sys
 import time
@@ -15,6 +16,37 @@ from pathlib import Path
 
 PROJECT = Path('/usr/local/lib/mysql_siem')
 PYTHON = '/opt/mysql_siem-venv/bin/python'
+
+
+def validate_manifest(manifest):
+    """Accept installed version-1 manifests, including optional target statuses."""
+    required = {'version', 'logfile', 'rules_sha256'}
+    allowed = required | {'target_statuses'}
+    if not isinstance(manifest, dict) or not manifest:
+        raise ValueError('Invalid Audit installation manifest.')
+    if not required <= set(manifest) or not set(manifest) <= allowed:
+        raise ValueError('Invalid Audit installation manifest fields.')
+    if type(manifest['version']) is not int or manifest['version'] != 1:
+        raise ValueError('Unsupported Audit installation manifest version.')
+    logfile = manifest['logfile']
+    if not isinstance(logfile, str) or not logfile:
+        raise ValueError('Invalid Audit log path.')
+    from config.audit_setup import audit_logfile
+
+    audit_logfile({'log_file': logfile})
+    digest = manifest['rules_sha256']
+    if not isinstance(digest, str) or re.fullmatch(r'[0-9a-f]{64}', digest) is None:
+        raise ValueError('Invalid Audit rule digest.')
+    if 'target_statuses' in manifest:
+        statuses = manifest['target_statuses']
+        if not isinstance(statuses, dict) or len(statuses) > 128:
+            raise ValueError('Invalid Audit target statuses.')
+        for path, status in statuses.items():
+            if not isinstance(path, str) or len(path) > 4096 or not path.startswith('/'):
+                raise ValueError('Invalid Audit target status path.')
+            if status not in ('PRESENT', 'NOT_INSTALLED'):
+                raise ValueError('Invalid Audit target status.')
+    return manifest
 
 
 def launch():
@@ -37,8 +69,7 @@ def launch():
     from ingestion.audit.get import source_status
 
     manifest = json.loads(read_root_text(PROJECT / 'config/audit-runtime.json'))
-    if not isinstance(manifest, dict) or set(manifest) != {'version', 'logfile', 'rules_sha256'} or manifest['version'] != 1:
-        raise ValueError('Invalid Audit installation manifest.')
+    validate_manifest(manifest)
     os.environ['PATH'] = '/usr/sbin:/usr/bin:/sbin:/bin'
     rules = read_root_text(RULES_FILE)
     if not rules.startswith(MARKER):

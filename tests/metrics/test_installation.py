@@ -95,6 +95,7 @@ def upgrade_connection(grants=None):
 def test_upgrade_never_resets_database_registry_passwords_or_checkpoints(monkeypatch):
     connection = upgrade_connection()
     calls = []
+    monkeypatch.setattr(migrate, 'migration_status', lambda _: {'017': ('checksum', 'APPLIED')})
     monkeypatch.setattr(migrate, 'migrate', lambda _: calls.append('migrate'))
     monkeypatch.setattr(migrate, 'check_ufw_utc_readiness', lambda _: calls.append('utc'))
     settings = {'DB_HOST': 'localhost', 'DB_USER': 'pythonuser', 'DB_PASSWORD': 'synthetic', 'DB_NAME': 'mysql_siem'}

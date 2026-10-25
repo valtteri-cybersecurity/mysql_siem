@@ -11,6 +11,8 @@ The project is actively evolving into a **centralized security monitoring servic
 - Port scan detection
 - DNS event collection through AdGuard Home
 - System, filesystem and security metrics
+- Process and systemd service snapshots with change history
+- Linux Audit metadata collection for passwd, shadow and sudo configuration
 - MySQL event history, security alerts and automated cron jobs
 
 ## Installation
@@ -32,6 +34,13 @@ The installer downloads the current official `main` branch and shows its commit.
 - Machine settings: `/usr/local/lib/mysql_siem/config/*.env`
 
 **Development reset installer:** if `mysql_siem` already exists, installation requires typing `RESET` and permanently deletes its events, metrics, alerts and database configuration. A fresh schema and local identities are created. File-based settings and logs are retained; the original Git clone and local changes stay untouched. Back up anything you want to keep before reinstalling. A failed reset installation keeps collection paused until a successful retry.
+
+To preserve an existing database, use `sudo bash install.sh --upgrade --role server`.
+The upgrade validates existing history and applies additive migrations. See the
+[local collector installation and acceptance checks](docs/local-collectors.md)
+for Processes, Services and Audit prerequisites, recovery and remaining host-level
+validation. Earlier platform installation tests do not establish acceptance of
+these new collectors.
 
 **Debian 13 requires a preinstalled Oracle MySQL 8.0 or 8.4 server and client**, with local administrative socket access. On Ubuntu and Mint, the installer can install MySQL when needed. MariaDB is not supported. Optional AdGuard Home integration requires separate configuration.
 

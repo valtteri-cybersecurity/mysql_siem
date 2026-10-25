@@ -1,53 +1,36 @@
-"""Linux Audit collection without database or system configuration changes.
+"""Linux Audit metadata collection and local MySQL integration.
 
-Development usage (run at the repository root):
-    python -m ingestion.audit.main
+Automatic collection uses ``collect_to_mysql`` in ``ingestion.audit.main``.
+Migration 020 supplies audit_events, audit_checkpoints and audit_targets. An
+approved local Audit identity and a source-scoped MySQL named lock are required.
+Events and the version-2 file-position checkpoint commit in one transaction;
+errors roll back both. Duplicate source/event hashes do not create extra rows.
+
+The installer prepares owned Audit rules, read access and a protected manifest.
+The systemd timer invokes a fixed launcher which verifies rules and auditd
+health, then permanently drops root before database collection. The worker
+reads retained, uncompressed audit.log rotations by device/inode/byte offset.
+Missing rotations, truncation, malformed history and kernel lost events stop
+collection without advancing the checkpoint. First start covers only retained
+uncompressed history; it cannot prove coverage before that history.
+
+Default automatic limits are 4 MiB, 1000 syscall groups and 40 seconds per batch.
+Recent or incomplete groups remain pending; the default settling delay is ten
+seconds. Stored data contains selected event metadata, never file contents,
+password hashes or raw PROCTITLE/EXECVE arguments.
+
+Development preview is a separate, nonpersistent time-window reader:
     python -m ingestion.audit.main --show-events --limit 5 --window-seconds 30
-
-API:
     from ingestion.audit.main import collect
-    result = collect(source_id="trusted-source-id", checkpoint=previous_state)
 
-The API returns Python dictionaries and UTC-aware datetimes. Only the selected
-event metadata may be stored; do not persist the raw reader output. Exit codes
-are 0 for a successful batch (including empty), 1 for failure and 130 for Ctrl-C.
-An issue-bearing batch has checkpoint=None and must not advance storage state.
+Its default window is the latest 60 seconds ending ten seconds ago, with a
+resumed two-second overlap and a shared ten-second command deadline. Its
+version-1 checkpoint is not interchangeable with automatic file positions.
+Preview does not save events or checkpoints, install rules or schedule jobs.
+Exit codes are 0 for success, 1 for failure and 130 for interruption. Automatic
+collection additionally returns 75 when another writer owns the source lock.
 
-The initial default window is the latest 60 seconds ending 10 seconds ago. An
-explicit timezone-aware start can select an older starting point. Each resumed
-window overlaps two seconds. Limits default to 1000 source syscall events, 4 MiB
-of output per command and a shared 10-second command deadline. Overflow fails
-the batch: retry the same checkpoint with a smaller window, never skip forward.
-
-Phase 2 requirements (not implemented here):
-* Persist events and the returned checkpoint in the SAME MySQL transaction.
-  Deduplicate event_hash under a trusted, stable source identity and serialize
-  writers. Convert UTC-aware times to UTC-naive only at the MySQL boundary.
-* Verify that the required audit rules, privileges and auditd disk flushing are
-  configured externally. No events is not proof that watches are installed.
-* Define an explicit first-start/recovery policy. Earlier history is deliberately
-  excluded by default. A missing retained anchor or a reboot requires recovery;
-  the collector never automatically resets progress. Kernel lost>0 also blocks
-  collection rather than silently accepting a known gap.
-* A retained event anchor detects loss through ordinary sequential rotation.
-  Without an anchor, retention coverage is unverified. It cannot prove that
-  individual records were not removed, or that missing intermediate rotations
-  exist. Add durable file/inode coverage and retention monitoring in phase 2.
-* Time windows cannot guarantee capture of arbitrarily delayed disk writes,
-  clock jumps or records arriving after the overlap. Confirm settle/overlap
-  against the deployment, and add durable log positions/replay in phase 2.
-* PATH item counts prove structural completeness, not arrival of every optional
-  record. EOE is optional. Relative paths use recorded CWD lexically; aliases,
-  symlinks and directory-FD-relative paths without sufficient PATH information
-  need deployment validation. Unknown syscall/architecture pairs stay unknown;
-  openat2 flags are a pointer and are never guessed from syscall arguments.
-
-No checkpoint files, database calls, audit rules, installations or schedules
-are created. Audit tools must already be installed. Live audit behavior must
-be verified separately on a disposable configured Linux audit host.
-
-Reader semantics were checked against the upstream sources:
-https://github.com/linux-audit/audit-userspace/blob/master/docs/ausearch.8
-https://github.com/linux-audit/audit-userspace/blob/master/src/ausearch.c
-https://github.com/linux-audit/audit-userspace/blob/master/docs/auditctl.8
+Deployment prerequisites, validation and recovery: docs/local-collectors.md.
+Real auditd rules, rotation, systemd confinement and privileges require an
+installation test on a disposable Linux host before deployment acceptance.
 """
