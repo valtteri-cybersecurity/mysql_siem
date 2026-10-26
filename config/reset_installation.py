@@ -5,6 +5,7 @@ import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -14,7 +15,7 @@ import pymysql
 
 from config import installation_state as journal
 from config.installation_role import RoleConfigurationError, get_installation_role
-from config.service_installation import InstallationError
+from config.service_installation import InstallationError, trusted_directory
 from database.migrate import LOCK_NAME, MigrationError
 
 DATABASE = 'mysql_siem'
@@ -203,20 +204,100 @@ def wait_for_legacy_jobs(processes=Path('/proc'), timeout=30):
         time.sleep(0.2)
 
 
-def validate_account(connection):
-    # Changing a shared account's password would affect other applications.
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT COUNT(*) FROM mysql.user WHERE User='pythonuser' AND Host='localhost'")
-        if cursor.fetchone()[0] == 0:
-            return
-        cursor.execute("SHOW GRANTS FOR 'pythonuser'@'localhost'")
-        for row in cursor.fetchall():
-            grant = row[0]
-            if grant.startswith('GRANT USAGE ON *.* TO '):
-                continue
-            if re.match(r'^GRANT [A-Z_, ]+ ON `mysql_siem`\.', grant):
-                continue
-            raise ResetError('pythonuser has grants outside mysql_siem or role grants; review this shared account before resetting.')
+# Maximum approved rights, matching the installer table grants. Missing rights
+# are allowed here: the normal installer grants them after schema preparation.
+RUNTIME_TABLE_PRIVILEGES = {
+    'filesystem_metrics': 'SELECT, INSERT, UPDATE',
+    'security_metrics': 'SELECT, INSERT, UPDATE',
+    'system_metrics': 'SELECT, INSERT',
+    'process_events': 'SELECT, INSERT',
+    'service_events': 'SELECT, INSERT',
+    'process_state': 'SELECT, INSERT, DELETE',
+    'service_state': 'SELECT, INSERT, DELETE',
+    'collector_snapshots': 'SELECT, INSERT, UPDATE',
+    'audit_events': 'SELECT, INSERT',
+    'audit_checkpoints': 'SELECT, INSERT, UPDATE',
+    'audit_targets': 'SELECT',
+    'analysis_ufw_ports': 'SELECT, INSERT, DELETE',
+    'analysis_ufw_traffic': 'SELECT, INSERT, UPDATE',
+    'analysis_ufw_traffic_daily': 'SELECT, INSERT, UPDATE',
+    'ufw_log': 'SELECT, INSERT',
+    'ufw_state': 'SELECT, INSERT, UPDATE',
+    'schema_migrations': 'SELECT',
+    'hosts': 'SELECT',
+    'host_groups': 'SELECT',
+    'host_group_members': 'SELECT',
+    'log_sources': 'SELECT',
+    'collectors': 'SELECT',
+    'collector_sources': 'SELECT',
+    'sender_identities': 'SELECT',
+    'sender_sources': 'SELECT',
+    'sender_certificates': 'SELECT',
+    'alert_hosts': 'SELECT, INSERT',
+    'dns_sources': 'SELECT, INSERT, UPDATE',
+    'dns_events': 'SELECT, INSERT, DELETE',
+    'dns_collection_state': 'SELECT, INSERT, UPDATE',
+    'dns_client_filters': 'SELECT, INSERT, UPDATE, DELETE',
+    'dns_domain_filters': 'SELECT, INSERT, UPDATE, DELETE',
+    'detection_rules': 'SELECT',
+    'detection_alerts': 'SELECT, INSERT, UPDATE',
+    'alert_evidence': 'SELECT, INSERT',
+    'detection_state': 'SELECT, INSERT, UPDATE',
+    'auth_events': 'SELECT, INSERT',
+    'auth_ingestion_state': 'SELECT, INSERT, UPDATE',
+}
+
+
+def validate_runtime_grants(rows):
+    """Accept complete SHOW GRANTS rows only for approved tables and rights."""
+    if not rows:
+        raise ResetError('Cannot verify pythonuser privileges: SHOW GRANTS returned no rows.')
+    for row in rows:
+        if not isinstance(row, (tuple, list)) or len(row) != 1 or not isinstance(row[0], str):
+            raise ResetError('Cannot verify pythonuser privileges: invalid SHOW GRANTS result.')
+        grant = re.fullmatch(
+            r'GRANT ([A-Z_]+(?:, *[A-Z_]+)*) ON (\*|`[a-zA-Z0-9_]+`)\.'
+            r'(\*|`[a-zA-Z0-9_]+`) TO `pythonuser`@`localhost`', row[0])
+        if grant is None:
+            raise ResetError('Unsafe runtime privileges: unsupported grant, role or GRANT OPTION for '
+                             'pythonuser@localhost. Review manually.')
+        privileges = set()
+        for privilege in grant[1].split(','):
+            privileges.add(privilege.strip())
+        schema = grant[2].strip('`')
+        table = grant[3].strip('`')
+        if privileges == {'USAGE'} and schema == '*' and table == '*':
+            continue
+        allowed = set(RUNTIME_TABLE_PRIVILEGES.get(table, '').split(', '))
+        if schema != DATABASE or table not in RUNTIME_TABLE_PRIVILEGES or not privileges <= allowed:
+            raise ResetError('Unsafe runtime privileges: unapproved rights or target for '
+                             'pythonuser@localhost. Review manually.')
+
+
+def validate_account(connection, *, allow_missing=True):
+    """Read and validate direct/implicit rights; never repair an account."""
+    try:
+        with connection.cursor() as cursor:
+            # SHOW GRANTS FOR a named account omits mandatory roles. Reject them
+            # explicitly rather than assuming an empty direct grant list is safe.
+            cursor.execute('SELECT @@GLOBAL.mandatory_roles')
+            if cursor.fetchone() != ('',):
+                raise ResetError('Cannot approve pythonuser privileges with mandatory roles or unknown role state. '
+                                 'Review manually.')
+            cursor.execute("SELECT COUNT(*) FROM mysql.user WHERE User='pythonuser' AND Host='localhost'")
+            count = cursor.fetchone()
+            if count == (0,) and allow_missing:
+                return
+            if count == (0,):
+                raise ResetError('Runtime account pythonuser@localhost is missing; upgrade requires it.')
+            if count != (1,):
+                raise ResetError('Cannot verify the runtime account; installation stopped.')
+            cursor.execute("SHOW GRANTS FOR 'pythonuser'@'localhost'")
+            rows = cursor.fetchall()
+    except pymysql.MySQLError:
+        raise ResetError('Cannot verify pythonuser privileges: MySQL account/SHOW GRANTS query failed. '
+                         'Review administrator access.') from None
+    validate_runtime_grants(rows)
 
 
 def clear_old_identity(state, project):
@@ -234,17 +315,21 @@ def clear_old_identity(state, project):
     journal.sync_directory(state)
 
 
+def check_server_version(connection):
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT VERSION()')
+        version = cursor.fetchone()[0]
+        if not re.match(r'^8\.(?:0|4)\.', version) or 'MariaDB' in version:
+            raise ResetError('The local socket must serve Oracle MySQL 8.0 or 8.4; no reset was performed.')
+
+
 def reset_database(connection, settings, *, approved=False, prepare=lambda: None):
     """Only the fixed local DB is reset; never accept a database name argument."""
     validate_settings(settings)
     exists = database_exists(connection)
     if exists and not approved:
         raise ResetError('Existing mysql_siem database requires an explicit RESET confirmation.')
-    with connection.cursor() as cursor:
-        cursor.execute('SELECT VERSION()')
-        version = cursor.fetchone()[0]
-        if not re.match(r'^8\.(?:0|4)\.', version) or 'MariaDB' in version:
-            raise ResetError('The local socket must serve Oracle MySQL 8.0 or 8.4; no reset was performed.')
+    check_server_version(connection)
     validate_account(connection)
     with connection.cursor() as cursor:
         cursor.execute('SELECT GET_LOCK(%s, 0)', (LOCK_NAME,))
@@ -362,97 +447,36 @@ def check_ufw_before_upgrade(connection):
             )
 
 
-def upgrade_database(connection, settings):
-    """Additive upgrade without deleting existing data."""
-
-    from database.migrate import (
-        check_ufw_utc_readiness,
-        migrate,
-    )
-
-    validate_settings(settings)
+def check_upgrade_database(connection):
+    """Reuse the existing read-only upgrade requirements before maintenance."""
 
     if not database_exists(connection):
         raise ResetError(
             "Upgrade requires an existing local database."
         )
 
-    # Validate MySQL version and runtime account permissions.
-    with connection.cursor() as cursor:
-        cursor.execute("SELECT VERSION()")
-        version = cursor.fetchone()[0]
-
-        if (
-            not re.match(r"^8\.(?:0|4)\.", version)
-            or "MariaDB" in version
-        ):
-            raise ResetError(
-                "Upgrade requires Oracle MySQL 8.0 or 8.4."
-            )
-
-        cursor.execute(
-            "SHOW GRANTS FOR 'pythonuser'@'localhost'"
-        )
-
-        registry = {
-            "hosts",
-            "log_sources",
-            "collectors",
-            "collector_sources",
-            "sender_identities",
-            "sender_sources",
-            "sender_certificates",
-            "schema_migrations",
-            "audit_targets",
-        }
-
-        for (grant,) in cursor.fetchall():
-
-            if grant.startswith(
-                "GRANT USAGE ON *.* TO "
-            ):
-                continue
-
-            binding = re.match(
-                r"^GRANT ([A-Z_, ]+) "
-                r"ON `mysql_siem`\.`(\w+)` TO ",
-                grant,
-            )
-
-            if (
-                binding is None
-                or "WITH GRANT OPTION" in grant
-            ):
-                raise ResetError(
-                    "Unsafe runtime account grants; "
-                    "review before upgrading."
-                )
-
-            privileges = set(
-                binding[1].split(", ")
-            )
-
-            if binding[2] in registry:
-                allowed = {"SELECT"}
-            else:
-                allowed = {
-                    "SELECT",
-                    "INSERT",
-                    "UPDATE",
-                    "DELETE",
-                }
-
-            if not privileges <= allowed:
-                raise ResetError(
-                    "Runtime account has administrative "
-                    "privileges; review before upgrading."
-                )
+    check_server_version(connection)
+    validate_account(connection, allow_missing=False)
 
     connection.select_db(DATABASE)
+    from database.migrate import check_migration_history
+
+    try:
+        check_migration_history(connection)
+    except MigrationError as error:
+        raise ResetError('Migration history preflight failed: ' + str(error)) from None
 
     # NEW: Check historical data before modifying the schema.
     # Migration 017 is not required to be complete yet.
     check_ufw_before_upgrade(connection)
+
+
+def upgrade_database(connection, settings):
+    """Additive upgrade without deleting existing data."""
+    from database.migrate import check_ufw_utc_readiness, migrate
+
+    validate_settings(settings)
+    check_upgrade_database(connection)
 
     # Apply missing migrations using the existing framework.
     migrate(connection)
@@ -462,13 +486,45 @@ def upgrade_database(connection, settings):
     check_ufw_utc_readiness(connection)
 
 
+def database_preflight(operation):
+    """Check the running local server using SELECT/SHOW only; never start it."""
+    if operation not in ('reset', 'upgrade'):
+        raise ResetError('Unknown database preflight operation.')
+    result = run_command(['/usr/bin/systemctl', 'is-active', '--quiet', 'mysql.service'])
+    if result.returncode:
+        raise ResetError('MySQL must already be running; preflight does not start services.')
+    if not stat.S_ISSOCK(Path(SOCKET).lstat().st_mode):
+        raise ResetError('The local MySQL endpoint must be a socket, not a file or symbolic link.')
+    connection = pymysql.connect(unix_socket=SOCKET, user='root', charset='utf8mb4', autocommit=True,
+                                 connect_timeout=5, read_timeout=15, write_timeout=15)
+    try:
+        if operation == 'upgrade':
+            check_upgrade_database(connection)
+        else:
+            check_server_version(connection)
+            validate_account(connection)
+    finally:
+        connection.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('reset', 'upgrade'))
+    parser.add_argument('action', choices=('check', 'reset', 'upgrade'))
+    parser.add_argument('--operation', choices=('reset', 'upgrade'), default='upgrade')
     parser.add_argument('--project', type=Path, required=True)
     args = parser.parse_args(argv)
     connection = None
     try:
+        if args.action == 'check':
+            if os.geteuid() != 0:
+                raise ResetError('Database preflight requires administrator privileges.')
+            trusted_directory(args.project)
+            validate_settings(os.environ)
+            database_preflight(args.operation)
+            if args.operation == 'reset':
+                check_system_cron()
+            print('Database preflight passed; no database or scheduler changes were made.')
+            return 0
         journal.require_maintenance(journal.STATE_DIR)
         journal.require_stage(journal.STATE_DIR, args.project)
         if get_installation_role(path=args.project / 'config/role.env') != 'server':
@@ -499,12 +555,19 @@ def main(argv=None):
         return 1
     except (OSError, ValueError, EOFError, subprocess.SubprocessError, InstallationError,
             journal.InstallationStateError):
-        print('Database setup stopped: filesystem, scheduler or maintenance validation failed. Collection remains paused.', file=sys.stderr)
+        if args.action == 'check':
+            print('Database preflight failed: filesystem or service validation failed; no database changes were made.', file=sys.stderr)
+        else:
+            print('Database setup stopped: filesystem, scheduler or maintenance validation failed. Collection remains paused.', file=sys.stderr)
         return 1
     except (pymysql.MySQLError, MigrationError) as error:
         # SQL/driver messages can contain credentials. Report the failed operation safely.
-        print('Database setup failed (' + type(error).__name__
-              + '). Collection remains paused; correct the error and rerun the installer.', file=sys.stderr)
+        if args.action == 'check':
+            print('Database preflight failed (' + type(error).__name__
+                  + '); check the local socket and administrator connection. No database changes were made.', file=sys.stderr)
+        else:
+            print('Database setup failed (' + type(error).__name__
+                  + '). Collection remains paused; correct the error and rerun the installer.', file=sys.stderr)
         return 1
     finally:
         if connection is not None:

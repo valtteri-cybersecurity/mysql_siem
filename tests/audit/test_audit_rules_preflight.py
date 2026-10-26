@@ -164,7 +164,7 @@ def test_unavailable_database_never_guesses_upgrade_targets(database):
     database[0].commit.assert_not_called()
 
 
-@pytest.mark.parametrize('fault', [None, 'targets', 'architectures', 'rules', 'rule-file'])
+@pytest.mark.parametrize('fault', [None, 'targets', 'architectures', 'rules', 'rule-file', 'unit-files'])
 def test_only_fully_verified_preflight_reports_ready(monkeypatch, capsys, fault):
     for name in ('_preflight_executables', '_preflight_auditd_active',
                  '_preflight_kernel_audit_status', '_preflight_reader_group', 'check_audit_log_access'):
@@ -172,13 +172,15 @@ def test_only_fully_verified_preflight_reports_ready(monkeypatch, capsys, fault)
     account = SimpleNamespace(pw_name='mysql_siem')
     monkeypatch.setattr(setup, '_preflight_account', Mock(return_value=account))
     monkeypatch.setattr(setup, 'managed_file_text', Mock(return_value=None))
+    monkeypatch.setattr(setup, 'preflight_audit_units', Mock(return_value='safe units'))
     monkeypatch.setattr(setup, 'architectures', Mock(return_value=['b64']))
     monkeypatch.setattr(setup, 'preflight_targets', Mock(return_value=[]))
     monkeypatch.setattr(setup, 'preflight_rules', Mock(return_value='checked'))
     monkeypatch.setattr(setup, 'read_root_text', Mock(return_value='log_group=mysql_siem\n'))
     if fault is not None:
         function = {'targets': setup.preflight_targets, 'architectures': setup.architectures,
-                    'rules': setup.preflight_rules, 'rule-file': setup.managed_file_text}[fault]
+                    'rules': setup.preflight_rules, 'rule-file': setup.managed_file_text,
+                    'unit-files': setup.preflight_audit_units}[fault]
         function.side_effect = ValueError('synthetic unavailable prerequisite')
     results = setup.audit_preflight(operation='reset')
     ready = setup.print_audit_preflight(results)

@@ -1,18 +1,21 @@
 """Exercise publication failures only in temporary trees, with fake cron/DB."""
 
 import fcntl
+import json
 import os
 import pwd
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
+from config import audit_setup
 from config import installation_state as journal
 from config import service_installation as service
+from config.audit_setup import verify_audit_activation as real_verify_audit_activation
 from database import local_identity as local
 from database.identity import IdentityError
 
@@ -24,6 +27,7 @@ def deployment(tmp_path, monkeypatch):
     monkeypatch.setattr(journal, 'require_install_lock', lambda: None)
     monkeypatch.setattr(local, 'require_stopped_legacy_jobs', lambda *args: None)
     monkeypatch.setattr(local, 'require_administrator', lambda: None)
+    monkeypatch.setattr(audit_setup, 'verify_audit_activation', Mock())
     actual_chown = os.chown
     monkeypatch.setattr(service.os, 'chown', lambda path, uid, gid: actual_chown(path, os.getuid() if uid == 0 else uid, gid))
     state = tmp_path / 'state'
@@ -85,6 +89,19 @@ def finish(layout):
                              user=layout.user, installed=layout.target, auth_reader='reader', ufw_paths=[], auth_paths=[])
 
 
+def rebuild_test_environment(layout):
+    # The installer builds a new complete environment after restaging the code.
+    record = journal.read_deployment(layout.state)
+    assert record['candidate'] is None
+    candidate = service.new_environment()
+    (candidate / 'bin').mkdir()
+    (candidate / 'bin/python').write_text('synthetic interpreter\n')
+    (candidate / 'pyvenv.cfg').write_text('synthetic environment\n')
+    record['candidate'] = str(candidate)
+    journal.save_deployment(layout.state, record)
+    layout.candidate = candidate
+
+
 def prepare_cron(layout, monkeypatch):
     text = (local.BEGIN + '\n* * * * * cd "' + str(layout.target) + '" && "'
             + str(layout.target / 'config/run_with_env.sh') + '" "'
@@ -100,11 +117,12 @@ def test_staged_credentials_and_identity_are_reused_on_retry(deployment):
     layout = deployment
     original = (layout.stage / 'config/mysql.env').read_bytes()
     resumed = service.prepare_deployment(layout.source, layout.target, layout.user, None, layout.stable, layout.state)
-    assert resumed == layout.stage
+    assert resumed != layout.stage
     assert (resumed / 'config/mysql.env').read_bytes() == original
     assert local.read_settings(resumed / 'config/identity.env') == layout.identity
     service.discard_deployment(layout.state)
     assert layout.stage.exists()  # Database-started state may never be discarded.
+    assert resumed.exists()
     assert (layout.state / 'maintenance').exists()
 
 
@@ -179,7 +197,10 @@ def test_publish_exception_restores_old_program_and_keeps_prepared_identity(depl
     assert local.read_settings(layout.target / 'config/identity.env') != layout.identity
     assert local.read_settings(layout.stage / 'config/identity.env') == layout.identity
     assert (layout.state / 'maintenance').exists()
-    assert service.prepare_deployment(layout.source, layout.target, layout.user, None, layout.stable, layout.state) == layout.stage
+    previous_stage = layout.stage
+    layout.stage = service.prepare_deployment(layout.source, layout.target, layout.user, None, layout.stable, layout.state)
+    assert layout.stage != previous_stage
+    rebuild_test_environment(layout)
     activate(layout)
     assert local.read_settings(layout.target / 'config/identity.env') == layout.identity
 
@@ -228,7 +249,7 @@ raise SystemExit('failpoint was not reached')
     assert journal.read_deployment(layout.state)['phase'] == 'publishing'
     assert (layout.state / 'maintenance').exists()
     resumed = service.prepare_deployment(layout.source, layout.target, layout.user, None, layout.stable, layout.state)
-    assert resumed == layout.stage
+    assert resumed != layout.stage
     assert (layout.target / 'app.py').read_text() == 'working program\n'
     assert 'synthetic-preserved-password' in (layout.target / 'config/mysql.env').read_text()
     assert (layout.target / 'collector.log').read_text() == 'preserved log\n'
@@ -239,18 +260,30 @@ raise SystemExit('failpoint was not reached')
         assert os.readlink(layout.stable) == str(layout.previous)
     assert 'synthetic-preserved-password' in (resumed / 'config/mysql.env').read_text()
     assert local.read_settings(layout.target / 'config/identity.env') != layout.identity
+    layout.stage = resumed
+    rebuild_test_environment(layout)
     activate(layout)
     assert (layout.target / 'app.py').read_text() == 'new program\n'
     assert local.read_settings(layout.target / 'config/identity.env') == layout.identity
 
 
-def test_retry_after_successful_publication_preserves_committed_settings(deployment, monkeypatch):
+@pytest.mark.parametrize('phase', ['activated', 'complete'])
+def test_retry_after_successful_publication_preserves_committed_settings(deployment, monkeypatch, phase):
     activate(deployment)
+    record = journal.read_deployment(deployment.state)
+    record['phase'] = phase
+    journal.save_deployment(deployment.state, record)
     resumed = service.prepare_deployment(deployment.source, deployment.target, deployment.user,
                                          None, deployment.stable, deployment.state)
     assert resumed != deployment.stage
     assert local.read_settings(resumed / 'config/identity.env') == deployment.identity
-    assert journal.read_deployment(deployment.state)['checkpoint_transition'] is True
+    record = journal.read_deployment(deployment.state)
+    assert record['checkpoint_transition'] is True
+    assert record['database_started'] is True
+    assert record['database_started_current'] is False
+    service.discard_deployment(deployment.state)
+    assert resumed.exists()
+    assert journal.read_deployment(deployment.state) == record
     assert (deployment.state / 'maintenance').exists()
     deployment.stage = resumed
     record = journal.read_deployment(deployment.state)
@@ -476,3 +509,414 @@ def test_reset_invalidates_only_old_identity_after_confirmation(deployment):
     assert (layout.state / 'maintenance').exists()
     record = journal.read_deployment(layout.state)
     assert record['identity'] == {} and record['checkpoint_transition'] is False
+
+
+@pytest.fixture(params=['legacy', 'current'])
+def unpublished(deployment, request):
+    layout = deployment
+    path = layout.state / 'deployment.json'
+    record = json.loads(path.read_text())
+    if request.param == 'legacy':
+        record.pop('database_started_current')
+    else:
+        record['database_started_current'] = True
+    journal.write_file(path, json.dumps(record, sort_keys=True) + '\n')
+    layout.target.rename(layout.target.with_name('unpublished-fixture-backup'))
+    role = layout.stage / 'config/role.env'
+    role.write_text('SIEM_ROLE=server\n')
+    role.chmod(0o600)
+    return layout
+
+
+def test_unpublished_recovery_uses_protected_journal_and_keeps_settings(unpublished):
+    layout = unpublished
+    journal_file = layout.state / 'deployment.json'
+    receipt = layout.state / 'receipt.json'
+    before = journal_file.read_bytes(), receipt.read_bytes(), (layout.stage / 'config/mysql.env').read_bytes()
+    recovered = service.check_unpublished_recovery(layout.target, layout.stable, layout.user, layout.state)
+    assert recovered == layout.stage
+    assert not layout.target.exists()
+    assert (journal_file.read_bytes(), receipt.read_bytes(), (layout.stage / 'config/mysql.env').read_bytes()) == before
+
+
+@pytest.mark.parametrize('fault', ['missing-journal', 'invalid-journal', 'wrong-user', 'wrong-target',
+                                  'wrong-stage', 'missing-receipt', 'invalid-receipt', 'prepared-receipt',
+                                  'missing-settings', 'unsafe-settings', 'wrong-role', 'no-maintenance'])
+def test_invalid_unpublished_recovery_is_rejected_without_repairs(unpublished, fault):
+    layout = unpublished
+    journal_file = layout.state / 'deployment.json'
+    record = journal.read_deployment(layout.state)
+    if fault == 'missing-journal':
+        journal_file.unlink()
+    elif fault == 'invalid-journal':
+        journal_file.write_text('{}')
+    elif fault in ('wrong-user', 'wrong-target', 'wrong-stage'):
+        key = {'wrong-user': 'user', 'wrong-target': 'target', 'wrong-stage': 'stage'}[fault]
+        record[key] = 'other-user' if key == 'user' else str(layout.state / 'wrong-location')
+        journal.save_deployment(layout.state, record)
+    elif fault == 'missing-receipt':
+        (layout.state / 'receipt.json').unlink()
+    elif fault == 'invalid-receipt':
+        (layout.state / 'receipt.json').write_text('{invalid')
+    elif fault == 'prepared-receipt':
+        receipt = local.read_receipt(layout.state / 'receipt.json')
+        receipt['phase'] = 'prepared'
+        local.save_receipt(layout.state / 'receipt.json', receipt)
+    elif fault == 'missing-settings':
+        (layout.stage / 'config/mysql.env').unlink()
+    elif fault == 'unsafe-settings':
+        (layout.stage / 'config/mysql.env').chmod(0o660)
+    elif fault == 'wrong-role':
+        (layout.stage / 'config/role.env').write_text('SIEM_ROLE=collector\n')
+    else:
+        (layout.state / 'maintenance').unlink()
+    before = journal_file.read_bytes() if journal_file.exists() else None
+    with pytest.raises((service.InstallationError, journal.InstallationStateError, OSError, ValueError)):
+        service.check_unpublished_recovery(layout.target, layout.stable, layout.user, layout.state)
+    assert (journal_file.read_bytes() if journal_file.exists() else None) == before
+    assert not layout.target.exists()
+    assert layout.stage.exists()
+
+
+@pytest.mark.parametrize('mode', ['valid', 'no-installer', 'no-runtime', 'wrong-installer'])
+def test_unpublished_recovery_requires_real_inherited_locks(unpublished, mode):
+    layout = unpublished
+    installer_lock = layout.state / 'install.lock'
+    runtime_lock = layout.state / 'runtime.lock'
+    installer_lock.touch(mode=0o600)
+    runtime_lock.touch(mode=0o644)
+    (layout.state / 'other.lock').touch(mode=0o600)
+    code = '''import fcntl, os, sys
+from pathlib import Path
+from config import installation_state as journal, service_installation as service
+state, mode = Path(sys.argv[1]), sys.argv[2]
+journal.INSTALL_LOCK = state / 'install.lock'
+service.trusted_directory = lambda path: None
+record = journal.read_deployment(state)
+service.ENVIRONMENTS = Path(record['candidate']).parent
+for number, name in ((9, 'install.lock'), (8, 'runtime.lock')):
+    try:
+        os.close(number)
+    except OSError:
+        pass
+    if (number == 9 and mode == 'no-installer') or (number == 8 and mode == 'no-runtime'):
+        continue
+    path = state / name
+    if number == 9 and mode == 'wrong-installer':
+        path = state / 'other.lock'
+    descriptor = os.open(path, os.O_RDONLY)
+    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.dup2(descriptor, number)
+    if descriptor != number:
+        os.close(descriptor)
+try:
+    service.check_unpublished_recovery(Path(record['target']), Path(record['stable']), record['user'], state)
+except journal.InstallationStateError:
+    sys.exit(17)
+'''
+    result = subprocess.run([sys.executable, '-B', '-c', code, str(layout.state), mode],
+                            capture_output=True, text=True, timeout=5, check=False)
+    assert result.returncode == (0 if mode == 'valid' else 17), result.stderr
+    assert (layout.state / 'maintenance').exists()
+
+
+@pytest.mark.parametrize('identity_missing', [False, True])
+def test_receipt_check_accepts_ready_bindings_without_reenrollment(unpublished, monkeypatch, identity_missing):
+    layout = unpublished
+    identity_path = layout.stage / 'config/identity.env'
+    if identity_missing:
+        identity_path.unlink()
+    connection = MagicMock()
+    for name in ('register_host', 'register_collector', 'register_source', 'approve_collector_source'):
+        monkeypatch.setattr(local, name, Mock(side_effect=AssertionError('Unexpected identity enrollment')))
+    before = (layout.state / 'receipt.json').read_bytes(), (layout.state / 'deployment.json').read_bytes()
+    local.check_staged_receipt(connection, layout.state, layout.stage, layout.target, layout.user)
+    assert ((layout.state / 'receipt.json').read_bytes(), (layout.state / 'deployment.json').read_bytes()) == before
+    expected_journal = journal.read_deployment(layout.state)
+    monkeypatch.setattr(local, 'identity_schema_enabled', lambda connection: True)
+    from ingestion import ufw_to_mysql
+    from ingestion.auth import collector
+
+    monkeypatch.setattr(local.pymysql, 'connect', Mock(return_value=connection))
+    monkeypatch.setenv('DB_NAME', 'synthetic')
+    monkeypatch.setattr(local, 'ssh_settings', lambda *args: ('test', '/synthetic/auth.log'))
+    monkeypatch.setattr(collector, 'get_logfiles', Mock(return_value=[]))
+    monkeypatch.setattr(ufw_to_mysql, 'get_logfiles', Mock(return_value=[]))
+    assert local.main(['prepare', '--project', str(layout.stage), '--installed', str(layout.target),
+                       '--user', layout.user]) == 0
+    assert local.read_settings(identity_path) == layout.identity
+    assert (layout.state / 'receipt.json').read_bytes() == before[0]
+    assert journal.read_deployment(layout.state) == expected_journal
+    connection.commit.assert_not_called()
+    for name in ('register_host', 'register_collector', 'register_source', 'approve_collector_source'):
+        getattr(local, name).assert_not_called()
+
+
+@pytest.mark.parametrize('fault', ['missing', 'invalid', 'prepared', 'database', 'server', 'host', 'identity-file', 'journal-identity'])
+def test_bad_receipt_or_bindings_stop_read_only_check(unpublished, fault):
+    layout = unpublished
+    path = layout.state / 'receipt.json'
+    if fault == 'missing':
+        path.unlink()
+    elif fault == 'invalid':
+        path.write_text('{}')
+    elif fault in ('prepared', 'database', 'server', 'host'):
+        receipt = local.read_receipt(path)
+        key = {'prepared': 'phase', 'host': 'host_id'}.get(fault, fault)
+        receipt[key] = 'prepared' if fault == 'prepared' else (99 if fault == 'host' else 'other')
+        local.save_receipt(path, receipt)
+    elif fault == 'identity-file':
+        local.write_settings(layout.stage / 'config/identity.env', {local.COLLECTOR_KEY: 99}, os.getgid())
+    else:
+        record = journal.read_deployment(layout.state)
+        record['identity'] = {local.COLLECTOR_KEY: 99}
+        journal.save_deployment(layout.state, record)
+    connection = MagicMock()
+    before = (layout.state / 'deployment.json').read_bytes()
+    with pytest.raises((IdentityError, ValueError)):
+        local.check_staged_receipt(connection, layout.state, layout.stage, layout.target, layout.user)
+    assert (layout.state / 'deployment.json').read_bytes() == before
+    for call in connection.cursor.return_value.__enter__.return_value.execute.call_args_list:
+        assert call.args[0].startswith('SELECT ')
+    connection.commit.assert_not_called()
+
+
+def test_old_code_is_replaced_from_source_and_recovery_evidence_is_kept(unpublished):
+    layout = unpublished
+    old_stage = layout.stage
+    (old_stage / 'app.py').write_text('obsolete staged program\n')
+    (old_stage / 'config/installed-version').write_text('a' * 40 + '\n')
+    old_record = journal.read_deployment(layout.state)
+    old_receipt = (layout.state / 'receipt.json').read_bytes()
+    old_settings = (old_stage / 'config/mysql.env').read_bytes()
+    layout.stage = service.prepare_deployment(layout.source, layout.target, layout.user, None,
+                                              layout.stable, layout.state)
+    record = journal.read_deployment(layout.state)
+    assert layout.stage != old_stage
+    for key in ('identity', 'database_started', 'checkpoint_transition'):
+        assert record[key] == old_record[key]
+    assert record['candidate'] is None
+    assert record['database_started_current'] is False
+    assert (layout.stage / 'app.py').read_bytes() == (layout.source / 'app.py').read_bytes()
+    assert (layout.stage / 'config/mysql.env').read_bytes() == old_settings
+    assert local.read_settings(layout.stage / 'config/identity.env') == layout.identity
+    assert (layout.state / 'receipt.json').read_bytes() == old_receipt
+    assert (old_stage / 'app.py').read_text() == 'obsolete staged program\n'
+    assert (old_stage / 'config/installed-version').read_text().strip() == 'a' * 40
+    assert service.check_unpublished_recovery(layout.target, layout.stable, layout.user, layout.state) == layout.stage
+    service.discard_deployment(layout.state)
+    assert layout.stage.exists()
+    assert (layout.state / 'receipt.json').read_bytes() == old_receipt
+    assert journal.read_deployment(layout.state) == record
+    installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
+    start = installer.index("printf '%s\\n' \"$SIEM_BOOTSTRAP_COMMIT\"")
+    end = installer.index('# Create or validate the database secrets file', start)
+    script = 'set -e\nPROJECT_DIR=$1\nSIEM_BOOTSTRAP_COMMIT=$2\nINSTALL_USER=test\nchown() { :; }\n' + installer[start:end]
+    result = subprocess.run(['bash', '-c', script, 'stamp-test', str(layout.stage), 'b' * 40],
+                            capture_output=True, text=True, timeout=5, check=False)
+    assert result.returncode == 0, result.stderr
+    rebuild_test_environment(layout)
+    activate(layout)
+    assert (layout.target / 'config/installed-version').read_text().strip() == 'b' * 40
+    assert (layout.target / 'app.py').read_text() == 'new program\n'
+    assert old_stage.exists()
+
+
+def test_failed_restaging_preserves_the_original_journal_and_directory(unpublished, monkeypatch):
+    layout = unpublished
+    before = (layout.state / 'deployment.json').read_bytes()
+    monkeypatch.setattr(service, 'stage_service', Mock(side_effect=OSError('synthetic copy failure')))
+    with pytest.raises(OSError, match='copy failure'):
+        service.prepare_deployment(layout.source, layout.target, layout.user, None, layout.stable, layout.state)
+    assert (layout.state / 'deployment.json').read_bytes() == before
+    assert layout.stage.exists()
+    assert (layout.state / 'receipt.json').exists()
+
+
+@pytest.mark.parametrize('fault', [None, 'database', 'missing'])
+def test_check_recovery_command_preserves_state(unpublished, monkeypatch, fault):
+    layout = unpublished
+    receipt_path = layout.state / 'receipt.json'
+    if fault == 'database':
+        receipt = local.read_receipt(receipt_path)
+        receipt['database'] = 'other'
+        local.save_receipt(receipt_path, receipt)
+    elif fault == 'missing':
+        receipt_path.unlink()
+    connection = MagicMock()
+    monkeypatch.setattr(local.pymysql, 'connect', Mock(return_value=connection))
+    monkeypatch.setenv('DB_NAME', 'synthetic')
+    prepare = Mock(side_effect=AssertionError('Unexpected identity preparation'))
+    begin = Mock(side_effect=AssertionError('Unexpected maintenance'))
+    monkeypatch.setattr(local, 'provision', prepare)
+    monkeypatch.setattr(local, 'begin_maintenance', begin)
+    before = (layout.state / 'deployment.json').read_bytes()
+    assert local.main(['check-recovery', '--project', str(layout.stage),
+                       '--installed', str(layout.target), '--user', layout.user]) == (0 if fault is None else 1)
+    prepare.assert_not_called()
+    begin.assert_not_called()
+    connection.commit.assert_not_called()
+    connection.close.assert_called_once()
+    assert (layout.state / 'deployment.json').read_bytes() == before
+    assert (layout.state / 'maintenance').exists()
+
+
+def test_failed_journal_write_preserves_old_staging(unpublished, monkeypatch):
+    layout = unpublished
+    before = (layout.state / 'deployment.json').read_bytes()
+    monkeypatch.setattr(journal, 'save_deployment', Mock(side_effect=OSError('synthetic journal failure')))
+    with pytest.raises(OSError, match='journal failure'):
+        service.prepare_deployment(layout.source, layout.target, layout.user, None, layout.stable, layout.state)
+    assert (layout.state / 'deployment.json').read_bytes() == before
+    assert layout.stage.exists()
+    assert (layout.stage / 'config/mysql.env').exists()
+    assert (layout.state / 'receipt.json').exists()
+
+
+
+def test_completed_upgrade_can_discard_only_new_pre_database_preparation(deployment, monkeypatch):
+    layout = deployment
+    activate(layout)
+    prepare_cron(layout, monkeypatch)
+    finish(layout)
+    receipt = (layout.state / 'receipt.json').read_bytes()
+    identity = (layout.target / 'config/identity.env').read_bytes()
+    stage = service.prepare_deployment(layout.source, layout.target, layout.user,
+                                       None, layout.stable, layout.state)
+    record = journal.read_deployment(layout.state)
+    assert record['database_started'] is False
+    assert record['database_started_current'] is False
+    service.discard_deployment(layout.state)
+    assert not stage.exists()
+    assert (layout.target / 'config/identity.env').read_bytes() == identity
+    assert (layout.state / 'receipt.json').read_bytes() == receipt
+    assert not (layout.state / 'maintenance').exists()
+
+
+@pytest.mark.parametrize('point', ['before', 'during', 'after', 'required', 'receipt', 'journal',
+                                   'unlink-before', 'unlink-after', 'success'])
+def test_abrupt_audit_activation_and_finish_keep_collection_guarded(deployment, monkeypatch, point):
+    layout = deployment
+    root = Path(__file__).resolve().parents[2]
+    units = layout.stage / 'config/systemd'
+    units.mkdir()
+    installed_units = layout.state / 'units'
+    installed_units.mkdir()
+    for name in audit_setup.UNIT_NAMES:
+        content = (root / 'config/systemd' / name).read_bytes()
+        (units / name).write_bytes(content)
+        (installed_units / name).write_bytes(content)
+    manifest = {'version': 1, 'logfile': '/var/log/audit/audit.log', 'rules_sha256': '0' * 64}
+    (layout.stage / 'config/audit-runtime.json').write_text(json.dumps(manifest))
+    activate(layout)
+    prepare_cron(layout, monkeypatch)
+    monkeypatch.setattr(journal, 'STATE_DIR', layout.state)
+    monkeypatch.setattr(audit_setup, 'UNIT_DIR', installed_units)
+    monkeypatch.setattr(audit_setup, 'read_root_text', lambda path: path.read_text())
+    monkeypatch.setattr(audit_setup, 'trusted_directory', Mock())
+    monkeypatch.setattr(audit_setup, 'verify_audit_activation', real_verify_audit_activation)
+    timer = layout.state / 'enabled-timer'
+    verified = layout.state / 'verified-timer'
+    error_file = layout.state / 'child-error'
+    (layout.state / 'runtime.lock').touch(mode=0o644)
+    wrapper = layout.target / 'config/run_with_env.sh'
+    wrapper.write_text((root / 'config/run_with_env.sh').read_text().replace(
+        'LOCAL_STATE_DIR=/usr/local/lib/.mysql_siem-local', 'LOCAL_STATE_DIR=' + str(layout.state)))
+
+    def command(arguments):
+        assert (layout.state / 'maintenance').exists()
+        if 'enable' in arguments:
+            timer.touch()
+            if point == 'during':
+                os._exit(77)
+        elif 'show' in arguments:
+            return 'LoadState=loaded\nFragmentPath=' + str(installed_units / arguments[-1]) + '\nDropInPaths=\n'
+        elif 'is-enabled' in arguments:
+            return 'enabled\n' if timer.exists() else 'disabled\n'
+        elif 'is-active' in arguments:
+            assert timer.exists()
+            verified.touch()
+        else:
+            assert arguments == ['/usr/bin/systemctl', 'daemon-reload']
+        return ''
+
+    monkeypatch.setattr(audit_setup, 'command', command)
+    original_write = local.atomic_write
+    original_receipt = local.save_receipt
+    original_journal = journal.save_deployment
+    original_unlink = Path.unlink
+
+    def write(path, *args, **kwargs):
+        original_write(path, *args, **kwargs)
+        if point == 'required' and path == layout.state / 'required':
+            os._exit(77)
+
+    def save_receipt(path, receipt):
+        original_receipt(path, receipt)
+        if point == 'receipt':
+            os._exit(77)
+
+    def save_journal(state, record):
+        original_journal(state, record)
+        if point == 'journal' and record['phase'] == 'complete':
+            os._exit(77)
+
+    def unlink(path, *args, **kwargs):
+        if path == layout.state / 'maintenance' and point == 'unlink-before':
+            os._exit(77)
+        original_unlink(path, *args, **kwargs)
+        if path == layout.state / 'maintenance' and point == 'unlink-after':
+            os._exit(77)
+
+    child = os.fork()
+    if child == 0:
+        try:
+            monkeypatch.setattr(local, 'atomic_write', write)
+            monkeypatch.setattr(local, 'save_receipt', save_receipt)
+            monkeypatch.setattr(journal, 'save_deployment', save_journal)
+            monkeypatch.setattr(Path, 'unlink', unlink)
+            if point == 'before':
+                os._exit(77)
+            audit_setup.activate_audit(layout.target)
+            if point == 'after':
+                os._exit(77)
+            finish(layout)
+        finally:
+            error = sys.exc_info()[1]
+            if error is not None:
+                error_file.write_text(repr(error))
+                os._exit(99)
+            os._exit(0)
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == (0 if point == 'success' else 77), (
+        error_file.read_text() if error_file.exists() else str(status))
+    released = point in ('unlink-after', 'success')
+    assert (layout.state / 'maintenance').exists() == (not released)
+    record = journal.read_deployment(layout.state)
+    if released:
+        assert record['phase'] == 'complete'
+        assert timer.exists() and verified.exists()
+        assert local.read_receipt(layout.state / 'receipt.json')['phase'] == 'ready'
+    else:
+        result = subprocess.run(['bash', str(wrapper), '/bin/echo', 'collector-must-not-run'],
+                                capture_output=True, text=True, timeout=5, check=False,
+                                env=dict(os.environ, SIEM_INSTALL_MAINTENANCE='0'))
+        assert result.returncode == 75
+        assert 'collector-must-not-run' not in result.stdout
+        if point in ('before', 'during', 'after'):
+            assert record['phase'] == 'activated'
+    assert (layout.target / 'config/identity.env').exists()
+    assert (layout.state / 'receipt.json').exists()
+
+
+def test_finish_rechecks_audit_and_keeps_all_recovery_state_on_failure(deployment, monkeypatch):
+    layout = deployment
+    activate(layout)
+    prepare_cron(layout, monkeypatch)
+    before = (layout.state / 'receipt.json').read_bytes(), (layout.state / 'deployment.json').read_bytes()
+    audit_setup.verify_audit_activation.side_effect = RuntimeError('timer is not active')
+    with pytest.raises(IdentityError, match='Audit activation is not verified'):
+        finish(layout)
+    assert ((layout.state / 'receipt.json').read_bytes(), (layout.state / 'deployment.json').read_bytes()) == before
+    assert (layout.state / 'maintenance').exists()
+    assert not (layout.state / 'required').exists()

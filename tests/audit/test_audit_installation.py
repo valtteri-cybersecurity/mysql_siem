@@ -30,8 +30,9 @@ record_python() { printf '%s\\n' "$PYTHONPATH" "$@"; return "$TEST_EXIT"; }
 
 def test_audit_preparation_and_activation_follow_maintenance_lifecycle():
     prepare = INSTALLER.index('\naudit_installation prepare\n')
-    publish = INSTALLER.index('\nlocal_identity_setup finish\n')
+    publish = INSTALLER.index('\nactivate_service_installation\n')
+    finish = INSTALLER.index('\nlocal_identity_setup finish\n')
     activate = INSTALLER.index('\naudit_installation activate\n')
     complete = INSTALLER.index('log "Installation steps completed.')
     assert INSTALLER.index('\nlocal_identity_setup prepare\n') < prepare < publish
-    assert publish < activate < complete
+    assert publish < activate < finish < complete

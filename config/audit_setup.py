@@ -287,6 +287,37 @@ def rule_signature(line):
     return fields
 
 
+
+def validate_exclude_rule(tokens):
+    """Allow exclusions only when they cannot hide required record types."""
+    exclude = False
+    for index, token in enumerate(tokens[:-1]):
+        if token in ('-a', '-A') and 'exclude' in tokens[index + 1].split(','):
+            exclude = True
+    if not exclude:
+        return
+    fields = []
+    for index, token in enumerate(tokens[:-1]):
+        if token == '-F' and tokens[index + 1].startswith('msgtype'):
+            match = re.fullmatch(r'msgtype(!=|=)([A-Z_]+|[0-9]+)', tokens[index + 1])
+            if match is None:
+                raise ValueError('Unreviewed Audit msgtype exclusion; administrator review required.')
+            value = match[2]
+            if value.isdigit():
+                value = str(int(value))
+            fields.append((match[1], value))
+    # Linux UAPI audit.h: these are the records consumed by our parser.
+    for name, number in (('SYSCALL', '1300'), ('PATH', '1302'), ('CWD', '1307')):
+        may_match = True
+        for operator, value in fields:
+            same = value in (name, number)
+            if operator == '=' and not same or operator == '!=' and same:
+                may_match = False
+        if may_match:
+            raise ValueError('An Audit exclude rule may suppress required ' + name
+                             + ' records; administrator review required.')
+
+
 def verify_rules(expected, output, *, owned_keys=()):
     wanted = [rule_signature(line) for line in expected]
     keys = {rule['key'] for rule in wanted} | set(owned_keys)
@@ -306,6 +337,7 @@ def verify_rules(expected, output, *, owned_keys=()):
             )
 
         tokens = shlex.split(line)
+        validate_exclude_rule(tokens)
         owned = False
 
         for key in keys:
@@ -559,9 +591,23 @@ def inspect_audit_log_directory(logfile):
     return f'{directory} (root owned; no unrelated files)'
 
 
-def audit_preflight(operation='upgrade'):
+def preflight_audit_units(project):
+    """Read the shipped units and their destinations; never publish them here."""
+    directory = Path(project) / 'config/systemd'
+    trusted_directory(directory)
+    for name in UNIT_NAMES:
+        content = read_root_text(directory / name)
+        if not content.startswith(MARKER):
+            raise ValueError('Shipped Audit unit lacks its management marker: ' + name)
+        managed_file_text(UNIT_DIR / name)
+    return 'Both Audit units have safe sources and managed destinations'
+
+
+def audit_preflight(operation='upgrade', project=None):
     """Inspect prerequisites without changing the system."""
     results = []
+    if project is None:
+        project = Path(__file__).resolve().parents[1]
 
     def record(name, action):
         try:
@@ -612,6 +658,8 @@ def audit_preflight(operation='upgrade'):
 
     record('persistent Audit rules destination',
            lambda: 'managed file' if managed_file_text(RULES_FILE) is not None else 'safe directory; file absent')
+
+    record('Audit systemd files', lambda: preflight_audit_units(project))
 
     targets = record('Audit target definitions (' + operation + ')', lambda: preflight_targets(operation))
     if targets is None or arches is None:
@@ -999,6 +1047,46 @@ def install_audit(project, targets):
     )
 
 
+
+def verify_audit_activation(project):
+    """Read back the protected units and persistent timer activation."""
+    from config.audit_launcher import validate_manifest
+
+    validate_manifest(json.loads(read_root_text(project / 'config/audit-runtime.json')))
+    for name in UNIT_NAMES:
+        if managed_file_text(UNIT_DIR / name) != read_root_text(project / 'config/systemd' / name):
+            raise ValueError('Installed Audit unit differs from the published service copy.')
+        output = command(['/usr/bin/systemctl', 'show', '--all',
+                          '--property=LoadState,FragmentPath,DropInPaths', name])
+        properties = {}
+        for line in output.splitlines():
+            key, separator, value = line.partition('=')
+            if not separator or key in properties:
+                raise ValueError('Cannot verify the loaded Audit unit.')
+            properties[key] = value
+        if properties != {'LoadState': 'loaded', 'FragmentPath': str(UNIT_DIR / name), 'DropInPaths': ''}:
+            raise ValueError('Audit unit is not loaded from the managed file or has unreviewed overrides.')
+    if command(['/usr/bin/systemctl', 'is-enabled', 'mysql-siem-audit.timer']).strip() != 'enabled':
+        raise ValueError('Audit timer must be persistently enabled.')
+    command(['/usr/bin/systemctl', 'is-active', '--quiet', 'mysql-siem-audit.timer'])
+
+
+def activate_audit(project):
+    """Activate only the journaled publication while all collectors stay paused."""
+    from config.audit_launcher import validate_manifest
+    from config.service_installation import verify_publication
+
+    installation_state.require_maintenance(installation_state.STATE_DIR)
+    record = installation_state.read_deployment(installation_state.STATE_DIR)
+    if record is None or record['target'] != str(project):
+        raise ValueError('Audit activation requires the journaled published installation.')
+    verify_publication(installation_state.STATE_DIR, record)
+    validate_manifest(json.loads(read_root_text(project / 'config/audit-runtime.json')))
+    command(['/usr/bin/systemctl', 'daemon-reload'])
+    command(['/usr/bin/systemctl', 'enable', '--now', 'mysql-siem-audit.timer'])
+    verify_audit_activation(project)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description='Prepare protected Linux Audit integration during installation.'
@@ -1022,7 +1110,7 @@ def main(argv=None):
     if args.action == 'check':
         return (
             0
-            if print_audit_preflight(audit_preflight(operation=args.operation))
+            if print_audit_preflight(audit_preflight(operation=args.operation, project=args.project))
             else 1
         )
 
@@ -1044,38 +1132,11 @@ def main(argv=None):
         trusted_directory(args.project)
 
         if args.action == 'activate':
-            from config.audit_launcher import validate_manifest
-
-            if (
-                installation_state.STATE_DIR / 'maintenance'
-            ).exists():
-                raise ValueError(
-                    'Audit activation is blocked by installation maintenance.'
-                )
-
-            manifest = json.loads(
-                read_root_text(
-                    args.project / 'config/audit-runtime.json'
-                )
-            )
-
-            validate_manifest(manifest)
-
-            command([
-                '/usr/bin/systemctl',
-                'daemon-reload',
-            ])
-
-            command([
-                '/usr/bin/systemctl',
-                'enable',
-                '--now',
-                'mysql-siem-audit.timer',
-            ])
+            activate_audit(args.project)
 
         else:
             if not print_audit_preflight(
-                audit_preflight(operation='upgrade')
+                audit_preflight(operation='upgrade', project=args.project)
             ):
                 raise ValueError(
                     'Audit environment preflight failed; '
@@ -1125,14 +1186,6 @@ def main(argv=None):
         RuntimeError,
         subprocess.SubprocessError,
     ) as error:
-        if args.action == 'activate' and os.geteuid() == 0:
-            from database.local_identity import atomic_write
-
-            atomic_write(
-                installation_state.STATE_DIR / 'maintenance',
-                installation_state.MAINTENANCE_TEXT,
-                mode=0o644,
-            )
 
         print(
             'Audit installation stopped: ' + str(error)

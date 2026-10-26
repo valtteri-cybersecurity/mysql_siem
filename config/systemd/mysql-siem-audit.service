@@ -1,4 +1,3 @@
-
 # Managed by mysql_siem Audit; administrator installation only.
 [Unit]
 Description=mysql_siem bounded Linux Audit collector

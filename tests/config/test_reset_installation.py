@@ -20,7 +20,7 @@ class FakeConnection:
         self.other_database = [77]
         self.statements = []
         self.version = '8.4.13'
-        self.grants = ['GRANT SELECT, INSERT ON `mysql_siem`.* TO `pythonuser`@`localhost`']
+        self.grants = ['GRANT SELECT, INSERT ON `mysql_siem`.`ufw_log` TO `pythonuser`@`localhost`']
         self.failure = None
         self.selected = None
         self.closed = False
@@ -52,6 +52,8 @@ class FakeConnection:
             return (int(self.lock_available),)
         if sql == 'SELECT VERSION()':
             return (self.version,)
+        if sql == 'SELECT @@GLOBAL.mandatory_roles':
+            return ('',)
         if 'mysql.user' in sql:
             return (1,)
         return (int(self.exists),)
@@ -129,7 +131,7 @@ def test_invalid_target_fails_before_any_sql(settings, initialized, key, value):
 def test_shared_account_is_not_changed(settings, initialized, grant):
     connection = FakeConnection(True)
     connection.grants = [grant]
-    with pytest.raises(reset.ResetError, match='outside mysql_siem'):
+    with pytest.raises(reset.ResetError, match='Unsafe runtime privileges'):
         reset.reset_database(connection, settings, approved=True)
     assert connection.events == [1, 2]
     assert not any(sql.startswith(('DROP', 'ALTER USER')) for sql, _ in connection.statements)

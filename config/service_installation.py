@@ -1,4 +1,7 @@
+"""Prepare and publish a service copy without editing the downloaded checkout."""
+
 import grp
+import json
 import os
 import pwd
 import shutil
@@ -399,6 +402,38 @@ def restore_missing_staged_settings(stage, target):
             destination.chmod(0o640 if relative == Path('config/identity.env') else 0o600)
 
 
+def check_unpublished_recovery(target, stable, user, state):
+    """Read protected recovery metadata before permitting an unpublished upgrade."""
+    from config import installation_state as journal
+
+    journal.require_maintenance(state)
+    record = journal.read_deployment(state)
+    if (record is None or record['phase'] != 'staged' or not record['database_started']
+            or target.exists() or target.is_symlink()):
+        raise InstallationError('Upgrade recovery requires an unpublished, database-started staging journal.')
+    deployment_paths(record, target, stable, user)
+    stage = Path(record['stage'])
+    trusted_directory(stage / 'config')
+    account = pwd.getpwnam(user)
+    if account.pw_uid == 0 or account.pw_gid == 0 or read_owned_role(user, path=stage / 'config/role.env') != 'server':
+        raise InstallationError('Upgrade recovery requires the existing non-root Server account and role.')
+    descriptor = os.open(stage / 'config/mysql.env', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or (info.st_uid, info.st_gid) != (account.pw_uid, account.pw_gid)
+                or stat.S_IMODE(info.st_mode) != 0o600):
+            raise InstallationError('Unsafe staged database settings; preserve the recovery files.')
+    finally:
+        os.close(descriptor)
+    receipt = json.loads(journal.read_file(state / 'receipt.json'))
+    if not isinstance(receipt, dict) or receipt.get('phase') not in ('database_ready', 'ready'):
+        raise InstallationError('A completed identity receipt is required; preserve incomplete recovery evidence.')
+    # Full receipt/binding/DB checks run with the new trusted environment, before
+    # maintenance begins or any migration runs. Never execute the old staging code.
+    return stage
+
+
 def prepare_deployment(source, target, user, role, stable, state, *, settings_source=None, reset=False):
     from config import installation_state as journal
 
@@ -425,18 +460,25 @@ def prepare_deployment(source, target, user, role, stable, state, *, settings_so
             trusted_directory(Path(record['stage']))
             restore_missing_staged_settings(Path(record['stage']), target)
             if not reset:
-                # This retry has not started database work. Preserve the older
-                # database history while clearing only the per-attempt flag.
-                record['database_started_current'] = False
-                journal.save_deployment(state, record)
-                return Path(record['stage'])
+                account = pwd.getpwnam(user)
+                stage = stage_service(source, target, account.pw_uid, account.pw_gid,
+                                      role=role, settings_source=Path(record['stage']))
+                updated = dict(record, stage=str(stage), candidate=None, cron_digest=None,
+                               database_started_current=False)
+                # Keep the old directory and durable recovery evidence. Publish
+                # the new code/settings reference only after copying succeeds.
+                journal.save_deployment(state, updated)
+                return stage
             settings_source = Path(record['stage'])
         if record['phase'] == 'staged' and not Path(record['stage']).exists() and not target.exists():
             raise InstallationError('Pending staged settings cannot be located; manual recovery required.')
         if record['phase'] == 'activated':
             verify_publication(state, record)
     account = pwd.getpwnam(user)
-    previous_database_started = bool(reset and record is not None and record['database_started'])
+    # Keep database history while resuming an unfinished maintenance period,
+    # including a failure after publication. Completed upgrades start fresh.
+    previous_database_started = bool(record is not None and record['database_started']
+                                     and (reset or (state / 'maintenance').exists()))
     if reset and target.exists():
         settings_source = target
     if settings_source is None or (target.exists() and (record is None or record['phase'] != 'staged')):
@@ -448,6 +490,29 @@ def prepare_deployment(source, target, user, role, stable, state, *, settings_so
               'cron_digest': None, 'checkpoint_transition': pending_transition}
     journal.save_deployment(state, record)
     return stage
+
+
+def preflight_deployment(project, target, stable, user, state):
+    """Validate the prepared journal/environment without starting maintenance."""
+    from config import installation_state as journal
+
+    journal.require_install_lock()
+    trusted_directory(state)
+    record = journal.read_deployment(state)
+    if record is None or record['phase'] != 'staged' or record['stage'] != str(project):
+        raise InstallationError('Preflight requires the journaled staging directory; recovery files were retained.')
+    deployment_paths(record, target, stable, user)
+    trusted_directory(project)
+    if record['candidate'] is None:
+        raise InstallationError('The prepared Python environment is missing.')
+    candidate = Path(record['candidate'])
+    validate_virtualenv(candidate)
+    if not (candidate / 'bin/python').is_file() or not (candidate / 'pyvenv.cfg').is_file():
+        raise InstallationError('The prepared Python environment is incomplete.')
+    if (state / 'maintenance').exists() or (state / 'maintenance').is_symlink():
+        # A previous maintenance period must already own the inherited locks.
+        # Do not create, remove or repair a maintenance marker in this check.
+        journal.require_maintenance(state)
 
 
 def activate_deployment(stage, target, candidate, stable, state):
@@ -683,6 +748,13 @@ def main(arguments):
             if target.exists() or target.is_symlink():
                 trusted_directory(target)
             validate_role_sources(source, target, arguments[3])
+        elif action == 'recovery-check':
+            from config.installation_state import STATE_DIR
+            check_unpublished_recovery(Path(arguments[1]), Path('/opt/mysql_siem-venv'), arguments[2], STATE_DIR)
+        elif action == 'preflight':
+            from config.installation_state import STATE_DIR
+            preflight_deployment(Path(arguments[1]), Path(arguments[2]), Path('/opt/mysql_siem-venv'),
+                                 arguments[3], STATE_DIR)
         elif action in ('snapshot-logs', 'snapshot-logs-check'):
             prepare_snapshot_logs(arguments[1], check_only=action == 'snapshot-logs-check')
         elif action == 'stage':

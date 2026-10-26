@@ -30,3 +30,4 @@ venv/
 
 # Persistent installation role
 /config/role.env
+/AGENTS.md

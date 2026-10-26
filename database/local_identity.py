@@ -256,7 +256,7 @@ def require_stopped_legacy_jobs(installed, user):
                     known_root_job = True
         if is_collection_command(command) and (owner == uid or str(installed) + '/' in command or known_root_job):
             raise IdentityError(f'A legacy mysql_siem job is still running (PID {process.name}). '
-                                'Let it finish or stop it gracefully, disable its old scheduler and rerun install.sh --role server.')
+                                'Let it finish or stop it gracefully, disable its old scheduler and rerun the same installation command (keep --upgrade when upgrading).')
 
 def validate_bindings(cursor, settings, *, complete=True):
     if COLLECTOR_KEY not in settings:
@@ -747,7 +747,7 @@ def read_crontab(user):
     result = subprocess.run(['crontab', '-u', user, '-l'], capture_output=True, text=True,
                             env=dict(os.environ, LC_ALL='C'), timeout=10, check=False)
     if result.returncode:
-        raise IdentityError('Cannot verify installed crontab; collection remains paused. Rerun install.sh --role server.')
+        raise IdentityError('Cannot verify installed crontab; collection remains paused. Rerun the same installation command (keep --upgrade when upgrading).')
     return result.stdout
 
 
@@ -809,7 +809,13 @@ def finish_maintenance(state, identity_file, connection, *, user, installed, aut
     text = read_crontab(user)
     digest = hashlib.sha256(text.encode('utf-8')).hexdigest()
     if record['cron_digest'] is None or record['cron_digest'] != digest:
-        raise IdentityError('Cron publication is missing or changed; rerun install.sh --role server. Collection remains paused.')
+        raise IdentityError('Cron publication is missing or changed; rerun the same installation command (keep --upgrade when upgrading). Collection remains paused.')
+    from config.audit_setup import verify_audit_activation
+
+    try:
+        verify_audit_activation(installed)
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        raise IdentityError('Audit activation is not verified; collection remains paused.') from None
     # Persist completion first. The public maintenance marker is always removed
     # last, and the inherited exclusive runtime lock still covers this process.
     atomic_write(state / 'required', 'Local bindings are required.\n', mode=0o644)
@@ -844,18 +850,51 @@ def require_administrator():
         raise IdentityError('Local enrollment requires administrator privileges.')
 
 
+def check_staged_receipt(connection, state, project, installed, user):
+    """Validate a completed receipt using reads only; do not enroll identities."""
+    record = installation.require_stage(state, project)
+    if record['target'] != str(installed) or record['user'] != user:
+        raise IdentityError('Recovery journal belongs to another installation.')
+    try:
+        receipt = read_receipt(state / 'receipt.json')
+    except (TypeError, AttributeError):
+        raise IdentityError('Invalid recovery receipt.') from None
+    if receipt is None or receipt['phase'] not in ('database_ready', 'ready'):
+        raise IdentityError('A completed identity receipt is required for unpublished upgrade recovery.')
+    if database_key(connection) != (receipt['database'], receipt['server']):
+        raise IdentityError('Recovery receipt belongs to another database or server.')
+    expected = receipt['identity']
+    settings = read_settings(project / 'config/identity.env')
+    for key, value in settings.items():
+        if expected.get(key) != value:
+            raise IdentityError('Staged identity settings conflict with the recovery receipt.')
+    if record['identity'] and record['identity'] != expected:
+        raise IdentityError('Journal identity settings conflict with the recovery receipt.')
+    with connection.cursor() as cursor:
+        if validate_bindings(cursor, expected) != receipt['host_id']:
+            raise IdentityError('Recovery host binding differs from the receipt.')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Prepare or verify local Server identities.')
-    parser.add_argument('action', choices=('begin', 'prepare', 'verify', 'schedule', 'finish'))
+    parser.add_argument('action', choices=('begin', 'prepare', 'verify', 'schedule', 'finish', 'check-recovery'))
     parser.add_argument('--project', type=Path, required=True)
     parser.add_argument('--installed', type=Path, default=Path('/usr/local/lib/mysql_siem'))
     parser.add_argument('--user', default='mysql_siem')
     parser.add_argument('--admin-socket', default='/run/mysqld/mysqld.sock')
     parser.add_argument('--cron-file', type=Path)
+    parser.add_argument('--operation', choices=('reset', 'upgrade'))
     parser.add_argument('--reset', action='store_true', help='Pause for a confirmed fresh-database installation.')
     args = parser.parse_args(argv)
+    retry = 'rerun the same installation command (keep --upgrade when upgrading)'
+    if args.operation is not None:
+        retry = 'rerun sudo bash install.sh --role server'
+        if args.operation == 'upgrade':
+            retry += ' --upgrade'
     connection = None
     try:
+        if args.reset and args.operation == 'upgrade':
+            raise IdentityError('Upgrade cannot request identity reset.')
         if args.action != 'verify':
             require_administrator()
         path = args.project / 'config/identity.env'
@@ -888,6 +927,10 @@ def main(argv=None):
                                      database=os.environ['DB_NAME'], charset='utf8mb4',
                                      autocommit=False, connect_timeout=5, read_timeout=30,
                                      write_timeout=30, init_command="SET time_zone = '+00:00'")
+        if args.action == 'check-recovery':
+            check_staged_receipt(connection, STATE_DIR, args.project, args.installed, args.user)
+            print('Staged receipt and database bindings verified; no database changes were made.')
+            return 0
         from ingestion.auth.collector import get_logfiles
         from ingestion.ufw_to_mysql import get_logfiles as ufw_logfiles
         reader, logfile = ssh_settings(args.project, args.user)
@@ -904,13 +947,21 @@ def main(argv=None):
             installation.mark_identity(STATE_DIR, args.project, settings)
         return 0
     except (IdentityError, installation.InstallationStateError, InstallationError) as error:
+        if args.action == 'check-recovery':
+            print('Staging recovery check failed: ' + str(error)
+                  + ' Preserve the journal, receipt and staged settings; resolve the conflict before retrying --upgrade.', file=sys.stderr)
+            return 1
         print(str(error) + ' Protected jobs remain blocked; stop any unguarded legacy jobs manually. Keep the recovery receipt, deployment journal, '
               'staged settings and backups. Correct the reported conflict, stop legacy jobs gracefully '
-              'and rerun sudo bash install.sh --role server; do not restore old cron jobs or delete the maintenance marker.', file=sys.stderr)
+              'and ' + retry + '; do not restore old cron jobs or delete the maintenance marker.', file=sys.stderr)
         return 1
     except (OSError, ValueError, KeyError, EOFError, subprocess.SubprocessError, pymysql.MySQLError):
+        if args.action == 'check-recovery':
+            print('Staging recovery check stopped. Preserve the journal, receipt and staged settings; '
+                  'review filesystem/database access before retrying --upgrade.', file=sys.stderr)
+            return 1
         print('Local identity setup stopped. Keep the maintenance marker, receipt, deployment journal and staged settings. '
-              'Resolve the filesystem/database error and rerun sudo bash install.sh --role server. '
+              'Resolve the filesystem/database error and ' + retry + '. '
               'Do not delete recovery files or enable legacy collection. If retry fails, inspect registry bindings '
               'and checkpoints manually before resuming.', file=sys.stderr)
         return 1

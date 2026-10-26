@@ -127,6 +127,36 @@ def migration_status(connection):
     return records
 
 
+def check_migration_history(connection):
+    """Validate known versions and source checksums using SELECT queries only."""
+    records = migration_status(connection)
+    known_versions = set()
+
+    for version, name, path in MIGRATIONS:
+        known_versions.add(version)
+
+    for version in records:
+        if version not in known_versions:
+            raise MigrationError(
+                "Database contains unknown migration versions; "
+                "use matching application code."
+            )
+
+    # Check existing migrations before changing the schema.
+    for version, name, path in MIGRATIONS:
+        if version in records:
+            saved_checksum = records[version][0]
+            current_checksum = checksum(path)
+
+            if saved_checksum != current_checksum:
+                raise MigrationError(
+                    f"Migration {version} checksum differs; "
+                    "restore its original source."
+                )
+
+    return records
+
+
 def ufw_timestamp_schema(connection):
     """Inspect the UFW event_time column without changing it."""
 
@@ -326,31 +356,7 @@ def migrate(connection):
                 """
             )
 
-        records = migration_status(connection)
-
-        known_versions = set()
-
-        for version, name, path in MIGRATIONS:
-            known_versions.add(version)
-
-        for version in records:
-            if version not in known_versions:
-                raise MigrationError(
-                    "Database contains unknown migration versions; "
-                    "use matching application code."
-                )
-
-        # Check existing migrations before changing the schema.
-        for version, name, path in MIGRATIONS:
-            if version in records:
-                saved_checksum = records[version][0]
-                current_checksum = checksum(path)
-
-                if saved_checksum != current_checksum:
-                    raise MigrationError(
-                        f"Migration {version} checksum differs; "
-                        "restore its original source."
-                    )
+        records = check_migration_history(connection)
 
         for version, name, path in MIGRATIONS:
             if version in records:

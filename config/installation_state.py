@@ -1,3 +1,5 @@
+"""Root-owned deployment journal and inherited installer lock checks."""
+
 import fcntl
 import json
 import os
@@ -156,7 +158,7 @@ def require_stage(state, project):
     require_maintenance(state)
     record = read_deployment(state)
     if record is None or record['phase'] != 'staged' or Path(record['stage']) != project:
-        raise InstallationStateError('prepare requires the journaled staging directory; rerun install.sh --role server.')
+        raise InstallationStateError('prepare requires the journaled staging directory; rerun the same installation command (keep --upgrade when upgrading).')
     return record
 
 

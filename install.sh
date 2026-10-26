@@ -29,6 +29,7 @@ VENV_BUILD_DIR=""
 SERVICE_PUBLISHED=0
 DATABASE_SETUP_STARTED=0
 LOCAL_DEPLOYMENT_STARTED=0
+STAGING_RECOVERY=0
 
 log()  { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -186,14 +187,14 @@ cleanup_prepared_installation() {
 # administrator confirmation. Keep the runtime lock through config and cron publication.
 local_identity_setup() {
     PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m database.local_identity "$@" \
-        --project "$PROJECT_DIR" --installed "$SERVICE_DIR" --user "$INSTALL_USER"
+        --project "$PROJECT_DIR" --installed "$SERVICE_DIR" --user "$INSTALL_USER" --operation "${INSTALL_OPERATION:-reset}"
 }
 audit_installation() {
     PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.audit_setup "$@" --project "$PROJECT_DIR"
 }
 verify_local_identity() {
     runuser -u "$INSTALL_USER" -- env PYTHONPATH="$PROJECT_DIR" \
-        "$APP_PYTHON" -m database.local_identity verify --project "$PROJECT_DIR"
+        "$APP_PYTHON" -m database.local_identity verify --project "$PROJECT_DIR" --operation "${INSTALL_OPERATION:-reset}"
 }
 
 # Platform and dependency checks (no database writes).
@@ -247,7 +248,7 @@ select_mysql_package() {
 install_dependencies() {
     local packages=(
         python3 python3-venv
-        rsyslog cron acl ca-certificates openssl coreutils
+        rsyslog cron ca-certificates openssl coreutils
     )
     if [[ -n "$MYSQL_PACKAGE" ]]; then
         packages+=("$MYSQL_PACKAGE")
@@ -643,14 +644,11 @@ done
 # Cancelled reset must not pause existing jobs or change the installed version.
 if [[ -x /usr/bin/mysql ]]; then
     EXISTING_DATABASE="$(/usr/bin/mysql --no-defaults --protocol=socket --socket=/run/mysqld/mysqld.sock \
-        --user=root --batch --skip-column-names \
+        --user=root --connect-timeout=5 --batch --skip-column-names \
         -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='mysql_siem'")" ||
         die "Cannot inspect local MySQL. Start/check the installed server before retrying; no reset was performed."
     if [[ "$EXISTING_DATABASE" == 1 && "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
-        [[ -f "$SERVICE_DIR/config/mysql.env" && -f "$SERVICE_DIR/config/identity.env" &&
-           -f /usr/local/lib/.mysql_siem-local/receipt.json ]] ||
-            die "Upgrade requires an existing protected local installation and its identity receipt."
-        log "Preserving the existing database and local identities."
+        : # Validate published or staging recovery state under the installation lock below.
     elif [[ "$EXISTING_DATABASE" == 1 ]]; then
         printf '%s\n' 'Existing local mysql_siem database detected.' \
             'Reinstallation permanently deletes all events, metrics, alerts and database records.'
@@ -678,6 +676,16 @@ if [[ -e /usr/local/lib/.mysql_siem-local/maintenance ]]; then
     flock -x -w 30 8 || die "Runtime jobs did not stop; collection remains paused."
 fi
 service_installation check "$SETTINGS_SOURCE_DIR" "$SERVICE_DIR" "$INSTALL_USER"
+if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
+    if [[ -f "$SERVICE_DIR/config/mysql.env" && -f "$SERVICE_DIR/config/identity.env" &&
+          -f /usr/local/lib/.mysql_siem-local/receipt.json ]]; then
+        log "Preserving the existing database and local identities."
+    else
+        service_installation recovery-check "$SERVICE_DIR" "$INSTALL_USER"
+        STAGING_RECOVERY=1
+        log "Using protected unpublished staging recovery; database bindings will be checked before upgrade."
+    fi
+fi
 trap cleanup_prepared_installation EXIT
 
 detect_distribution
@@ -694,30 +702,6 @@ printf '%s\n' "$SIEM_BOOTSTRAP_COMMIT" > "$PROJECT_DIR/config/installed-version"
 chown root:"$INSTALL_USER" "$PROJECT_DIR/config/installed-version"
 chmod 640 "$PROJECT_DIR/config/installed-version"
 
-# Preflight is read-only: do not start a new maintenance period or alter the
-# database when Audit configuration or snapshot-log permissions are unsuitable.
-# Audit log ownership and auditd.conf must be reviewed by an administrator.
-audit_installation check --operation "$INSTALL_OPERATION"
-service_installation snapshot-logs-check "$INSTALL_USER"
-
-# Only after successful preflight may the installer pause the collectors.
-if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
-    local_identity_setup begin
-else
-    local_identity_setup begin --reset
-fi
-exec 8< /usr/local/lib/.mysql_siem-local/runtime.lock
-flock -x -w 30 8 || die "Runtime jobs did not stop; collection remains paused."
-export SIEM_INSTALL_MAINTENANCE=1
-
-# Enable services only after the installation maintenance barrier is active.
-log "Starting services."
-systemctl enable --now mysql
-systemctl enable --now cron
-systemctl enable --now rsyslog
-
-"$APP_PYTHON" -c 'import pymysql; print("PyMySQL OK")'
-
 # Create or validate the database secrets file without following symbolic links.
 prepare_mysql_env
 
@@ -731,6 +715,31 @@ load_mysql_env "$ENV_FILE"
 [[ -n "${DB_PASSWORD:-}" ]] || die "DB_PASSWORD is missing from mysql.env."
 [[ "${DB_HOST:-}" == "localhost" ]] ||
     die "This installer requires DB_HOST=localhost."
+
+# These checks only read prepared state, MySQL and log prerequisites.
+# They must pass before starting a new maintenance period or database operation.
+service_installation preflight "$PROJECT_DIR" "$SERVICE_DIR" "$INSTALL_USER"
+PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation check --operation "$INSTALL_OPERATION" --project "$PROJECT_DIR"
+if [[ "$STAGING_RECOVERY" == 1 ]]; then
+    local_identity_setup check-recovery
+fi
+audit_installation check --operation "$INSTALL_OPERATION"
+service_installation snapshot-logs-check "$INSTALL_USER"
+
+if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
+    local_identity_setup begin
+else
+    local_identity_setup begin --reset
+fi
+exec 8< /usr/local/lib/.mysql_siem-local/runtime.lock
+flock -x -w 30 8 || die "Runtime jobs did not stop; collection remains paused."
+export SIEM_INSTALL_MAINTENANCE=1
+
+# Normal service enablement follows successful checks; never use it to pass them.
+log "Starting services."
+systemctl enable --now mysql
+systemctl enable --now cron
+systemctl enable --now rsyslog
 
 # Upgrade preserves history; the original reset path still requires explicit consent.
 DATABASE_SETUP_STARTED=1
@@ -820,6 +829,7 @@ grants = {
     "ufw_log": "SELECT, INSERT",
     "ufw_state": "SELECT, INSERT, UPDATE",
 }
+
 conn = pymysql.connect(unix_socket="/run/mysqld/mysqld.sock", user="root")
 try:
     with conn.cursor() as cur:
@@ -950,6 +960,7 @@ elif [[ "${PORT_ANALYSIS_READY:-0}" == "1" ]]; then
 elif [[ "${SOURCE_IP_ANALYSIS_READY:-0}" == "1" ]]; then
     UFW_ANALYSIS_OPTIONS="--recent-hours 2"
 fi
+
 if [[ "${TRAFFIC_ANALYSIS_READY:-0}" == "1" ]]; then
     if [[ "$UFW_ANALYSIS_OPTIONS" != "--all --recent-hours 3" ]]; then
         # --traffic combines with an explicitly selected legacy-compatible analysis.
@@ -959,6 +970,7 @@ if [[ "${TRAFFIC_ANALYSIS_READY:-0}" == "1" ]]; then
         UFW_ANALYSIS_OPTIONS="${UFW_ANALYSIS_OPTIONS:+$UFW_ANALYSIS_OPTIONS }--traffic"
     fi
 fi
+
 if [[ -n "$UFW_ANALYSIS_OPTIONS" ]]; then
     mkdir -p "$PROJECT_DIR/analysis/ufw"
     prepare_runtime_log "$PROJECT_DIR/analysis/ufw/cron.log"
@@ -1012,6 +1024,7 @@ if ! CRON_EXISTING="$(LC_ALL=C crontab -u "$INSTALL_USER" -l 2>"$CRON_TMP")"; th
         die "Cannot read the existing crontab; no cron changes were made."
     CRON_EXISTING=""
 fi
+
 printf '%s\n' "$CRON_EXISTING" |
     awk -v begin="$CRON_BEGIN" -v end="$CRON_END" -v project="$PROJECT_DIR" '
         $0 == begin { skip=1; next }
@@ -1039,10 +1052,10 @@ CRON
 
 local_identity_setup schedule --cron-file "$CRON_TMP"
 crontab -u "$INSTALL_USER" "$CRON_TMP"
-local_identity_setup finish
 # Audit uses a fixed status preflight then permanently drops root. The service
 # account receives no sudo/capabilities and all DB work uses run_with_env.sh.
 audit_installation activate
+local_identity_setup finish
 unset SIEM_INSTALL_MAINTENANCE
 rm -f "$CRON_TMP"
 trap - EXIT
