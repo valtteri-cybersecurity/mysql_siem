@@ -218,6 +218,7 @@ RUNTIME_TABLE_PRIVILEGES = {
     'audit_events': 'SELECT, INSERT',
     'audit_checkpoints': 'SELECT, INSERT, UPDATE',
     'audit_targets': 'SELECT',
+    'analysis_source_ips': 'SELECT, INSERT, DELETE',
     'analysis_ufw_ports': 'SELECT, INSERT, DELETE',
     'analysis_ufw_traffic': 'SELECT, INSERT, UPDATE',
     'analysis_ufw_traffic_daily': 'SELECT, INSERT, UPDATE',
