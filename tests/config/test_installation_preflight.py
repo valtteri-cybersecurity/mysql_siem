@@ -259,7 +259,7 @@ def test_legacy_system_cron_blocks_reset_preflight_before_maintenance(mysql, mon
     mysql.connection.close.assert_called_once()
 
 
-@pytest.mark.parametrize('scenario', ['published', 'staged', 'rejected'])
+@pytest.mark.parametrize('scenario', ['published', 'staged', 'rejected', 'missing-state', 'fresh'])
 def test_upgrade_source_gate_keeps_published_checks_and_admits_only_valid_recovery(tmp_path, scenario):
     installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
     start = installer.index('if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then\n    if [[ -f')
@@ -267,13 +267,14 @@ def test_upgrade_source_gate_keeps_published_checks_and_admits_only_valid_recove
     assert installer.index('flock -n 9') < start < installer.index('\nprepare_service_installation\n')
     target = tmp_path / 'service'
     state = tmp_path / 'state'
-    state.mkdir()
+    if scenario not in ('missing-state', 'fresh'):
+        state.mkdir()
     if scenario == 'published':
         (target / 'config').mkdir(parents=True)
         (target / 'config/mysql.env').write_text('synthetic settings\n')
         (target / 'config/identity.env').write_text('synthetic identity\n')
         (state / 'receipt.json').write_text('synthetic receipt\n')
-    block = installer[start:end].replace('/usr/local/lib/.mysql_siem-local/receipt.json', '"$TEST_STATE/receipt.json"')
+    block = installer[start:end].replace('/usr/local/lib/.mysql_siem-local', '${TEST_STATE}')
     script = '''set -euo pipefail
 INSTALL_OPERATION=upgrade
 STAGING_RECOVERY=0
@@ -281,7 +282,9 @@ INSTALL_USER=mysql_siem
 SERVICE_DIR=$1
 TEST_STATE=$2
 SCENARIO=$3
+if [[ "$SCENARIO" == fresh ]]; then INSTALL_OPERATION=reset; fi
 log() { :; }
+die() { printf '%s\\n' "$*" >&2; exit 19; }
 service_installation() {
     [[ "$1" == recovery-check ]] || exit 91
     printf 'recovery-check\\n'
@@ -290,13 +293,22 @@ service_installation() {
 ''' + block + '\nprintf "continued:%s\\n" "$STAGING_RECOVERY"\n'
     result = subprocess.run(['bash', '-c', script, 'source-test', str(target), str(state), scenario],
                             capture_output=True, text=True, timeout=5, check=False)
-    if scenario == 'rejected':
+    if scenario == 'missing-state':
+        assert result.returncode == 19
+        assert 'protected local installation state is missing' in result.stderr
+        assert 'database was preserved' in result.stderr
+        assert 'recovery-check' not in result.stdout
+        assert 'continued' not in result.stdout
+        assert not state.exists()
+    elif scenario == 'rejected':
         assert result.returncode == 17
         assert 'continued' not in result.stdout
     else:
         assert result.returncode == 0, result.stderr
-        assert result.stdout.strip().endswith('continued:' + ('0' if scenario == 'published' else '1'))
+        assert result.stdout.strip().endswith('continued:' + ('1' if scenario == 'staged' else '0'))
         assert ('recovery-check' in result.stdout) == (scenario == 'staged')
+        if scenario == 'fresh':
+            assert not state.exists()
 
 
 def test_receipt_failure_stops_unpublished_upgrade_before_new_maintenance_or_database():
@@ -381,3 +393,31 @@ def test_missing_migration_ledger_is_read_only(mysql):
     assert migrate.check_migration_history(mysql.connection) == {}
     mysql.cursor.execute.assert_called_once()
     assert mysql.cursor.execute.call_args.args[0].startswith('SELECT ')
+
+
+@pytest.mark.parametrize('exists,answer,approved', [('1', 'RESET', True), ('1', 'cancel', False), ('0', '', False)])
+def test_fresh_install_requires_explicit_reset_confirmation_for_an_existing_database(exists, answer, approved):
+    installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
+    start = installer.index('# Cancelled reset must not pause existing jobs')
+    end = installer.index('# Recheck persistent roles', start)
+    block = installer[start:end].replace('if [[ -x /usr/bin/mysql ]]; then', 'if true; then')
+    block = block.replace('/usr/bin/mysql --no-defaults', 'simulated_mysql --no-defaults')
+    prefix = r'''set -euo pipefail
+INSTALL_OPERATION=reset
+SIEM_DATABASE_RESET_APPROVED=0
+SIMULATED_EXISTS=$1
+die() { printf '%s\n' "$*" >&2; exit 19; }
+simulated_mysql() { printf '%s\n' "$SIMULATED_EXISTS"; }
+'''
+    result = subprocess.run(['bash', '-c', prefix + block + '\nprintf "approved:%s\n" "$SIEM_DATABASE_RESET_APPROVED"\n',
+                             'first-install-test', exists], input=answer + '\n',
+                            capture_output=True, text=True, timeout=5, check=False)
+    if exists == '1' and not approved:
+        assert result.returncode == 19
+        assert 'Reset cancelled' in result.stderr
+        assert 'approved:' not in result.stdout
+    else:
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip().endswith('approved:' + ('1' if approved else '0'))
+    if exists == '1':
+        assert 'Type RESET to continue' in result.stdout

@@ -406,6 +406,25 @@ def check_unpublished_recovery(target, stable, user, state):
     """Read protected recovery metadata before permitting an unpublished upgrade."""
     from config import installation_state as journal
 
+    journal.require_install_lock()
+    try:
+        state.lstat()
+    except FileNotFoundError:
+        raise InstallationError('Cannot use --upgrade: protected local installation state is missing. '
+                                'An existing database alone is not a recoverable installation. '
+                                "Preserve the database and recover this machine's own settings/state; "
+                                'do not create recovery files or copy them from another host.') from None
+    trusted_directory(state)
+    missing = []
+    for name in ('maintenance', 'deployment.json', 'receipt.json'):
+        try:
+            (state / name).lstat()
+        except FileNotFoundError:
+            missing.append(name)
+    if missing:
+        raise InstallationError('Incomplete local upgrade recovery state: missing ' + ', '.join(missing)
+                                + '. Preserve the database, staged settings and remaining recovery files; '
+                                'restore only verified files from this machine before retrying --upgrade.')
     journal.require_maintenance(state)
     record = journal.read_deployment(state)
     if (record is None or record['phase'] != 'staged' or not record['database_started']

@@ -256,8 +256,10 @@ def test_unverified_activation_never_releases_maintenance(activation, monkeypatc
     assert setup.main(['activate', '--project', str(state['project'])]) == 1
     assert (state['directory'] / 'maintenance').exists()
     assert state['writes'] == []
-    if fault in ('lock', 'publication', 'target'):
+    if fault in ('lock', 'publication', 'target', 'unit'):
         assert state['commands'] == []
+    if fault in ('lock', 'publication', 'target', 'unit', 'overrides'):
+        assert ['/usr/bin/systemctl', 'enable', '--now', 'mysql-siem-audit.timer'] not in state['commands']
 
 
 def test_nonroot_activation_does_not_attempt_privileged_state_write(installation, monkeypatch):

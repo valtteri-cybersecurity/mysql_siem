@@ -920,3 +920,36 @@ def test_finish_rechecks_audit_and_keeps_all_recovery_state_on_failure(deploymen
     assert ((layout.state / 'receipt.json').read_bytes(), (layout.state / 'deployment.json').read_bytes()) == before
     assert (layout.state / 'maintenance').exists()
     assert not (layout.state / 'required').exists()
+
+
+@pytest.mark.parametrize('missing', ['state', 'maintenance', 'deployment.json', 'receipt.json'])
+def test_missing_upgrade_state_is_diagnosed_without_creating_or_deleting_files(unpublished, missing):
+    layout = unpublished
+    settings = (layout.stage / 'config/mysql.env').read_bytes()
+    if missing == 'state':
+        retained = layout.state.with_name('retained-state')
+        layout.state.rename(retained)
+    else:
+        retained = layout.state
+        (retained / missing).rename(retained / (missing + '.retained'))
+    before = {}
+    for path in retained.iterdir():
+        if path.is_file():
+            before[path.name] = path.read_bytes()
+    with pytest.raises(service.InstallationError) as error:
+        service.check_unpublished_recovery(layout.target, layout.stable, layout.user, layout.state)
+    message = str(error.value)
+    if missing == 'state':
+        assert 'protected local installation state is missing' in message
+    else:
+        assert 'missing ' + missing in message
+    assert 'Errno 2' not in message
+    assert not layout.target.exists()
+    assert (layout.stage / 'config/mysql.env').read_bytes() == settings
+    after = {}
+    for path in retained.iterdir():
+        if path.is_file():
+            after[path.name] = path.read_bytes()
+    assert after == before
+    if missing == 'state':
+        assert not layout.state.exists()

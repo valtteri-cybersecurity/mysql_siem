@@ -680,6 +680,8 @@ if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
     if [[ -f "$SERVICE_DIR/config/mysql.env" && -f "$SERVICE_DIR/config/identity.env" &&
           -f /usr/local/lib/.mysql_siem-local/receipt.json ]]; then
         log "Preserving the existing database and local identities."
+    elif [[ ! -e /usr/local/lib/.mysql_siem-local && ! -L /usr/local/lib/.mysql_siem-local ]]; then
+        die "Cannot use --upgrade: protected local installation state is missing. An existing mysql_siem database alone is not an installed instance. The database was preserved. If its data must be kept, recover this machine's own installation/settings or arrange a reviewed legacy migration. A fresh installation without --upgrade requires an explicit RESET confirmation before replacing an existing database. Do not create recovery files manually or copy them from another host."
     else
         service_installation recovery-check "$SERVICE_DIR" "$INSTALL_USER"
         STAGING_RECOVERY=1

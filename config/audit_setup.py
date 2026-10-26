@@ -1048,8 +1048,8 @@ def install_audit(project, targets):
 
 
 
-def verify_audit_activation(project):
-    """Read back the protected units and persistent timer activation."""
+def verify_audit_units(project):
+    """Read back the protected files and their loaded systemd definitions."""
     from config.audit_launcher import validate_manifest
 
     validate_manifest(json.loads(read_root_text(project / 'config/audit-runtime.json')))
@@ -1066,6 +1066,11 @@ def verify_audit_activation(project):
             properties[key] = value
         if properties != {'LoadState': 'loaded', 'FragmentPath': str(UNIT_DIR / name), 'DropInPaths': ''}:
             raise ValueError('Audit unit is not loaded from the managed file or has unreviewed overrides.')
+
+
+def verify_audit_activation(project):
+    """Verify loaded units and persistent timer activation before release."""
+    verify_audit_units(project)
     if command(['/usr/bin/systemctl', 'is-enabled', 'mysql-siem-audit.timer']).strip() != 'enabled':
         raise ValueError('Audit timer must be persistently enabled.')
     command(['/usr/bin/systemctl', 'is-active', '--quiet', 'mysql-siem-audit.timer'])
@@ -1082,7 +1087,12 @@ def activate_audit(project):
         raise ValueError('Audit activation requires the journaled published installation.')
     verify_publication(installation_state.STATE_DIR, record)
     validate_manifest(json.loads(read_root_text(project / 'config/audit-runtime.json')))
+    # Check disk files before reloading, then loaded definitions before starting.
+    for name in UNIT_NAMES:
+        if managed_file_text(UNIT_DIR / name) != read_root_text(project / 'config/systemd' / name):
+            raise ValueError('Installed Audit unit differs from the published service copy.')
     command(['/usr/bin/systemctl', 'daemon-reload'])
+    verify_audit_units(project)
     command(['/usr/bin/systemctl', 'enable', '--now', 'mysql-siem-audit.timer'])
     verify_audit_activation(project)
 
