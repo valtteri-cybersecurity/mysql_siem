@@ -168,17 +168,14 @@ def test_first_install_does_not_prompt():
     reset.confirm_reset(True, confirm=lambda _: 'RESET')
 
 
-def test_shell_cancellation_precedes_persistent_changes(tmp_path):
+def test_shell_reset_cancellation_follows_preflight_but_precedes_maintenance(tmp_path):
     installer = (ROOT / 'install.sh').read_text()
-    block = installer.split('# Cancelled reset', 1)[1].split('# Recheck persistent roles', 1)[0]
-    block = block[block.index('\n') + 1:]
-    fake = tmp_path / 'mysql'
-    fake.write_text('#!/bin/bash\nprintf "1\n"\n')
-    fake.chmod(0o755)
-    script = 'set -eu\nSIEM_DATABASE_RESET_APPROVED=0\ndie() { echo "$*" >&2; exit 1; }\n'
-    script += block.replace('/usr/bin/mysql', str(fake))
+    start = installer.index('# Final database reset approval')
+    end = installer.index('if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then\n    local_identity_setup begin', start)
+    assert installer.index('audit_installation check --operation') < start < end
+    script = 'set -eu\nINSTALL_OPERATION=reset\nEXISTING_DATABASE=1\nSIEM_DATABASE_RESET_APPROVED=0\n'
+    script += 'die() { echo "$*" >&2; exit 1; }\n' + installer[start:end]
     script += '\nprintf "APPROVED=%s\n" "$SIEM_DATABASE_RESET_APPROVED"'
-    before = fake.read_bytes()
     cancelled = subprocess.run(['/bin/bash', '-c', script], input='no\n', capture_output=True, text=True, check=False)
     assert cancelled.returncode == 1
     assert 'cancelled' in cancelled.stderr
@@ -186,8 +183,8 @@ def test_shell_cancellation_precedes_persistent_changes(tmp_path):
     approved = subprocess.run(['/bin/bash', '-c', script], input='RESET\n', capture_output=True, text=True, check=False)
     assert approved.returncode == 0, approved.stderr
     assert 'APPROVED=1' in approved.stdout
-    assert fake.read_bytes() == before
-    assert list(tmp_path.iterdir()) == [fake]
+    assert list(tmp_path.iterdir()) == []
+
 
 
 def test_cron_pauses_only_legacy_mysql_siem_jobs(tmp_path, monkeypatch):

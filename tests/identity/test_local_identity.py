@@ -384,3 +384,18 @@ runuser() { printf '%s\n' "$*"; }
     assert len(lines) == 2
     for line in lines:
         assert '--operation ' + operation in line
+
+
+@pytest.mark.parametrize('symlink', [False, True])
+def test_audit_permission_barrier_blocks_jobs_before_identity_enrollment(tmp_path, symlink):
+    wrapper, directory = wrapper_setup(tmp_path)
+    (directory / 'runtime.lock').touch(mode=0o644)
+    pending = directory / 'audit-permissions.pending'
+    if symlink:
+        pending.symlink_to(directory / 'missing-marker')
+    else:
+        pending.write_text('Audit permission setup is incomplete.\n')
+    result = subprocess.run(['bash', str(wrapper), '/bin/echo', 'must-not-run'],
+                            capture_output=True, text=True, timeout=5, check=False)
+    assert result.returncode == 75
+    assert 'must-not-run' not in result.stdout

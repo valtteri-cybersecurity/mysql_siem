@@ -398,16 +398,14 @@ def test_missing_migration_ledger_is_read_only(mysql):
 @pytest.mark.parametrize('exists,answer,approved', [('1', 'RESET', True), ('1', 'cancel', False), ('0', '', False)])
 def test_fresh_install_requires_explicit_reset_confirmation_for_an_existing_database(exists, answer, approved):
     installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
-    start = installer.index('# Cancelled reset must not pause existing jobs')
-    end = installer.index('# Recheck persistent roles', start)
-    block = installer[start:end].replace('if [[ -x /usr/bin/mysql ]]; then', 'if true; then')
-    block = block.replace('/usr/bin/mysql --no-defaults', 'simulated_mysql --no-defaults')
+    start = installer.index('# Final database reset approval')
+    end = installer.index('if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then\n    local_identity_setup begin', start)
+    block = installer[start:end]
     prefix = r'''set -euo pipefail
 INSTALL_OPERATION=reset
 SIEM_DATABASE_RESET_APPROVED=0
-SIMULATED_EXISTS=$1
+EXISTING_DATABASE=$1
 die() { printf '%s\n' "$*" >&2; exit 19; }
-simulated_mysql() { printf '%s\n' "$SIMULATED_EXISTS"; }
 '''
     result = subprocess.run(['bash', '-c', prefix + block + '\nprintf "approved:%s\n" "$SIEM_DATABASE_RESET_APPROVED"\n',
                              'first-install-test', exists], input=answer + '\n',

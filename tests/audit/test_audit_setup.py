@@ -442,3 +442,11 @@ def test_unrelated_record_exclusions_are_accepted_and_preserved(installation, ru
     prepare(installation)
     assert rule in installation['active']
     setup.verify_rules(setup.rule_lines(installation['targets'], ['b64']), '\n'.join(installation['active']))
+
+
+def test_pending_permission_migration_blocks_timer_start(activation):
+    marker = activation['directory'] / 'audit-permissions.pending'
+    marker.write_text('Permission migration is incomplete.\n')
+    assert setup.main(['activate', '--project', str(activation['project'])]) == 1
+    assert activation['commands'] == []
+    assert (activation['directory'] / 'maintenance').exists()

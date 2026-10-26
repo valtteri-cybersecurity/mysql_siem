@@ -609,6 +609,7 @@ for path in \
     ingestion/audit/database.py \
     ingestion/audit/targets.py \
     config/audit_setup.py \
+    config/audit_permissions.py \
     config/audit_launcher.py \
     config/systemd/mysql-siem-audit.service \
     config/systemd/mysql-siem-audit.timer \
@@ -641,7 +642,7 @@ do
     [[ -f "$PROJECT_DIR/$path" ]] || die "Required file is missing: $path"
 done
 
-# Cancelled reset must not pause existing jobs or change the installed version.
+# Inspect the database without requesting destructive approval yet.
 if [[ -x /usr/bin/mysql ]]; then
     EXISTING_DATABASE="$(/usr/bin/mysql --no-defaults --protocol=socket --socket=/run/mysqld/mysqld.sock \
         --user=root --connect-timeout=5 --batch --skip-column-names \
@@ -650,12 +651,7 @@ if [[ -x /usr/bin/mysql ]]; then
     if [[ "$EXISTING_DATABASE" == 1 && "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
         : # Validate published or staging recovery state under the installation lock below.
     elif [[ "$EXISTING_DATABASE" == 1 ]]; then
-        printf '%s\n' 'Existing local mysql_siem database detected.' \
-            'Reinstallation permanently deletes all events, metrics, alerts and database records.'
-        printf 'Type RESET to continue: '
-        IFS= read -r reset_answer || die "Reset cancelled; no installation changes were made."
-        [[ "$reset_answer" == RESET ]] || die "Reset cancelled; no installation changes were made."
-        SIEM_DATABASE_RESET_APPROVED=1
+        : # Request final RESET approval only after all preflights.
     elif [[ "$EXISTING_DATABASE" != 0 ]]; then
         die "Unexpected database inspection result; reset was not attempted."
     fi
@@ -725,8 +721,19 @@ PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation check --ope
 if [[ "$STAGING_RECOVERY" == 1 ]]; then
     local_identity_setup check-recovery
 fi
-audit_installation check --operation "$INSTALL_OPERATION"
 service_installation snapshot-logs-check "$INSTALL_USER"
+audit_installation permissions --operation "$INSTALL_OPERATION"
+audit_installation check --operation "$INSTALL_OPERATION"
+
+# Final database reset approval follows successful Audit preparation and all preflights.
+if [[ "${INSTALL_OPERATION:-reset}" == reset && "${EXISTING_DATABASE:-0}" == 1 ]]; then
+        printf '%s\n' 'Existing local mysql_siem database detected.' \
+            'Reinstallation permanently deletes all events, metrics, alerts and database records.'
+        printf 'Type RESET to continue: '
+        IFS= read -r reset_answer || die "Reset cancelled; Audit preparation may already have completed; no database reset was performed."
+        [[ "$reset_answer" == RESET ]] || die "Reset cancelled; Audit preparation may already have completed; no database reset was performed."
+        SIEM_DATABASE_RESET_APPROVED=1
+fi
 
 if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
     local_identity_setup begin

@@ -175,7 +175,8 @@ def test_role_checks_precede_mutations_and_initialization_precedes_packages():
 
     assert '-m config.reset_installation reset' in INSTALLER
     assert 'DATABASE_CREATED_THIS_RUN' not in INSTALLER
-    assert INSTALLER.index('Type RESET to continue:') < INSTALLER.index('\nensure_application_user\n')
+    assert INSTALLER.index('audit_installation check --operation') < INSTALLER.index('Type RESET to continue:')
+    assert INSTALLER.index('Type RESET to continue:') < INSTALLER.index('    local_identity_setup begin --reset')
 
 
 

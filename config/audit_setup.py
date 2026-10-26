@@ -1070,6 +1070,9 @@ def verify_audit_units(project):
 
 def verify_audit_activation(project):
     """Verify loaded units and persistent timer activation before release."""
+    pending = installation_state.STATE_DIR / 'audit-permissions.pending'
+    if pending.exists() or pending.is_symlink():
+        raise ValueError('Audit permission preparation is incomplete; activation is not verified.')
     verify_audit_units(project)
     if command(['/usr/bin/systemctl', 'is-enabled', 'mysql-siem-audit.timer']).strip() != 'enabled':
         raise ValueError('Audit timer must be persistently enabled.')
@@ -1082,6 +1085,9 @@ def activate_audit(project):
     from config.service_installation import verify_publication
 
     installation_state.require_maintenance(installation_state.STATE_DIR)
+    pending = installation_state.STATE_DIR / 'audit-permissions.pending'
+    if pending.exists() or pending.is_symlink():
+        raise ValueError('Audit permission preparation is incomplete; activation stays blocked.')
     record = installation_state.read_deployment(installation_state.STATE_DIR)
     if record is None or record['target'] != str(project):
         raise ValueError('Audit activation requires the journaled published installation.')
@@ -1104,7 +1110,7 @@ def main(argv=None):
 
     parser.add_argument(
         'action',
-        choices=('check', 'prepare', 'activate'),
+        choices=('check', 'prepare', 'activate', 'permissions'),
     )
 
     parser.add_argument('--operation', choices=('reset', 'upgrade'), default='upgrade',
@@ -1116,6 +1122,19 @@ def main(argv=None):
     )
 
     args = parser.parse_args(argv)
+
+    if args.action == 'permissions':
+        if args.project is None:
+            parser.error('--project is required for permission preparation')
+        from config.audit_permissions import prepare_permissions
+
+        try:
+            prepare_permissions(args.project, args.operation)
+            return 0
+        except (OSError, ValueError, TypeError, RuntimeError, KeyError, EOFError, subprocess.SubprocessError) as error:
+            print('Audit permission preparation stopped: ' + str(error)
+                  + ' Keep any Audit permission backup and pending marker; retry the same installer after review.', file=sys.stderr)
+            return 1
 
     if args.action == 'check':
         return (

@@ -107,6 +107,10 @@ load_adguard_env() {
 
 # Local identity maintenance barrier. The descriptor survives exec of every job.
 LOCAL_STATE_DIR=/usr/local/lib/.mysql_siem-local
+if [[ -e "$LOCAL_STATE_DIR/audit-permissions.pending" || -L "$LOCAL_STATE_DIR/audit-permissions.pending" ]]; then
+    printf 'Audit permission preparation is incomplete; job skipped.\n' >&2
+    exit 75
+fi
 if [[ "$EUID" == 0 && "${SIEM_INSTALL_MAINTENANCE:-}" == 1 ]]; then
     /usr/bin/python3 -I -B - "$PROJECT_DIR" "$LOCAL_STATE_DIR" <<'PY_MAINTENANCE'
 import sys
@@ -116,7 +120,7 @@ from config.installation_state import require_maintenance
 require_maintenance(Path(sys.argv[2]))
 PY_MAINTENANCE
 else
-    if [[ -e "$LOCAL_STATE_DIR/required" || -e "$LOCAL_STATE_DIR/deployment.json" || -e "$LOCAL_STATE_DIR/maintenance" ]]; then
+    if [[ -e "$LOCAL_STATE_DIR/required" || -e "$LOCAL_STATE_DIR/deployment.json" || -e "$LOCAL_STATE_DIR/maintenance" || -e "$LOCAL_STATE_DIR/audit-permissions.pending" || -L "$LOCAL_STATE_DIR/audit-permissions.pending" ]]; then
         [[ -f "$LOCAL_STATE_DIR/runtime.lock" && ! -L "$LOCAL_STATE_DIR/runtime.lock" ]] || {
             printf 'Required runtime lock is missing; job skipped.\n' >&2; exit 75;
         }
@@ -126,7 +130,7 @@ else
         exec 8< "$LOCAL_STATE_DIR/runtime.lock"
         flock -s -n 8 || { printf 'Local identity maintenance: job skipped.\n' >&2; exit 75; }
     fi
-    [[ ! -e "$LOCAL_STATE_DIR/maintenance" ]] || { printf 'Local identity setup is incomplete; job skipped.\n' >&2; exit 75; }
+    [[ ! -e "$LOCAL_STATE_DIR/maintenance" && ! -e "$LOCAL_STATE_DIR/audit-permissions.pending" && ! -L "$LOCAL_STATE_DIR/audit-permissions.pending" ]] || { printf 'Local identity setup is incomplete; job skipped.\n' >&2; exit 75; }
 fi
 
 load_mysql_env "$PROJECT_DIR/config/mysql.env"

@@ -4,6 +4,7 @@ Description=mysql_siem bounded Linux Audit collector
 After=auditd.service mysql.service
 Requires=auditd.service
 ConditionPathExists=!/usr/local/lib/.mysql_siem-local/maintenance
+ConditionPathExists=!/usr/local/lib/.mysql_siem-local/audit-permissions.pending
 
 [Service]
 Type=oneshot
