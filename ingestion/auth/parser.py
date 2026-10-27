@@ -120,6 +120,8 @@ def parse_event_fields(process, message):
             if message.startswith(("Accepted password ", "Accepted publickey ",
                                    "Failed password ", "Failed publickey ")):
                 raise AuthParseError("A supported SSH event has an invalid format.")
+            if message.startswith(("Accepted ", "Failed ")):
+                raise AuthParseError("An SSH authentication outcome has an unsupported method or format.")
             return None
         extra = match["extra"]
         if match["method"] == "publickey" and extra.startswith(": "):

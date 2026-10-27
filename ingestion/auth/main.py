@@ -10,7 +10,6 @@ import sys
 from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pymysql
 
@@ -19,9 +18,10 @@ from database.connection import get_connection
 from ingestion.auth.collector import (
     AuthCollectionBusy,
     AuthCollectionError,
+    check_source_format,
     collect_auth_events,
 )
-from ingestion.auth.parser import AuthParseError
+from ingestion.auth.parser import AuthParseError, validate_syslog_context
 
 
 def stop_collection(signum, frame):
@@ -34,6 +34,8 @@ def main(argv=None):
     parser.add_argument("--logfile", default=os.getenv("SSH_AUTH_LOGFILE", "/var/log/auth.log"))
     parser.add_argument("--collector-id", default=os.getenv("SSH_AUTH_COLLECTOR_ID") or socket.gethostname())
     parser.add_argument("--allow-missing-source", action="store_true", help="Report a missing source as SKIPPED.")
+    parser.add_argument("--check-source", action="store_true",
+                        help="Check a bounded timestamp sample without a database or writes.")
     parser.add_argument("--max-lines", type=int, default=5000)
     parser.add_argument("--max-seconds", type=float, default=os.getenv("SSH_AUTH_MAX_SECONDS", "30"))
     parser.add_argument("--syslog-start", default=os.getenv("SSH_AUTH_SYSLOG_START") or None,
@@ -55,13 +57,9 @@ def main(argv=None):
         try:
             args.syslog_start = datetime.fromisoformat(args.syslog_start.replace("Z", "+00:00"))
             args.syslog_end = datetime.fromisoformat(args.syslog_end.replace("Z", "+00:00"))
-            if args.syslog_start.utcoffset() is None or args.syslog_end.utcoffset() is None:
-                raise ValueError("Missing timezone.")
-            duration = (args.syslog_end - args.syslog_start).total_seconds()
-            if not 0 < duration <= 366 * 86400:
-                raise ValueError("Invalid interval.")
-            args.syslog_timezone = ZoneInfo(args.syslog_timezone)
-        except (ValueError, OverflowError, ZoneInfoNotFoundError):
+            args.syslog_start, args.syslog_end, args.syslog_timezone = validate_syslog_context(
+                args.syslog_start, args.syslog_end, args.syslog_timezone)
+        except (ValueError, OverflowError):
             parser.error("Invalid administrator-verified syslog context; maximum interval is 366 days.")
     try:
         logger, handler = open_log("mysql_siem.auth_collection", args.log_file)
@@ -76,6 +74,16 @@ def main(argv=None):
         if args.allow_missing_source and not Path(args.logfile).exists():
             report(logger, "Status: SKIPPED - Auth log source is absent; collection state unchanged.")
             return 0
+        if args.check_source:
+            result = check_source_format(args.logfile, syslog_start=args.syslog_start,
+                                         syslog_end=args.syslog_end,
+                                         syslog_timezone=args.syslog_timezone)
+            report(logger, f"Source timestamp sample: {result['lines_checked']} complete lines; {result['timestamps_checked']} timestamps verified.")
+            if result["timestamps_checked"] == 0:
+                report(logger, "Source timestamp check: INCONCLUSIVE - no timestamped complete records in the bounded sample.")
+                return 2
+            report(logger, "Source timestamp check: SUCCESS - bounded sample only; no collection state changed.")
+            return 0
         with redirect_stdout(io.StringIO()):
             connection = get_connection()
         if connection is None:
@@ -88,7 +96,10 @@ def main(argv=None):
                                      syslog_timezone=args.syslog_timezone)
         report(logger, f"New auth events: {result['inserted']}; skipped lines: {result['skipped']}")
         report(logger, "Collection state updated: YES")
-        if stats.get("budget_exhausted"):
+        if stats.get("coverage_gaps"):
+            report(logger, "Auth coverage gap: compressed or missing rotations or a source reset prevent verification of complete history.", error=True)
+            report(logger, "Status: PARTIAL - available records committed; historical coverage is unverified.")
+        elif stats.get("budget_exhausted"):
             report(logger, "Status: PARTIAL - collection budget reached; remaining work retained.")
         else:
             report(logger, "Status: SUCCESS")
@@ -101,18 +112,21 @@ def main(argv=None):
             report(logger, "Status: SKIPPED - Auth source disappeared; collection state unchanged.")
             return 0
         report(logger, "Auth collection failed: log source is missing; check rsyslog/source configuration.", error=True)
-        report(logger, "Collection state updated: NO")
+        state_updated = stats.get("state_updated", "NO")
+        report(logger, f"Collection state updated: {state_updated}")
         report(logger, "Status: FAILED")
         return 1
     except (AuthParseError, AuthCollectionError) as error:
         # These exceptions contain static reasons only, never source payloads.
         report(logger, f"Auth coverage gap: {error}", error=True)
-        report(logger, "Collection state updated: NO")
+        state_updated = stats.get("state_updated", "NO")
+        report(logger, f"Collection state updated: {state_updated}")
         report(logger, "Status: FAILED")
         return 1
     except (OSError, pymysql.MySQLError, ValueError):
         report(logger, "Auth collection failed. Check migration, log access and identity configuration.", error=True)
-        report(logger, "Collection state updated: NO")
+        state_updated = stats.get("state_updated", "NO")
+        report(logger, f"Collection state updated: {state_updated}")
         report(logger, "Status: FAILED")
         return 1
     finally:
@@ -128,7 +142,11 @@ def main(argv=None):
                 report(logger, f"Unrecognized lines: {stats.get('unrecognized_lines', 0)}; invalid lines: {stats.get('invalid_lines', 0)}")
                 report(logger, f"Duplicate events skipped: {stats.get('duplicates', 0)}")
                 report(logger, f"Collection seconds: {stats.get('elapsed_seconds', 0):.3f}")
-                report(logger, f"Remaining observed bytes: {stats.get('remaining_bytes', 0)}; uninspected files: {stats.get('files_pending', 0)}")
+                if stats.get("state_updated") == "NO":
+                    report(logger, "Remaining work: UNKNOWN - this collection pass was not committed.")
+                else:
+                    report(logger, f"Remaining observed bytes: {stats.get('remaining_bytes', 0)}; uninspected files: {stats.get('files_pending', 0)}")
+                report(logger, f"Coverage gaps: {stats.get('coverage_gaps', 0)}; compressed rotations: {stats.get('compressed_rotations', 0)}; vanished rotations: {stats.get('vanished_rotations', 0)}; source resets: {stats.get('source_resets', 0)}")
                 report(logger, f"Waiting for complete line: {stats.get('waiting_for_line', False)}")
             report(logger, f"Finished: {datetime.now().isoformat(timespec='seconds')}")
             close_log(logger, handler)

@@ -10,7 +10,13 @@ from pathlib import Path
 
 from database.identity import configured_identity
 from ingestion.auth.db import load_position, save_event, save_position
-from ingestion.auth.parser import AuthParseError, parse_auth_line
+from ingestion.auth.parser import (
+    ISO_TIME,
+    SYSLOG_TIME,
+    AuthParseError,
+    parse_auth_line,
+    parse_event_time,
+)
 
 # Serialize all auth ID allocation through commit, including different collectors.
 AUTH_WRITER_LOCK = "mysql_siem_auth_events_writer"
@@ -27,13 +33,19 @@ class AuthCollectionBusy(RuntimeError):
     """Another run holds the auth writer lock."""
 
 
-def get_logfiles(logfile):
+def get_logfiles(logfile, *, stats=None):
     """Read numbered, uncompressed rotations oldest first, then the active log."""
+    if stats is not None:
+        stats.setdefault("compressed_rotations", 0)
+        stats.setdefault("coverage_gaps", 0)
     rotations = []
     for filename in glob.glob(glob.escape(logfile) + ".*"):
         suffix = filename[len(logfile) + 1:]
         if suffix.isascii() and suffix.isdigit():
             rotations.append((int(suffix), filename))
+        elif suffix.endswith((".gz", ".xz", ".bz2", ".zst")) and stats is not None:
+            stats["compressed_rotations"] += 1
+            stats["coverage_gaps"] += 1
     rotations.sort(reverse=True)
     filenames = []
     for _, filename in rotations:
@@ -50,6 +62,49 @@ def open_logfile(filename):
         infile.close()
         raise AuthCollectionError("The auth source must be a regular file.")
     return infile
+
+
+def check_source_format(logfile, *, syslog_start=None, syslog_end=None, syslog_timezone=None):
+    """Check at most 100 complete source records without a database or writes."""
+    checked = timestamps = 0
+    deadline = time.monotonic() + MAX_SECONDS
+    active = str(Path(logfile).resolve())
+    with open_logfile(active):
+        pass
+    for filename in get_logfiles(active):
+        if checked >= 100:
+            break
+        try:
+            infile = open_logfile(filename)
+        except FileNotFoundError:
+            if filename == active:
+                raise
+            continue
+        with infile:
+            while checked < 100:
+                if time.monotonic() >= deadline:
+                    raise AuthCollectionError("Auth timestamp preflight exceeded its time budget.")
+                raw_line = infile.readline(MAX_LINE_BYTES)
+                if not raw_line:
+                    break
+                if not raw_line.endswith(b"\n"):
+                    if len(raw_line) == MAX_LINE_BYTES:
+                        raise AuthCollectionError("Auth line exceeds the safe size limit.")
+                    break
+                try:
+                    line = raw_line.decode("utf-8")
+                except UnicodeDecodeError:
+                    raise AuthCollectionError("Invalid UTF-8 in auth source.") from None
+                checked += 1
+                timestamp = ISO_TIME.match(line)
+                if timestamp is None:
+                    timestamp = SYSLOG_TIME.match(line)
+                if timestamp is not None:
+                    parse_event_time(timestamp[0], syslog_start, syslog_end, syslog_timezone)
+                    timestamps += 1
+                parse_auth_line(line, syslog_start=syslog_start, syslog_end=syslog_end,
+                                syslog_timezone=syslog_timezone)
+    return {"lines_checked": checked, "timestamps_checked": timestamps}
 
 
 def position_hash(infile, position):
@@ -72,6 +127,8 @@ def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_L
         stats.setdefault(key, 0)
     stats.setdefault("budget_exhausted", False)
     stats.setdefault("waiting_for_line", False)
+    stats.setdefault("coverage_gaps", 0)
+    stats.setdefault("source_resets", 0)
     with open_logfile(filename) as infile:
         info = os.fstat(infile.fileno())
         source_scope = 0
@@ -87,6 +144,11 @@ def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_L
             if (previous_position <= info.st_size
                     and position_hash(infile, previous_position) == previous_hash):
                 position = previous_position
+            else:
+                # Replay surviving bytes, but lost pre-truncation bytes cannot
+                # be proven complete from a checkpoint fingerprint alone.
+                stats["source_resets"] += 1
+                stats["coverage_gaps"] += 1
         anchor_position = max(position, min(info.st_size, 256))
         anchor_digest = position_hash(infile, anchor_position)
         infile.seek(position)
@@ -176,7 +238,8 @@ def collect_auth_events(connection, logfile="/var/log/auth.log", *, collector_id
                  local_logins_recognized=0, unrecognized_lines=0, invalid_lines=0,
                  duplicates=0, remaining_bytes=0, files_processed=0,
                  files_pending=0, budget_exhausted=False, waiting_for_line=False,
-                 elapsed_seconds=0.0)
+                 elapsed_seconds=0.0, state_updated="NO", coverage_gaps=0,
+                 compressed_rotations=0, vanished_rotations=0, source_resets=0)
     started = time.monotonic()
     deadline = started + max_seconds
     logfile = str(Path(logfile).resolve())
@@ -196,7 +259,7 @@ def collect_auth_events(connection, logfile="/var/log/auth.log", *, collector_id
         with open_logfile(logfile):
             pass
         inserted = skipped = 0
-        filenames = get_logfiles(logfile)
+        filenames = get_logfiles(logfile, stats=stats)
         for index, filename in enumerate(filenames):
             if time.monotonic() >= deadline:
                 stats["budget_exhausted"] = True
@@ -211,20 +274,24 @@ def collect_auth_events(connection, logfile="/var/log/auth.log", *, collector_id
             except FileNotFoundError:
                 if filename == logfile:
                     raise
-                # A rotation can disappear between directory listing and open.
+                # Keep collecting available sources, but report the coverage gap.
+                stats["vanished_rotations"] += 1
+                stats["coverage_gaps"] += 1
                 continue
             inserted += new
             skipped += ignored
+        stats["state_updated"] = "UNKNOWN"
         connection.commit()
+        stats["state_updated"] = "YES"
         return {"inserted": inserted, "skipped": skipped}
     except Exception:
         # Transaction cleanup only: programming errors are re-raised, never hidden.
         connection.rollback()
         raise
     finally:
-        stats["elapsed_seconds"] = time.monotonic() - started
         try:
             if locked:
                 cursor.execute("SELECT RELEASE_LOCK(%s)", (AUTH_WRITER_LOCK,))
         finally:
             cursor.close()
+            stats["elapsed_seconds"] = time.monotonic() - started

@@ -303,7 +303,14 @@ def test_payload_matches_current_parser_and_storage_without_database(service, so
     assert save_event(cursor, event) == 1
     sql, values = cursor.execute.call_args.args
     fields = sql.split("(", 1)[1].split(")", 1)[0].split(", ")
-    exported = dict(zip(fields, values))
+    stored = dict(zip(fields, values))
+    assert stored["auth_method"] == "password"
+    assert stored["source_port"] == 2222
+    # API v1 deliberately keeps its established failure-only payload. Storage
+    # metadata is additive and is not an automatic API contract expansion.
+    exported = {}
+    for field in SSHAuthEventPayload.model_fields:
+        exported[field] = stored[field]
     exported["event_time"] = event["event_time"].isoformat(timespec="microseconds") + "Z"
     assert exported["event_time"] == "2026-10-23T11:59:59.123456Z"
     assert exported["service"] == "sshd"

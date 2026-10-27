@@ -330,3 +330,12 @@ def test_local_login_and_pam_session_companion_count_once():
         if parse_auth_line(log_line(message, service="login[1234]")) is not None:
             recognized += 1
     assert recognized == 1
+
+
+@pytest.mark.parametrize("message", [
+    "Accepted keyboard-interactive/pam for alice from 192.0.2.1 port 22 ssh2",
+    "Failed changed-format for alice from 192.0.2.1 port 22 ssh2",
+])
+def test_unrecognized_ssh_auth_outcome_is_a_visible_gap(message):
+    with pytest.raises(AuthParseError, match="unsupported method or format"):
+        parse_auth_line("2026-10-22T12:00:00Z server sshd[12]: " + message)

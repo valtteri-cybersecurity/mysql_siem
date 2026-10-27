@@ -21,10 +21,15 @@ from database.migrate import LOCK_NAME, MigrationError
 DATABASE = 'mysql_siem'
 ACCOUNT = 'pythonuser'
 SOCKET = '/run/mysqld/mysqld.sock'
-RESET_WARNING = """Existing mysql_siem database detected on the local MySQL socket.
-Reinstallation will permanently delete all collected events, historical metrics,
-detection alerts and previous database records. A fresh database will be created.
-Type RESET to continue: """
+RESET_WARNING = """WARNING: RESET INSTALLATION
+
+This operation will permanently delete the
+existing MySQL SIEM application database data.
+
+All collected events, metrics, alerts and
+collection checkpoints may be lost.
+
+Type RESET to confirm: """
 
 
 class ResetError(RuntimeError):
@@ -382,6 +387,52 @@ def check_server_version(connection):
             raise ResetError('The local socket must serve Oracle MySQL 8.0 or 8.4; no reset was performed.')
 
 
+def validate_reset_database(connection):
+    """Prove a known application schema before permitting destructive RESET.
+
+    A matching database name is not ownership evidence. Ledgerless historical
+    databases require an administrator's separate review, never a blind reset.
+    """
+    from database.migrate import check_migration_history
+
+    connection.select_db(DATABASE)
+    try:
+        records = check_migration_history(connection)
+    except MigrationError:
+        raise ResetError('Cannot verify the application migration ledger; database was preserved.') from None
+    if records.get('013', (None, None))[1] != 'APPLIED':
+        raise ResetError('Cannot prove this mysql_siem database belongs to the application; '
+                         'a verified baseline migration is required. Database was preserved.')
+    required = {
+        'ufw_log': {'id', 'event_time', 'raw_line', 'event_hash'},
+        'auth_events': {'id', 'event_time', 'event_type', 'raw_message', 'event_hash'},
+        'auth_ingestion_state': {'collector_id', 'file_device', 'file_inode', 'last_position', 'position_hash'},
+        'detection_rules': {'id', 'rule_key', 'enabled'},
+        'detection_alerts': {'id', 'rule_id'},
+    }
+    tables = tuple(required)
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT table_name, engine, table_type FROM information_schema.tables '
+                       'WHERE table_schema = DATABASE()')
+        existing = set()
+        for name, engine, kind in cursor.fetchall():
+            if name not in RUNTIME_TABLE_PRIVILEGES:
+                raise ResetError('Unknown tables share the application database; database was preserved.')
+            if engine != 'InnoDB' or kind != 'BASE TABLE':
+                raise ResetError('Unexpected application table type; database was preserved.')
+            existing.add(name)
+        if not set(required) <= existing:
+            raise ResetError('Application schema is incomplete or unknown; database was preserved.')
+        cursor.execute('SELECT table_name, column_name FROM information_schema.columns '
+                       'WHERE table_schema = DATABASE() AND table_name IN %s', (tables,))
+        columns = {}
+        for name, column in cursor.fetchall():
+            columns.setdefault(name, set()).add(column)
+        for name, expected in required.items():
+            if not expected <= columns.get(name, set()):
+                raise ResetError('Application schema identity does not match; database was preserved.')
+
+
 def reset_database(connection, settings, *, approved=False, prepare=lambda: None):
     """Only the fixed local DB is reset; never accept a database name argument."""
     validate_settings(settings)
@@ -394,8 +445,11 @@ def reset_database(connection, settings, *, approved=False, prepare=lambda: None
         cursor.execute('SELECT GET_LOCK(%s, 0)', (LOCK_NAME,))
         if cursor.fetchone() != (1,):
             raise ResetError('Another database migration is running; no reset was performed.')
-    step = 'identity reset preparation'
+    step = 'application database ownership verification'
     try:
+        if exists:
+            validate_reset_database(connection)
+        step = 'identity reset preparation'
         prepare()
         with connection.cursor() as cursor:
             if exists:

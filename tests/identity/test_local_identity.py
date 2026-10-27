@@ -399,3 +399,45 @@ def test_audit_permission_barrier_blocks_jobs_before_identity_enrollment(tmp_pat
                             capture_output=True, text=True, timeout=5, check=False)
     assert result.returncode == 75
     assert 'must-not-run' not in result.stdout
+
+
+def test_ssh_settings_preserve_auth_budget_and_verified_timestamp_context(tmp_path, monkeypatch):
+    project = tmp_path / 'project'
+    (project / 'config').mkdir(parents=True)
+    path = project / 'config/ssh.env'
+    original = ('SSH_AUTH_LOGFILE=/synthetic/auth.log\nSSH_AUTH_COLLECTOR_ID=stable-reader\n'
+                'SSH_AUTH_MAX_SECONDS=30\nSSH_AUTH_SYSLOG_START=2026-01-01T00:00:00Z\n'
+                'SSH_AUTH_SYSLOG_END=2027-01-01T00:00:00Z\n'
+                'SSH_AUTH_SYSLOG_TIMEZONE=Europe/Helsinki\n')
+    path.write_text(original)
+    path.chmod(0o600)
+    monkeypatch.setattr(local.pwd, 'getpwnam', lambda _: SimpleNamespace(pw_uid=os.getuid()))
+    assert local.ssh_settings(project, 'synthetic-service') == ('stable-reader', '/synthetic/auth.log')
+    assert path.read_text() == original
+
+
+def test_default_ssh_example_is_valid_for_identity_preparation(tmp_path, monkeypatch):
+    import shutil
+
+    project = tmp_path / 'project'
+    (project / 'config').mkdir(parents=True)
+    source = Path(__file__).resolve().parents[2] / 'config/ssh.env.example'
+    path = project / 'config/ssh.env'
+    shutil.copyfile(source, path)
+    path.chmod(0o600)
+    monkeypatch.setattr(local.pwd, 'getpwnam', lambda _: SimpleNamespace(pw_uid=os.getuid()))
+    monkeypatch.setattr(local.socket, 'gethostname', lambda: 'synthetic-host')
+    assert local.ssh_settings(project, 'synthetic-service') == ('synthetic-host', '/var/log/auth.log')
+
+
+@pytest.mark.parametrize('contents', ['UNKNOWN_AUTH_SETTING=1\n',
+                                     'SSH_AUTH_MAX_SECONDS=30\nSSH_AUTH_MAX_SECONDS=5\n'])
+def test_ssh_settings_still_reject_unknown_and_duplicate_keys(tmp_path, monkeypatch, contents):
+    project = tmp_path / 'project'
+    (project / 'config').mkdir(parents=True)
+    path = project / 'config/ssh.env'
+    path.write_text(contents)
+    path.chmod(0o600)
+    monkeypatch.setattr(local.pwd, 'getpwnam', lambda _: SimpleNamespace(pw_uid=os.getuid()))
+    with pytest.raises(IdentityError, match='Invalid SSH settings'):
+        local.ssh_settings(project, 'synthetic-service')

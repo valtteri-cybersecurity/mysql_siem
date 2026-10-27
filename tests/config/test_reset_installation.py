@@ -25,6 +25,14 @@ class FakeConnection:
         self.selected = None
         self.closed = False
         self.lock_available = True
+        self.table_kind = 'BASE TABLE'
+        self.application_tables = {
+            'ufw_log': {'id', 'event_time', 'raw_line', 'event_hash'},
+            'auth_events': {'id', 'event_time', 'event_type', 'raw_message', 'event_hash'},
+            'auth_ingestion_state': {'collector_id', 'file_device', 'file_inode', 'last_position', 'position_hash'},
+            'detection_rules': {'id', 'rule_key', 'enabled'},
+            'detection_alerts': {'id', 'rule_id'},
+        }
 
     def cursor(self):
         return self
@@ -59,7 +67,20 @@ class FakeConnection:
         return (int(self.exists),)
 
     def fetchall(self):
-        return [(grant,) for grant in self.grants]
+        sql = self.statements[-1][0]
+        rows = []
+        if 'table_name, engine, table_type' in sql:
+            for name in self.application_tables:
+                rows.append((name, 'InnoDB', self.table_kind))
+            return rows
+        if 'table_name, column_name' in sql:
+            for name, fields in self.application_tables.items():
+                for field in fields:
+                    rows.append((name, field))
+            return rows
+        for grant in self.grants:
+            rows.append((grant,))
+        return rows
 
     def select_db(self, name):
         self.selected = name
@@ -76,6 +97,7 @@ def settings():
 @pytest.fixture
 def initialized(monkeypatch):
     calls = []
+    monkeypatch.setattr(migrations, 'check_migration_history', lambda connection: {'013': ('verified', 'APPLIED')})
     monkeypatch.setattr(migrations, 'migrate', lambda connection: calls.append('migrate'))
     monkeypatch.setattr(migrations, 'check_ufw_utc_readiness', lambda connection: calls.append('check'))
     return calls
@@ -338,3 +360,42 @@ def test_reset_cli_rejects_collector_before_database_connection(tmp_path, monkey
     monkeypatch.setattr(reset.pymysql, 'connect', lambda **kwargs: pytest.fail('Collector must not connect'))
     assert reset.main(['reset', '--project', str(tmp_path)]) == 1
     assert 'only for the Server' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('fault', ['no-ledger', 'partial-baseline', 'checksum', 'missing-table',
+                                   'foreign-table', 'missing-column', 'view'])
+def test_reset_rejects_unproven_application_database_before_identity_or_drop(settings, initialized, monkeypatch, fault):
+    connection = FakeConnection(True)
+    if fault == 'no-ledger':
+        monkeypatch.setattr(migrations, 'check_migration_history', lambda _: {})
+    elif fault == 'partial-baseline':
+        monkeypatch.setattr(migrations, 'check_migration_history', lambda _: {'013': ('verified', 'FAILED')})
+    elif fault == 'checksum':
+        def reject(_):
+            raise migrations.MigrationError('untrusted migration checksum')
+        monkeypatch.setattr(migrations, 'check_migration_history', reject)
+    elif fault == 'missing-table':
+        del connection.application_tables['auth_events']
+    elif fault == 'foreign-table':
+        connection.application_tables['customer_payments'] = {'id'}
+    elif fault == 'missing-column':
+        connection.application_tables['auth_events'].remove('event_hash')
+    else:
+        connection.table_kind = 'VIEW'
+    with pytest.raises(reset.ResetError, match='database was preserved|Database was preserved'):
+        reset.reset_database(connection, settings, approved=True,
+                             prepare=lambda: pytest.fail('Identity reset must not run'))
+    assert connection.events == [1, 2]
+    assert connection.other_database == [77]
+    assert not initialized
+    for sql, _ in connection.statements:
+        assert not sql.startswith(('DROP ', 'CREATE ', 'ALTER '))
+    assert 'RELEASE_LOCK' in connection.statements[-1][0]
+
+
+def test_known_application_schema_is_verified_with_selects_only(settings, initialized):
+    connection = FakeConnection(True)
+    reset.validate_reset_database(connection)
+    assert connection.selected == 'mysql_siem'
+    for sql, _ in connection.statements:
+        assert sql.startswith('SELECT ')

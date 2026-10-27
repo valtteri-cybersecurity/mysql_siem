@@ -26,6 +26,22 @@ def save_event(cursor, event, *, identity=None):
     except pymysql.IntegrityError as error:
         if error.args[0] != 1062:
             raise
+        source_scope = 0
+        if identity is not None:
+            source_scope = identity.source_id
+        scoped = source_scope != 0 or identity_schema_enabled(cursor.connection)
+        sql = ("SELECT event_time, hostname, source_ip, username, event_type, service "
+               "FROM auth_events WHERE event_hash = %s")
+        parameters = (event["event_hash"],)
+        if scoped:
+            sql += " AND source_scope = %s"
+            parameters += (source_scope,)
+        cursor.execute(sql + " FOR SHARE", parameters)
+        stored = cursor.fetchone()
+        expected = (event["event_time"], event["hostname"], event["source_ip"],
+                    event["username"], event["event_type"], event["service"])
+        if stored != expected:
+            raise
         return 0
     return 1
 
