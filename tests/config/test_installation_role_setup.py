@@ -84,7 +84,7 @@ def test_sync_failure_never_deletes_published_role(target, monkeypatch, after_pu
 
 
 @pytest.mark.parametrize('arguments,input_text,accepted', [
-    ('--role server', 'yes\n', True), ('', '1\nyes\n', True),
+    ('--role server', 'yes\n', True), ('', '2\n1\nyes\n', True),
     ('--role server', 'no\n', False), ('--role server', '', False),
 ])
 def test_missing_role_requires_explicit_confirmation(tmp_path, arguments, input_text, accepted):
@@ -99,7 +99,7 @@ def test_missing_role_requires_explicit_confirmation(tmp_path, arguments, input_
 ])
 def test_existing_role_is_used_or_conflict_rejected(tmp_path, stored, requested, accepted):
     result = shell(tmp_path, f'select_installation_role {requested}; echo "ROLE:$INSTALL_ROLE"',
-                   stored=stored, extra=f'role_configuration() {{ echo {stored}; }}')
+                   stored=stored, extra=f'role_configuration() {{ echo {stored}; }}', input_text='\n')
     assert (result.returncode == 0) == accepted
     assert (tmp_path / 'config/role.env').read_text() == stored
     assert 'Confirm Server' not in result.stdout
@@ -175,8 +175,8 @@ def test_role_checks_precede_mutations_and_initialization_precedes_packages():
 
     assert '-m config.reset_installation reset' in INSTALLER
     assert 'DATABASE_CREATED_THIS_RUN' not in INSTALLER
-    assert INSTALLER.index('audit_installation check --operation') < INSTALLER.index('Type RESET to continue:')
-    assert INSTALLER.index('Type RESET to continue:') < INSTALLER.index('    local_identity_setup begin --reset')
+    assert INSTALLER.index('audit_installation check --operation') < INSTALLER.index('Type RESET to confirm:')
+    assert INSTALLER.index('Type RESET to confirm:') < INSTALLER.index('    local_identity_setup begin --reset')
 
 
 
@@ -189,7 +189,7 @@ def test_real_python_bridge_reads_only_temporary_configuration(tmp_path, content
     target = config / 'role.env'
     target.write_text(content)
     target.chmod(0o600)
-    result = shell(tmp_path, 'select_installation_role; echo "ROLE:$INSTALL_ROLE"')
+    result = shell(tmp_path, 'select_installation_role --upgrade; echo "ROLE:$INSTALL_ROLE"')
     assert (result.returncode == 0) == valid
     assert target.read_text() == content
     if valid:
@@ -205,3 +205,56 @@ crontab() { echo "Unexpected cron access error" >&2; return 1; }
     assert result.returncode != 0
     assert 'Cannot read the existing crontab' in result.stderr
     assert not (tmp_path / 'crontab').exists()
+
+
+@pytest.mark.parametrize('selection,operation', [('1', 'upgrade'), ('2', 'reset'), ('', 'upgrade')])
+def test_existing_installation_operation_menu_defaults_to_upgrade(tmp_path, selection, operation):
+    result = shell(tmp_path, 'select_installation_role; echo "OPERATION:$INSTALL_OPERATION"',
+                   stored='server', extra='role_configuration() { echo server; }', input_text=selection + '\n')
+    assert result.returncode == 0, result.stderr
+    assert 'MySQL SIEM Installer' in result.stdout
+    assert 'UPGRADE is recommended' in result.stdout
+    assert 'OPERATION:' + operation in result.stdout
+
+
+@pytest.mark.parametrize('selection', ['', 'invalid', '3', ' RESET '])
+def test_fresh_menu_never_turns_invalid_input_into_reset(tmp_path, selection):
+    result = shell(tmp_path, 'select_installation_role; echo UNEXPECTED', input_text=selection + '\n')
+    assert result.returncode != 0
+    assert 'UNEXPECTED' not in result.stdout
+    assert not (tmp_path / 'config/role.env').exists()
+
+
+@pytest.mark.parametrize('arguments', [
+    '--upgrade --reset', '--reset --upgrade', '--reset --reset', '--upgrade --upgrade',
+    '--revision invalid', '--revision', '--role server --role collector', '--unknown',
+])
+def test_invalid_or_conflicting_installation_arguments_stop_before_prompts(tmp_path, arguments):
+    result = shell(tmp_path, 'select_installation_role ' + arguments + '; echo UNEXPECTED')
+    assert result.returncode != 0
+    assert 'Selection [1/2]' not in result.stdout
+    assert 'UNEXPECTED' not in result.stdout
+
+
+@pytest.mark.parametrize('arguments', [
+    '--revision {revision} --upgrade --role server',
+    '--role server --revision {revision} --upgrade',
+    '--upgrade --role server --revision {revision}',
+])
+def test_revision_is_preserved_independent_of_argument_order(tmp_path, arguments):
+    revision = 'ABCDEF01' * 5
+    command = 'select_installation_role ' + arguments.format(revision=revision)
+    command += '; printf "OPERATION:%s REVISION:%s ROLE:%s\n" "$INSTALL_OPERATION" "$INSTALL_REVISION" "$INSTALL_ROLE"'
+    result = shell(tmp_path, command, stored='server', extra='role_configuration() { echo server; }')
+    assert result.returncode == 0, result.stderr
+    assert 'OPERATION:upgrade REVISION:' + revision.lower() + ' ROLE:server' in result.stdout
+    assert 'Selection [1/2]' not in result.stdout
+
+
+def test_explicit_reset_flag_preserves_separate_destructive_confirmation(tmp_path):
+    result = shell(tmp_path, 'select_installation_role --reset --role server; echo "OPERATION:$INSTALL_OPERATION"',
+                   stored='server', extra='role_configuration() { echo server; }')
+    assert result.returncode == 0
+    assert 'OPERATION:reset' in result.stdout
+    assert 'SIEM_DATABASE_RESET_APPROVED=1' not in result.stdout
+    assert 'Type RESET to confirm:' in INSTALLER

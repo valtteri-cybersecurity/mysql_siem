@@ -159,3 +159,65 @@ def test_login_metadata_and_null_local_source_are_saved_without_changing_failure
             assert event["auth_method"] == "publickey"
             assert event["source_port"] == 54321
     assert detect_ssh_brute_force(events) == []
+
+
+def test_unrelated_unique_conflict_is_not_a_duplicate(mysql):
+    first = parse_auth_line(line(0))
+    second = parse_auth_line(line(1))
+    second["username"] = first["username"]
+    with mysql.cursor() as cursor:
+        cursor.execute("ALTER TABLE auth_events ADD UNIQUE KEY synthetic_username (username)")
+        assert save_event(cursor, first) == 1
+        with pytest.raises(pymysql.IntegrityError) as raised:
+            save_event(cursor, second)
+        assert raised.value.args[0] == 1062
+    mysql.rollback()
+    assert not read_events(mysql)
+
+
+def test_021_committed_ddl_can_be_safely_rechecked(mysql):
+    from database.auth_migrations import upgrade_auth_events
+    from database.migrate import ROOT
+
+    with mysql.cursor() as cursor:
+        assert save_event(cursor, parse_auth_line(line())) == 1
+    mysql.commit()
+    before = read_events(mysql)
+    upgrade_auth_events(mysql, ROOT / "migrations/021_auth_logins.sql")
+    upgrade_auth_events(mysql, ROOT / "migrations/021_auth_logins.sql")
+    assert read_events(mysql) == before
+
+
+def test_021_preserves_old_event_and_resumes_after_committed_ddl(private_server, apply_migration):
+    import time
+
+    from database.auth_migrations import upgrade_auth_events
+    from database.migrate import ROOT
+
+    connection = pymysql.connect(unix_socket=private_server, user="root", autocommit=False,
+                                 charset="utf8mb4", read_timeout=10, write_timeout=10)
+    try:
+        schema = f"auth_upgrade_{time.monotonic_ns()}"
+        with connection.cursor() as cursor:
+            cursor.execute(f"CREATE DATABASE `{schema}`")
+        connection.select_db(schema)
+        apply_migration(connection, "007_auth_events.sql")
+        event = parse_auth_line(line())
+        with connection.cursor() as cursor:
+            cursor.execute("INSERT INTO auth_events (event_time, hostname, source_ip, username, "
+                           "event_type, service, raw_message, event_hash) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                           (event["event_time"], event["hostname"], event["source_ip"], event["username"],
+                            event["event_type"], event["service"], event["raw_message"], event["event_hash"]))
+            cursor.execute("SELECT id, event_hash, raw_message FROM auth_events")
+            before = cursor.fetchall()
+            # Simulate DDL committed before the migration process was stopped.
+            cursor.execute("ALTER TABLE auth_events MODIFY source_ip VARCHAR(45) "
+                           "CHARACTER SET ascii COLLATE ascii_bin NULL")
+        upgrade_auth_events(connection, ROOT / "migrations/021_auth_logins.sql")
+        upgrade_auth_events(connection, ROOT / "migrations/021_auth_logins.sql")
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT id, event_hash, raw_message FROM auth_events")
+            assert cursor.fetchall() == before
+            assert save_event(cursor, event) == 0
+    finally:
+        connection.close()
