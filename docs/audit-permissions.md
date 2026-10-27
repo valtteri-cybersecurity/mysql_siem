@@ -114,7 +114,7 @@ permission-repair step required in normal product deployment.
 | Retained logs | Compare inode/device and hashes of the original byte prefixes | No replacement/truncation; appended daemon records are allowed |
 | Future rotation | Request a normal auditd rotation, then repeat reader/worker probes | New active and retained logs preserve intended access and modes |
 | Real event | Create/remove a harmless comment-only file in the watched sudoers directory | A bounded collector run stores the matching event in MySQL |
-| Upgrade | Re-run with --upgrade, without RESET input | Same receipt, identities, historical events and checkpoints; no redundant permission mutation |
+| Upgrade | Re-run with --upgrade, without RESET input | Same receipt and identities; historical events retained and checkpoints continue without reset; no redundant permission mutation |
 | Reload failure | In a restored disposable snapshot, reject/fail HUP acknowledgement | Pending and maintenance remain; no database reset |
 | Abrupt stop | Terminate setup before config update, after update, after reload and at completion | Saved metadata remains; no premature collection; verified same-command recovery |
 | Concurrent rotation | Rotate during a partial migration | Known readers retain policy; conflicting inventory remains blocked for review |

@@ -12,6 +12,7 @@ from unittest.mock import Mock
 import pytest
 
 from config import audit_setup
+from config import installation_state as journal
 from config import service_installation as service
 
 
@@ -27,7 +28,7 @@ def logs(tmp_path, monkeypatch):
     ancestors = set(system.parents)
     actual_stat = os.stat
     actual_fstat = os.fstat
-    account = SimpleNamespace(pw_uid=1001, pw_gid=1001)
+    account = SimpleNamespace(pw_uid=1001, pw_gid=1001, pw_name='mysql_siem')
 
     def metadata(info, path):
         values = list(info)
@@ -66,7 +67,13 @@ def logs(tmp_path, monkeypatch):
     monkeypatch.setattr(service.os, 'fchown', Mock(side_effect=chown))
     monkeypatch.setattr(service.os, 'fchmod', Mock(wraps=os.fchmod))
     monkeypatch.setattr(service.pwd, 'getpwnam', Mock(return_value=account))
-    monkeypatch.setattr(service.grp, 'getgrnam', Mock(return_value=SimpleNamespace(gr_gid=104)))
+    group = SimpleNamespace(gr_name='mysql_siem', gr_gid=account.pw_gid, gr_mem=[])
+    monkeypatch.setattr(service.grp, 'getgrnam', Mock(side_effect=lambda name: (
+        SimpleNamespace(gr_name='syslog', gr_gid=104, gr_mem=[]) if name == 'syslog' else group)))
+    monkeypatch.setattr(service.grp, 'getgrall', Mock(return_value=[group]))
+    monkeypatch.setattr(service.pwd, 'getpwall', Mock(return_value=[account]))
+    monkeypatch.setattr(service.os, 'getgrouplist', lambda name, gid: [gid])
+    monkeypatch.setattr(journal, 'require_maintenance', Mock())
     monkeypatch.setattr(service.subprocess, 'run', Mock(return_value=SimpleNamespace(returncode=0)))
     return SimpleNamespace(root=root, parent=parent, owner=owner, account=account)
 
@@ -343,6 +350,8 @@ def test_real_service_user_can_open_isolated_logs(monkeypatch, mask):
         account = pwd.getpwnam('mysql_siem')
     except KeyError:
         pytest.skip('Needs an existing mysql_siem account; this test does not create users.')
+    # The test prepares only its temporary tree, without an actual installer.
+    monkeypatch.setattr(journal, 'require_maintenance', Mock())
     with tempfile.TemporaryDirectory(prefix='mysql-siem-log-test-', dir='/run') as temporary:
         base = Path(temporary)
         parent = base / 'var/log'
@@ -369,3 +378,224 @@ def test_real_service_user_can_open_isolated_logs(monkeypatch, mask):
                             '-I', '-B', '-c', probe, str(logfile)],
                            check=True, capture_output=True, timeout=5)
             assert logfile.read_bytes() == b''
+
+
+@pytest.mark.parametrize('platform,parent_mode,parent_gid', [
+    ('Debian 13', 0o755, 0), ('Ubuntu 24.04', 0o775, 104),
+])
+def test_empty_legacy_root_is_classified_and_migrated_without_replacing_it(logs, platform, parent_mode, parent_gid):
+    logs.parent.chmod(parent_mode)
+    logs.owner(logs.parent, 0, parent_gid)
+    logs.root.mkdir(mode=0o750)
+    logs.root.chmod(0o750)
+    logs.owner(logs.root, logs.account.pw_uid, logs.account.pw_gid)
+    inode = logs.root.stat().st_dev, logs.root.stat().st_ino
+    assert service.prepare_snapshot_logs('mysql_siem', logs.root, check_only=True) == 'legacy-empty'
+    assert not list(logs.root.iterdir())
+    service.os.fchown.assert_not_called()
+    journal.require_maintenance.assert_not_called()
+    assert service.prepare_snapshot_logs('mysql_siem', logs.root) == 'prepared'
+    journal.require_maintenance.assert_called_once_with(journal.STATE_DIR)
+    assert (logs.root.stat().st_dev, logs.root.stat().st_ino) == inode
+    assert (logs.root.stat().st_uid, logs.root.stat().st_gid, stat.S_IMODE(logs.root.stat().st_mode)) == (0, 1001, 0o750)
+    assert sorted(path.name for path in logs.root.iterdir()) == sorted(service.LOG_COMPONENTS)
+    for component in service.LOG_COMPONENTS:
+        directory = logs.root / component
+        logfile = directory / 'cron.log'
+        assert (directory.stat().st_uid, directory.stat().st_gid, stat.S_IMODE(directory.stat().st_mode)) == (1001, 1001, 0o700)
+        assert (logfile.stat().st_uid, logfile.stat().st_gid, stat.S_IMODE(logfile.stat().st_mode)) == (1001, 1001, 0o600)
+    service.os.fchown.reset_mock()
+    service.os.fchmod.reset_mock()
+    prepare(logs)
+    service.os.fchown.assert_not_called()
+    service.os.fchmod.assert_not_called()
+
+
+@pytest.mark.parametrize('fault', ['nonempty', 'known-child', 'wrong-group', 'world-readable',
+                                  'group-writable', 'special-mode', 'default-acl', 'group-mismatch',
+                                  'shared-group', 'shared-primary', 'group-alias', 'uid-alias'])
+def test_legacy_migration_is_narrow_and_rejects_unrecognized_state(logs, fault):
+    logs.root.mkdir(mode=0o750)
+    logs.root.chmod(0o750)
+    logs.owner(logs.root, 1001, 1001)
+    if fault == 'nonempty':
+        (logs.root / 'unrelated').write_bytes(b'keep')
+    elif fault == 'known-child':
+        (logs.root / 'processes').mkdir()
+    elif fault == 'wrong-group':
+        logs.owner(logs.root, 1001, 55)
+    elif fault == 'world-readable':
+        logs.root.chmod(0o755)
+    elif fault == 'group-writable':
+        logs.root.chmod(0o770)
+    elif fault == 'special-mode':
+        logs.root.chmod(0o2750)
+    elif fault == 'default-acl':
+        from config.audit_permissions import write_acl
+        descriptor = os.open(logs.root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            write_acl(descriptor, {'user:': 7, 'group:': 5, 'mask:': 5, 'other:': 0}, default=True)
+        finally:
+            os.close(descriptor)
+    elif fault in ('shared-group', 'group-mismatch'):
+        group = SimpleNamespace(gr_gid=55 if fault == 'group-mismatch' else 1001,
+                                gr_mem=['reader'] if fault == 'shared-group' else [])
+        service.grp.getgrnam.side_effect = None
+        service.grp.getgrnam.return_value = group
+    elif fault == 'shared-primary':
+        service.pwd.getpwall.return_value = [logs.account, SimpleNamespace(pw_name='reader', pw_uid=55, pw_gid=1001)]
+    elif fault == 'group-alias':
+        service.grp.getgrall.return_value = [SimpleNamespace(gr_name='alias', gr_gid=1001)]
+    else:
+        service.pwd.getpwall.return_value = [logs.account, SimpleNamespace(pw_name='alias', pw_uid=1001, pw_gid=55)]
+    for check in (True, False):
+        with pytest.raises(service.InstallationError):
+            prepare(logs, check=check)
+    service.os.fchown.assert_not_called()
+    service.os.fchmod.assert_not_called()
+    assert logs.root.stat().st_uid == 1001
+    if fault == 'nonempty':
+        assert (logs.root / 'unrelated').read_bytes() == b'keep'
+
+
+@pytest.mark.parametrize('point', ['before-change', 'after-change'])
+def test_legacy_root_identity_is_verified_on_both_sides_of_migration(logs, monkeypatch, point):
+    logs.root.mkdir(mode=0o750)
+    logs.root.chmod(0o750)
+    logs.owner(logs.root, 1001, 1001)
+    original_verify = service.verify_snapshot_name
+    original_chown = service.os.fchown
+    calls = 0
+
+    def replace():
+        logs.root.rename(logs.parent / 'old-root')
+        logs.root.mkdir(mode=0o750)
+
+    def verify(parent, name, descriptor):
+        nonlocal calls
+        if name == 'mysql_siem':
+            calls += 1
+            if point == 'before-change' and calls == 2:
+                replace()
+        original_verify(parent, name, descriptor)
+
+    def chown(descriptor, uid, gid):
+        original_chown(descriptor, uid, gid)
+        if point == 'after-change':
+            replace()
+
+    monkeypatch.setattr(service, 'verify_snapshot_name', verify)
+    monkeypatch.setattr(service.os, 'fchown', Mock(side_effect=chown))
+    with pytest.raises(service.InstallationError, match='path changed'):
+        prepare(logs)
+    assert not list(logs.root.iterdir())
+    assert not list((logs.parent / 'old-root').iterdir())
+    if point == 'before-change':
+        service.os.fchown.assert_not_called()
+
+
+def test_snapshot_mutation_requires_both_maintenance_locks_before_creating_paths(logs):
+    journal.require_maintenance.side_effect = journal.InstallationStateError('inherited lock missing')
+    with pytest.raises(journal.InstallationStateError, match='lock missing'):
+        prepare(logs)
+    assert not logs.root.exists()
+    service.os.fchown.assert_not_called()
+
+
+def test_partial_legacy_preparation_can_retry_without_losing_recovery_material(logs, tmp_path, monkeypatch):
+    logs.root.mkdir(mode=0o750)
+    logs.root.chmod(0o750)
+    logs.owner(logs.root, 1001, 1001)
+    state = tmp_path / 'recovery'
+    state.mkdir()
+    for name in ('deployment.json', 'receipt.json', 'maintenance', 'mysql.env', 'identity.env'):
+        (state / name).write_text('synthetic preserved material\n')
+    before = {path.name: (path.stat().st_ino, path.read_bytes()) for path in state.iterdir()}
+    original_open = service.open_snapshot_directory
+
+    def interrupt(parent, name, account, **kwargs):
+        if name == 'services':
+            raise OSError('synthetic interruption after ownership migration')
+        return original_open(parent, name, account, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(service, 'open_snapshot_directory', interrupt)
+        with pytest.raises(OSError, match='interruption'):
+            prepare(logs)
+    assert logs.root.stat().st_uid == 0
+    assert (logs.root / 'processes/cron.log').exists()
+    assert {path.name: (path.stat().st_ino, path.read_bytes()) for path in state.iterdir()} == before
+    prepare(logs)
+    assert {path.name: (path.stat().st_ino, path.read_bytes()) for path in state.iterdir()} == before
+
+
+@pytest.mark.parametrize('operation', ['reset', 'upgrade'])
+def test_failed_snapshot_preparation_preserves_stage_and_stops_before_services_and_database(tmp_path, operation):
+    installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
+    check = installer.index('service_installation snapshot-logs-check "$INSTALL_USER"')
+    lock = installer.index('flock -x -w 30 8', installer.index('    local_identity_setup begin --reset'))
+    prepare = installer.index('service_installation snapshot-logs "$INSTALL_USER"')
+    started = installer.index('\nDATABASE_SETUP_STARTED=1\n')
+    assert check < lock < prepare < installer.index('log "Starting services."') < started
+    assert installer.count('service_installation snapshot-logs "$INSTALL_USER"') == 1
+    cleanup_start = installer.index('cleanup_prepared_installation() {')
+    cleanup_end = installer.index('\n}\n', cleanup_start) + 3
+    phase_start = installer.index('# Prepare and verify snapshot logs under both inherited locks')
+    phase_end = installer.index('# Both schema paths', started)
+    receipt = tmp_path / 'receipt.json'
+    journal_file = tmp_path / 'deployment.json'
+    receipt.write_text('retained receipt\n')
+    journal_file.write_text('retained journal\n')
+    before = receipt.read_bytes(), journal_file.read_bytes()
+    prefix = r'''set -euo pipefail
+INSTALL_USER=mysql_siem
+INSTALL_OPERATION=$1
+LOCAL_DEPLOYMENT_STARTED=1
+SERVICE_PUBLISHED=0
+warn() { printf '%s\n' "$*" >&2; }
+service_installation() {
+    [[ "$1" == snapshot-logs ]] || { printf 'UNEXPECTED journal deletion\n'; return 91; }
+    return 17
+}
+systemctl() { printf 'UNEXPECTED service action\n'; return 91; }
+log() { printf 'UNEXPECTED service phase\n'; return 91; }
+'''
+    script = prefix + installer[cleanup_start:cleanup_end] + '\ntrap cleanup_prepared_installation EXIT\n' + installer[phase_start:phase_end]
+    result = subprocess.run(['bash', '-c', script, 'snapshot-test', operation],
+                            capture_output=True, text=True, check=False, timeout=5)
+    assert result.returncode == 17, result.stdout + result.stderr
+    assert 'UNEXPECTED' not in result.stdout
+    assert 'recovery journal were retained' in result.stderr
+    assert (receipt.read_bytes(), journal_file.read_bytes()) == before
+
+
+
+def test_read_only_check_classifies_missing_and_existing_roots(logs):
+    assert service.prepare_snapshot_logs('mysql_siem', logs.root, check_only=True) == 'missing'
+    prepare(logs)
+    assert service.prepare_snapshot_logs('mysql_siem', logs.root, check_only=True) == 'existing'
+
+
+def test_legacy_exception_does_not_relax_the_shared_root_validator(logs):
+    logs.root.mkdir(mode=0o750)
+    logs.owner(logs.root, 1001, 1001)
+    with pytest.raises(service.InstallationError, match='Unsafe snapshot'):
+        service.validate_snapshot_entry(logs.root.stat(), logs.account, shared=True, directory=True)
+
+
+def test_concurrent_entry_is_not_adopted_during_legacy_migration(logs, monkeypatch):
+    logs.root.mkdir(mode=0o750)
+    logs.root.chmod(0o750)
+    logs.owner(logs.root, 1001, 1001)
+    original_chown = service.os.fchown
+
+    def add_entry(descriptor, uid, gid):
+        (logs.root / 'unrecognized').write_bytes(b'preserve this content')
+        original_chown(descriptor, uid, gid)
+
+    monkeypatch.setattr(service.os, 'fchown', Mock(side_effect=add_entry))
+    with pytest.raises(service.InstallationError, match='changed during migration'):
+        prepare(logs)
+    assert (logs.root / 'unrecognized').read_bytes() == b'preserve this content'
+    assert sorted(path.name for path in logs.root.iterdir()) == ['unrecognized']
+    service.os.fchown.assert_called_once()

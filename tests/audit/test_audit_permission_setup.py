@@ -445,3 +445,55 @@ def test_abrupt_permission_setup_blocks_old_installed_collectors_and_can_resume(
     assert not (env.state / permissions.PENDING).exists()
     assert not (env.state / 'maintenance').exists()
     assert permissions.reload_auditd is original_reload
+
+
+@pytest.mark.parametrize('case', ['private', 'listed-member', 'gid-alias', 'uid-alias',
+                                 'primary-member', 'supplementary-member'])
+def test_private_account_validation_checks_real_membership_rules(account, monkeypatch, case):
+    group = SimpleNamespace(gr_name='mysql_siem', gr_gid=account.pw_gid, gr_mem=[])
+    groups = [group]
+    users = [account]
+    other = SimpleNamespace(pw_uid=55, pw_gid=55, pw_name='reader')
+    if case == 'listed-member':
+        group.gr_mem = ['reader']
+    elif case == 'gid-alias':
+        groups.append(SimpleNamespace(gr_name='alias', gr_gid=account.pw_gid, gr_mem=[]))
+    elif case == 'uid-alias':
+        users.append(SimpleNamespace(pw_uid=account.pw_uid, pw_gid=55, pw_name='alias'))
+    elif case in ('primary-member', 'supplementary-member'):
+        if case == 'primary-member':
+            other.pw_gid = account.pw_gid
+        users.append(other)
+
+    def memberships(username, primary):
+        result = [primary]
+        if case == 'supplementary-member' and username == 'reader':
+            result.append(account.pw_gid)
+        return result
+
+    monkeypatch.setattr(permissions.audit, '_preflight_account', Mock(return_value=account))
+    monkeypatch.setattr(permissions.grp, 'getgrnam', Mock(return_value=group))
+    monkeypatch.setattr(permissions.grp, 'getgrall', Mock(return_value=groups))
+    monkeypatch.setattr(permissions.pwd, 'getpwall', Mock(return_value=users))
+    monkeypatch.setattr(permissions.os, 'getgrouplist', memberships)
+    if case == 'private':
+        assert permissions.account_and_group() is account
+    else:
+        with pytest.raises(ValueError, match='private|shares'):
+            permissions.account_and_group()
+
+
+def test_initially_correct_permissions_do_not_rewrite_configuration_or_log_acls(environment, monkeypatch):
+    env = environment
+    env.config.write_text(env.config.read_text().replace('log_group = adm', 'log_group = mysql_siem'))
+    for path in (env.directory, *env.directory.iterdir()):
+        env.owners[(path.stat().st_dev, path.stat().st_ino)] = env.account.pw_gid
+        if path.name.startswith('audit.log.'):
+            path.chmod(0o440)
+    original = env.config.stat().st_ino, env.config.read_bytes()
+    writer = Mock(wraps=permissions.write_acl)
+    monkeypatch.setattr(permissions, 'write_acl', writer)
+    assert permissions.prepare_permissions(Path('/synthetic/project'), 'upgrade', confirm=lambda _: 'AUDIT')
+    assert (env.config.stat().st_ino, env.config.read_bytes()) == original
+    writer.assert_not_called()
+    permissions.reload_auditd.assert_called_once()

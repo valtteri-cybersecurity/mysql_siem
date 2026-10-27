@@ -641,7 +641,30 @@ def validate_snapshot_entry(info, account, *, shared=False, directory=False):
         raise InstallationError('Unsafe snapshot log owner, permissions, type or hard link.')
 
 
-def open_snapshot_directory(parent, name, account, *, create=False, shared=False):
+def validate_legacy_snapshot_root(descriptor, account):
+    """Only the empty, privately owned historical root is migratable."""
+    info = os.fstat(descriptor)
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != account.pw_uid
+            or info.st_gid != account.pw_gid or stat.S_IMODE(info.st_mode) != 0o750
+            or os.listdir(descriptor)):
+        raise InstallationError('Only an empty mysql_siem:mysql_siem 0750 snapshot root can be migrated.')
+    attributes = os.listxattr(descriptor)
+    if 'system.posix_acl_access' in attributes or 'system.posix_acl_default' in attributes:
+        raise InstallationError('Legacy snapshot root ACLs require separate review.')
+    group = grp.getgrnam('mysql_siem')
+    if account.pw_name != 'mysql_siem' or group.gr_gid != account.pw_gid or set(group.gr_mem) - {account.pw_name}:
+        raise InstallationError('Legacy snapshot migration requires the private mysql_siem group.')
+    for candidate in grp.getgrall():
+        if candidate.gr_gid == account.pw_gid and candidate.gr_name != 'mysql_siem':
+            raise InstallationError('Legacy snapshot group ID is shared by another group.')
+    for user in pwd.getpwall():
+        if user.pw_name == account.pw_name:
+            continue
+        if user.pw_uid == account.pw_uid or account.pw_gid in os.getgrouplist(user.pw_name, user.pw_gid):
+            raise InstallationError('Legacy snapshot account or private group is shared.')
+
+
+def open_snapshot_directory(parent, name, account, *, create=False, shared=False, allow_legacy=False):
     if create:
         try:
             os.mkdir(name, mode=0o750 if shared else 0o700, dir_fd=parent)
@@ -650,7 +673,10 @@ def open_snapshot_directory(parent, name, account, *, create=False, shared=False
     descriptor = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
     try:
         info = os.fstat(descriptor)
-        validate_snapshot_entry(info, account, shared=shared, directory=True)
+        if shared and allow_legacy and info.st_uid == account.pw_uid:
+            validate_legacy_snapshot_root(descriptor, account)
+        else:
+            validate_snapshot_entry(info, account, shared=shared, directory=True)
         verify_snapshot_name(parent, name, descriptor)
         return descriptor
     except BaseException:
@@ -671,16 +697,24 @@ def set_snapshot_permissions(descriptor, uid, gid, mode):
         os.fchown(descriptor, uid, gid)
     if stat.S_IMODE(info.st_mode) != mode:
         os.fchmod(descriptor, mode)
+    info = os.fstat(descriptor)
+    if (info.st_uid, info.st_gid, stat.S_IMODE(info.st_mode)) != (uid, gid, mode):
+        raise InstallationError('Snapshot log permissions did not reach the required state; keep maintenance active.')
+    os.fsync(descriptor)
 
 
 def prepare_snapshot_logs(user, root=Path('/var/log/mysql_siem'), *, check_only=False):
     """Check or prepare only our fixed log tree; never change /var/log itself."""
+    from config import installation_state as journal
+
     root = Path(root)
     if root != LOG_PARENT / 'mysql_siem':
         raise InstallationError('Snapshot logs require the dedicated /var/log/mysql_siem layout.')
     account = pwd.getpwnam(user)
     if account.pw_uid == 0 or account.pw_gid == 0:
         raise InstallationError('Snapshot logs require a dedicated non-root account and group.')
+    if not check_only:
+        journal.require_maintenance(journal.STATE_DIR)
     trusted_directory(LOG_PARENT.parent)
     for ancestor in LOG_PARENT.parents:
         info = ancestor.lstat()
@@ -698,12 +732,30 @@ def prepare_snapshot_logs(user, root=Path('/var/log/mysql_siem'), *, check_only=
         if (named_parent.st_dev, named_parent.st_ino) != (opened_parent.st_dev, opened_parent.st_ino):
             raise InstallationError('Log parent changed during validation.')
         try:
-            root_fd = open_snapshot_directory(parent, root.name, account, create=not check_only, shared=True)
+            root_fd = open_snapshot_directory(parent, root.name, account, create=not check_only,
+                                              shared=True, allow_legacy=True)
         except FileNotFoundError:
             if check_only:
-                return
+                return 'missing'
             raise
         try:
+            legacy = os.fstat(root_fd).st_uid == account.pw_uid
+            if legacy:
+                verify_snapshot_name(parent, root.name, root_fd)
+                validate_legacy_snapshot_root(root_fd, account)
+                if check_only:
+                    return 'legacy-empty'
+                # The original descriptor stays pinned. No children are adopted.
+                verify_snapshot_name(parent, root.name, root_fd)
+                os.fchown(root_fd, 0, account.pw_gid)
+                os.fsync(root_fd)
+                verify_snapshot_name(parent, root.name, root_fd)
+                validate_snapshot_entry(os.fstat(root_fd), account, shared=True, directory=True)
+                migrated = os.fstat(root_fd)
+                attributes = os.listxattr(root_fd)
+                if (os.listdir(root_fd) or stat.S_IMODE(migrated.st_mode) != 0o750
+                        or 'system.posix_acl_access' in attributes or 'system.posix_acl_default' in attributes):
+                    raise InstallationError('Legacy snapshot root changed during migration; keep maintenance active.')
             for name in os.listdir(root_fd):
                 if name not in LOG_COMPONENTS:
                     raise InstallationError('Unexpected entry in snapshot log root: ' + name)
@@ -744,6 +796,7 @@ def prepare_snapshot_logs(user, root=Path('/var/log/mysql_siem'), *, check_only=
                 finally:
                     os.close(directory)
             verify_snapshot_name(parent, root.name, root_fd)
+            validate_snapshot_entry(os.fstat(root_fd), account, shared=True, directory=True)
         finally:
             os.close(root_fd)
     finally:
@@ -755,6 +808,7 @@ def prepare_snapshot_logs(user, root=Path('/var/log/mysql_siem'), *, check_only=
                                     stderr=subprocess.DEVNULL, timeout=5, check=False)
             if result.returncode != 0:
                 raise InstallationError('Service account cannot open snapshot log: ' + component)
+    return 'existing' if check_only else 'prepared'
 
 
 def main(arguments):

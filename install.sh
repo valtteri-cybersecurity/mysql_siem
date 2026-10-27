@@ -169,6 +169,10 @@ activate_service_installation() {
 }
 
 cleanup_prepared_installation() {
+    if [[ "${SNAPSHOT_LOGS_SETUP_STARTED:-0}" == 1 && "${SERVICE_PUBLISHED:-0}" != 1 ]]; then
+        warn "Snapshot log preparation began under maintenance; staged settings and recovery journal were retained. Rerun the same installation command."
+        return
+    fi
     if [[ "${LOCAL_DEPLOYMENT_STARTED:-0}" == 1 && "${SERVICE_PUBLISHED:-0}" != 1 ]]; then
         service_installation discard || warn "Prepared deployment retained; keep maintenance and recovery files and rerun the same installation command (keep --upgrade when upgrading)."
         return
@@ -744,6 +748,10 @@ exec 8< /usr/local/lib/.mysql_siem-local/runtime.lock
 flock -x -w 30 8 || die "Runtime jobs did not stop; collection remains paused."
 export SIEM_INSTALL_MAINTENANCE=1
 
+# Prepare and verify snapshot logs under both inherited locks, before database changes.
+SNAPSHOT_LOGS_SETUP_STARTED=1
+service_installation snapshot-logs "$INSTALL_USER"
+
 # Normal service enablement follows successful checks; never use it to pass them.
 log "Starting services."
 systemctl enable --now mysql
@@ -991,9 +999,6 @@ prepare_runtime_log "$PROJECT_DIR/ingestion/cron.log"
 prepare_runtime_log "$PROJECT_DIR/metrics/system/cron.log"
 prepare_runtime_log "$PROJECT_DIR/metrics/filesystem/cron.log"
 prepare_runtime_log "$PROJECT_DIR/metrics/security/cron.log"
-# Rotation needs writable logs outside the protected code tree.
-service_installation snapshot-logs "$INSTALL_USER"
-
 log "Checking Python syntax."
 while IFS= read -r -d '' pyfile; do
     "$APP_PYTHON" -m py_compile "$pyfile"
