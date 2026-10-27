@@ -38,18 +38,30 @@ die()  { printf '[ERROR] %s\n' "$*" >&2; exit 1; }
 
 # Installation role selection (before any installation changes).
 select_installation_role() {
-    local selection stored_role="" role_directory found_role argument
-    local -a role_arguments=()
-    INSTALL_OPERATION=reset
-    for argument in "$@"; do
-        if [[ "$argument" == --upgrade ]]; then
-            [[ "$INSTALL_OPERATION" == reset ]] || die "Duplicate --upgrade option."
-            INSTALL_OPERATION=upgrade
-        else
-            role_arguments+=("$argument")
-        fi
+    local selection stored_role="" role_directory found_role requested_role=""
+    INSTALL_OPERATION=""
+    INSTALL_REVISION=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --upgrade|--reset)
+                [[ -z "$INSTALL_OPERATION" ]] || die "Choose exactly one installation operation; duplicate or conflicting options are not allowed."
+                INSTALL_OPERATION="${1#--}"
+                shift
+                ;;
+            --role)
+                [[ $# -ge 2 && -z "$requested_role" ]] || die "Specify --role server or collector exactly once."
+                requested_role="$2"
+                shift 2
+                ;;
+            --revision)
+                [[ $# -ge 2 && -z "$INSTALL_REVISION" ]] || die "Specify --revision exactly once with a full commit ID."
+                [[ "$2" =~ ^[0-9a-fA-F]{40}$ ]] || die "--revision requires a full 40-character Git commit ID."
+                INSTALL_REVISION="${2,,}"
+                shift 2
+                ;;
+            *) die "Usage: sudo bash install.sh [--upgrade|--reset] [--role server|collector] [--revision COMMIT]" ;;
+        esac
     done
-    set -- "${role_arguments[@]}"
     for role_directory in "${SETTINGS_SOURCE_DIR:-$PROJECT_DIR}" "${SERVICE_DIR:-$PROJECT_DIR}"; do
         [[ ! -L "$role_directory/config" ]] || die "Configuration directory must not be a symbolic link."
         if [[ -e "$role_directory/config/role.env" || -L "$role_directory/config/role.env" ]]; then
@@ -58,9 +70,49 @@ select_installation_role() {
             stored_role="$found_role"
         fi
     done
-    if [[ $# -eq 0 && -n "$stored_role" ]]; then
+    if [[ -n "$requested_role" && "$requested_role" != server && "$requested_role" != collector ]]; then
+        die "Invalid installation role; use server or collector."
+    fi
+    if [[ -n "$stored_role" && -n "$requested_role" && "$requested_role" != "$stored_role" ]]; then
+        die "Installation role conflict; the stored role will not be changed."
+    fi
+    if [[ -z "$INSTALL_OPERATION" ]]; then
+        if [[ -n "$stored_role" || -z "$requested_role" ]]; then
+            printf '%s\n' '========================================' \
+                '          MySQL SIEM Installer' '========================================' '' \
+                'Select installation operation:' '' \
+                '1) UPGRADE - Keep database and existing data' \
+                '2) RESET   - Fresh installation (DELETE SIEM DATA)' ''
+            if [[ -n "$stored_role" ]]; then
+                printf '%s\n' 'UPGRADE is recommended for this existing installation.'
+            else
+                printf '%s\n' 'A fresh installation creates the application database without deleting a nonexistent database.'
+            fi
+            printf 'Selection [1/2]: '
+            if ! IFS= read -r selection; then
+                [[ -n "$stored_role" ]] || die "No installation operation selected; use --upgrade or --reset."
+                selection=""
+            fi
+            if [[ -z "$selection" && -n "$stored_role" ]]; then
+                INSTALL_OPERATION=upgrade
+            else
+                case "$selection" in
+                    1) INSTALL_OPERATION=upgrade ;;
+                    2) INSTALL_OPERATION=reset ;;
+                    *) die "Invalid installation operation; enter 1 or 2. No RESET was started." ;;
+                esac
+            fi
+        else
+            # Preserve the established explicit-role first-install command. An
+            # existing database still requires the separate exact RESET prompt.
+            INSTALL_OPERATION=reset
+        fi
+    fi
+    if [[ -n "$requested_role" ]]; then
+        INSTALL_ROLE="$requested_role"
+    elif [[ -n "$stored_role" ]]; then
         INSTALL_ROLE="$stored_role"
-    elif [[ $# -eq 0 ]]; then
+    else
         printf '%s\n' 'mysql_siem Installation
 
 1. SIEM Server
@@ -78,18 +130,6 @@ select_installation_role() {
             2) INSTALL_ROLE=collector ;;
             *) die "Invalid installation selection; enter 1 or 2." ;;
         esac
-    elif [[ $# -eq 2 && "$1" == --role ]]; then
-        INSTALL_ROLE="$2"
-    else
-        die "Usage: sudo bash install.sh [--role server|collector] [--upgrade]"
-    fi
-
-    case "$INSTALL_ROLE" in
-        server|collector) ;;
-        *) die "Invalid installation role; use server or collector." ;;
-    esac
-    if [[ -n "$stored_role" && "$INSTALL_ROLE" != "$stored_role" ]]; then
-        die "Installation role conflict; the stored role will not be changed."
     fi
     if [[ -z "$stored_role" && "$INSTALL_ROLE" == server && "${SIEM_BOOTSTRAP_CONFIRMED:-}" != "${SOURCE_DIR:-$PROJECT_DIR}" ]]; then
         printf 'No persistent role exists. Confirm Server role for this new or existing installation [yes]: '
@@ -758,9 +798,12 @@ fi
 
 # Final database reset approval follows successful Audit preparation and all preflights.
 if [[ "${INSTALL_OPERATION:-reset}" == reset && "${EXISTING_DATABASE:-0}" == 1 && "${RESET_RECOVERY:-0}" != 1 ]]; then
-        printf '%s\n' 'Existing local mysql_siem database detected.' \
-            'Reinstallation permanently deletes all events, metrics, alerts and database records.'
-        printf 'Type RESET to continue: '
+        printf '%s\n' 'WARNING: RESET INSTALLATION' '' \
+            'This operation will permanently delete the' \
+            'existing MySQL SIEM application database data.' '' \
+            'All collected events, metrics, alerts and' \
+            'collection checkpoints may be lost.' ''
+        printf 'Type RESET to confirm: '
         IFS= read -r reset_answer || die "Reset cancelled; Audit preparation may already have completed; no database reset was performed."
         [[ "$reset_answer" == RESET ]] || die "Reset cancelled; Audit preparation may already have completed; no database reset was performed."
         SIEM_DATABASE_RESET_APPROVED=1
@@ -985,10 +1028,16 @@ if [[ "${SSH_READY:-0}" == "1" ]]; then
     SSH_LOG_READABLE=1
     if [[ ! -e "$SSH_LOG_SOURCE" ]]; then
         warn "SSH log source absent: $SSH_LOG_SOURCE; the SSH collector will report SKIPPED until it appears."
+    elif [[ ! -f "$SSH_LOG_SOURCE" ]]; then
+        SSH_LOG_READABLE=0
+        warn "Auth log source must be a regular file; SSH jobs will NOT be scheduled."
     elif ! runuser -u "$INSTALL_USER" -- /usr/bin/head -c 1 "$SSH_LOG_SOURCE" >/dev/null; then
         SSH_LOG_READABLE=0
         warn "SSH log source is unreadable by mysql_siem: $SSH_LOG_SOURCE. SSH collection and detection will NOT be scheduled."
         warn "Check log ACLs, directory permissions and any access controls separately; do not loosen log permissions."
+    elif ! runuser -u "$INSTALL_USER" -- /usr/bin/timeout --kill-after=5s 35s "$PROJECT_DIR/config/run_with_env.sh" --ssh "$APP_PYTHON" -m ingestion.auth.main --check-source --logfile "$SSH_LOG_SOURCE"; then
+        warn "Auth timestamp preflight failed or was inconclusive; collection may report FAILED until the source is configured."
+        warn "Prefer precise ISO 8601 logs or configure a verified SSH_AUTH_SYSLOG_START/END/TIMEZONE interval; rsyslog settings were not changed."
     fi
     if [[ "$SSH_LOG_READABLE" == 1 ]]; then
         mkdir -p "$PROJECT_DIR/ingestion/auth" "$PROJECT_DIR/detection/ssh_brute_force"

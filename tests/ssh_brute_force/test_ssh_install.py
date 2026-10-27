@@ -30,7 +30,7 @@ def project(tmp_path):
     return root
 
 
-def ssh_cron(project, *, ready="1", source=None):
+def ssh_cron(project, *, ready="1", source=None, preflight_result="0"):
     if source is not None:
         (project / "config/ssh.env").write_text(f"SSH_AUTH_LOGFILE={source}\n")
 
@@ -48,7 +48,7 @@ def ssh_cron(project, *, ready="1", source=None):
         "die() { printf '%s\\n' \"$*\" >&2; exit 1; }\n"
         "chown() { :; }\n"
         "id() { printf 'test-group\\n'; }\n"
-        "runuser() { return 0; }\n"
+        "runuser() { if [[ \"$*\" == *--check-source* ]]; then return \"$SSH_PREFLIGHT_RESULT\"; fi; return 0; }\n"
         + log_helper
         + installer[start:end]
         + '\nprintf "%s\\n%s\\n" "$SSH_AUTH_CRON" "$SSH_DETECTION_CRON"'
@@ -64,6 +64,7 @@ def ssh_cron(project, *, ready="1", source=None):
             "PROJECT_DIR": str(project),
             "INSTALL_USER": "test-user",
             "SSH_READY": ready,
+            "SSH_PREFLIGHT_RESULT": preflight_result,
             "APP_PYTHON": sys.executable,
         },
     )
@@ -280,3 +281,25 @@ def test_auth_login_migration_is_required_before_installation():
     preflight = installer.split("for path in ", 1)[1].split("done", 1)[0]
     assert "database/auth_migrations.py" in preflight
     assert "database/migrations/021_auth_logins.sql" in preflight
+
+
+def test_installer_checks_source_timestamp_without_reconfiguring_rsyslog():
+    installer = (ROOT / "install.sh").read_text()
+    start = installer.index("# Schedule the SSH jobs independently;")
+    end = installer.index("# Schedule UFW Analysis;", start)
+    section = installer[start:end]
+    assert '-m ingestion.auth.main --check-source --logfile "$SSH_LOG_SOURCE"' in section
+    assert "runuser -u" in section
+    assert "SSH_AUTH_SYSLOG_START/END/TIMEZONE" in section
+    assert "/etc/rsyslog" not in section
+
+
+def test_failed_timestamp_preflight_warns_without_changing_source(project):
+    source = project / "auth.log"
+    original = "Oct 22 12:00:00 host CRON[1]: session opened\n"
+    source.write_text(original)
+    result = ssh_cron(project, source=source, preflight_result="1")
+    assert "Auth timestamp preflight failed or was inconclusive" in result.stderr
+    assert "SSH_AUTH_SYSLOG_START/END/TIMEZONE" in result.stderr
+    assert source.read_text() == original
+    assert "-m ingestion.auth.main --allow-missing-source" in result.stdout

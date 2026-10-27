@@ -630,3 +630,27 @@ def test_application_connection_sets_real_session_to_utc(mysql, monkeypatch):
             assert cursor.fetchone() == ("+00:00", name)
     finally:
         connection.close()
+
+
+def test_auth_collection_separates_trusted_sources_and_nullable_local_logins(mysql, tmp_path, monkeypatch):
+    from ingestion.auth.collector import collect_auth_events
+
+    first = enroll(mysql, source_type="auth")
+    second = enroll(mysql, source_type="auth", collector_id=first.collector_id)
+    logfile = tmp_path / "auth.log"
+    logfile.write_text(
+        "2026-10-22T12:00:00Z same-name sshd[1]: Failed password for alice from 192.0.2.1 port 123 ssh2\n"
+        "2026-10-22T12:00:01Z same-name login[2]: LOGIN ON tty1 BY alice\n"
+    )
+    for identity in (first, second):
+        monkeypatch.setenv("SIEM_AUTH_SOURCE_ID", str(identity.source_id))
+        monkeypatch.setenv("SIEM_COLLECTOR_ID", str(identity.collector_id))
+        assert collect_auth_events(mysql, logfile, collector_id="scoped-reader")["inserted"] == 2
+        assert collect_auth_events(mysql, logfile, collector_id="scoped-reader")["inserted"] == 0
+    with mysql.cursor() as cursor:
+        cursor.execute("SELECT host_id, source_id, collector_id, source_ip FROM auth_events "
+                       "WHERE event_type = 'LOCAL_LOGIN_SUCCESS' ORDER BY host_id")
+        assert cursor.fetchall() == ((first.host_id, first.source_id, first.collector_id, None),
+                                     (second.host_id, second.source_id, second.collector_id, None))
+        cursor.execute("SELECT COUNT(*) FROM auth_ingestion_state WHERE collector_id = 'scoped-reader'")
+        assert cursor.fetchone() == (2,)

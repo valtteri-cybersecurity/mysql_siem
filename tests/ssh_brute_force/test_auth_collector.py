@@ -19,11 +19,19 @@ from ingestion.auth.parser import parse_auth_line
 LINE = b"2026-10-22T12:00:00Z server-a sshd[12]: Failed password for alice from 192.0.2.1 port 22 ssh2\n"
 
 
-def test_duplicate_event_only_suppresses_duplicate_key_error():
+def test_duplicate_event_only_suppresses_duplicate_key_error(monkeypatch):
     cursor = MagicMock()
     event = parse_auth_line(LINE.decode())
     assert save_event(cursor, event) == 1
-    cursor.execute.side_effect = pymysql.IntegrityError(1062, "duplicate")
+    monkeypatch.setattr("ingestion.auth.db.identity_schema_enabled", lambda _: False)
+    cursor.fetchone.return_value = (event["event_time"], event["hostname"], event["source_ip"],
+                                    event["username"], event["event_type"], event["service"])
+
+    def duplicate_insert(sql, parameters):
+        if sql.startswith("INSERT"):
+            raise pymysql.IntegrityError(1062, "duplicate")
+
+    cursor.execute.side_effect = duplicate_insert
     assert save_event(cursor, event) == 0
     cursor.execute.side_effect = pymysql.IntegrityError(1048, "not null")
     with pytest.raises(pymysql.IntegrityError):
@@ -132,7 +140,7 @@ def test_rotation_disappearing_between_listing_and_open_is_safe(tmp_path, monkey
     connection = MagicMock()
     connection.cursor.return_value.fetchone.side_effect = [(1,), None]
     monkeypatch.setattr("ingestion.auth.collector.get_logfiles",
-                        lambda _: [str(logfile) + ".1", str(logfile)])
+                        lambda *args, **kwargs: [str(logfile) + ".1", str(logfile)])
     assert collect_auth_events(connection, logfile, collector_id="test")["inserted"] == 1
     connection.commit.assert_called_once()
 
@@ -340,3 +348,97 @@ def test_commit_failure_rolls_back_checkpoint_and_events(tmp_path):
         collect_auth_events(connection, logfile, collector_id="test")
     connection.rollback.assert_called_once()
     assert "RELEASE_LOCK" in connection.cursor.return_value.execute.call_args.args[0]
+
+
+@pytest.mark.parametrize("stored", [None, ("unrelated row",)])
+def test_other_unique_conflict_is_never_suppressed(monkeypatch, stored):
+    monkeypatch.setattr("ingestion.auth.db.identity_schema_enabled", lambda _: False)
+    cursor = MagicMock()
+    cursor.fetchone.return_value = stored
+
+    def conflict(sql, parameters):
+        if sql.startswith("INSERT"):
+            raise pymysql.IntegrityError(1062, "another unique constraint")
+
+    cursor.execute.side_effect = conflict
+    with pytest.raises(pymysql.IntegrityError) as raised:
+        save_event(cursor, parse_auth_line(LINE.decode()))
+    assert raised.value.args[0] == 1062
+
+
+def test_duplicate_lookup_uses_trusted_source_scope(monkeypatch):
+    from database.identity import EventIdentity
+
+    event = parse_auth_line(LINE.decode())
+    cursor = MagicMock()
+    cursor.fetchone.return_value = (event["event_time"], event["hostname"], event["source_ip"],
+                                    event["username"], event["event_type"], event["service"])
+
+    def duplicate(sql, parameters):
+        if sql.startswith("INSERT"):
+            raise pymysql.IntegrityError(1062, "duplicate")
+
+    cursor.execute.side_effect = duplicate
+    assert save_event(cursor, event, identity=EventIdentity(1, 2, 3)) == 0
+    sql, parameters = cursor.execute.call_args.args
+    assert "source_scope = %s" in sql
+    assert parameters == (event["event_hash"], 2)
+
+
+def test_compressed_rotation_is_reported_without_decompression(tmp_path):
+    logfile = tmp_path / "auth.log"
+    logfile.write_bytes(LINE)
+    (tmp_path / "auth.log.2.gz").write_bytes(b"not opened or decompressed")
+    connection = MagicMock()
+    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    stats = {}
+    result = collect_auth_events(connection, logfile, collector_id="test", stats=stats)
+    assert result["inserted"] == 1
+    assert stats["compressed_rotations"] == 1
+    assert stats["coverage_gaps"] == 1
+    assert stats["state_updated"] == "YES"
+    connection.commit.assert_called_once()
+
+
+def test_disappearing_rotation_reports_coverage_gap(tmp_path, monkeypatch):
+    logfile = tmp_path / "auth.log"
+    logfile.write_bytes(LINE)
+    connection = MagicMock()
+    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    monkeypatch.setattr("ingestion.auth.collector.get_logfiles",
+                        lambda *args, **kwargs: [str(logfile) + ".1", str(logfile)])
+    stats = {}
+    collect_auth_events(connection, logfile, collector_id="test", stats=stats)
+    assert stats["vanished_rotations"] == 1
+    assert stats["coverage_gaps"] == 1
+
+
+def test_cleanup_failure_retains_confirmed_commit_state(tmp_path):
+    logfile = tmp_path / "auth.log"
+    logfile.write_bytes(LINE)
+    connection = MagicMock()
+    cursor = connection.cursor.return_value
+    cursor.fetchone.side_effect = [(1,), None]
+
+    def fail_release(sql, parameters):
+        if "RELEASE_LOCK" in sql:
+            raise pymysql.OperationalError(2013, "synthetic cleanup failure")
+
+    cursor.execute.side_effect = fail_release
+    stats = {}
+    with pytest.raises(pymysql.OperationalError):
+        collect_auth_events(connection, logfile, collector_id="test", stats=stats)
+    assert stats["state_updated"] == "YES"
+    connection.commit.assert_called_once()
+
+
+def test_commit_ack_failure_has_unknown_state(tmp_path):
+    logfile = tmp_path / "auth.log"
+    logfile.write_bytes(LINE)
+    connection = MagicMock()
+    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    connection.commit.side_effect = pymysql.OperationalError(2013, "synthetic lost acknowledgement")
+    stats = {}
+    with pytest.raises(pymysql.OperationalError):
+        collect_auth_events(connection, logfile, collector_id="test", stats=stats)
+    assert stats["state_updated"] == "UNKNOWN"

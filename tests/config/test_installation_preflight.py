@@ -419,7 +419,7 @@ die() { printf '%s\n' "$*" >&2; exit 19; }
         assert result.returncode == 0, result.stderr
         assert result.stdout.strip().endswith('approved:' + ('1' if approved else '0'))
     if exists == '1':
-        assert 'Type RESET to continue' in result.stdout
+        assert 'Type RESET to confirm' in result.stdout
 
 
 def test_completed_reset_recovery_skips_new_reset_consent_and_uses_only_resume():
@@ -482,7 +482,7 @@ def test_legacy_grant_transition_is_approved_before_maintenance_and_applied_befo
     check = installer.index('-m config.reset_installation check --operation')
     audit = installer.index('audit_installation check --operation')
     approval = installer.index('-m config.legacy_runtime approve')
-    reset_confirmation = installer.index('Type RESET to continue:')
+    reset_confirmation = installer.index('Type RESET to confirm:')
     maintenance = installer.index('    local_identity_setup begin --reset')
     lock = installer.index('flock -x -w 30 8', maintenance)
     apply = installer.index('-m config.legacy_runtime apply')

@@ -833,8 +833,10 @@ def ssh_settings(project, user):
     path = project / 'config/ssh.env'
     if path.exists() or path.is_symlink():
         text = read_private(path, owner=pwd.getpwnam(user).pw_uid)
-        allowed = {'SSH_AUTH_LOGFILE', 'SSH_AUTH_COLLECTOR_ID', 'SSH_BRUTE_FORCE_BATCH_SIZE',
-                   'SSH_BRUTE_FORCE_LATE_SECONDS', 'SSH_BRUTE_FORCE_MAX_BUFFER_EVENTS'}
+        allowed = {'SSH_AUTH_LOGFILE', 'SSH_AUTH_COLLECTOR_ID', 'SSH_AUTH_MAX_SECONDS',
+                   'SSH_AUTH_SYSLOG_START', 'SSH_AUTH_SYSLOG_END', 'SSH_AUTH_SYSLOG_TIMEZONE',
+                   'SSH_BRUTE_FORCE_BATCH_SIZE', 'SSH_BRUTE_FORCE_LATE_SECONDS',
+                   'SSH_BRUTE_FORCE_MAX_BUFFER_EVENTS'}
         for line in text.splitlines():
             if not line or line.startswith('#'):
                 continue
