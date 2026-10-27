@@ -1,8 +1,8 @@
-# mysql_siem
+# MySQL SIEM
 
 **Linux Security Monitoring & Intrusion Detection**
 
-mysql_siem is an open-source security monitoring project built with Python and MySQL.
+MySQL SIEM is an open-source security monitoring project built with Python and MySQL.
 
 It collects security events, monitors Linux system activity, analyzes network traffic and detects potentially suspicious behavior.
 
