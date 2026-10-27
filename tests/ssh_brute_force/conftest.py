@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import pymysql
 import pytest
 
+from database.auth_migrations import upgrade_auth_events
 from detection.ssh_brute_force.detector import detect_ssh_brute_force
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -94,6 +95,8 @@ def mysql(private_server, apply_migration):
             cursor.execute(f"CREATE DATABASE `{schema_name}` CHARACTER SET utf8mb4")
         connection.select_db(schema_name)
         apply_migration(connection, "007_auth_events.sql")
+        upgrade_auth_events(connection, ROOT / "database/migrations/021_auth_logins.sql")
+        connection.commit()
         yield connection
     finally:
         connection.close()

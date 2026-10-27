@@ -132,3 +132,30 @@ def test_competing_collector_lock(mysql, private_server, tmp_path):
             collect_auth_events(mysql, tmp_path / "auth.log", collector_id="test")
         cursor.execute("SELECT RELEASE_LOCK(%s)", (lock_name,))
     assert not read_events(mysql)
+
+
+def test_login_metadata_and_null_local_source_are_saved_without_changing_failures(mysql):
+    failure = parse_auth_line(line())
+    local = dict(failure)
+    local.update(source_ip=None, event_type="LOCAL_LOGIN_SUCCESS", service="login",
+                 auth_method="pam", source_port=None, event_hash="f" * 64)
+    success = dict(failure)
+    success.update(event_type="SSH_LOGIN_SUCCESS", auth_method="publickey",
+                   source_port=54321, event_hash="e" * 64)
+    with mysql.cursor() as cursor:
+        assert save_event(cursor, failure) == 1
+        assert save_event(cursor, local) == 1
+        assert save_event(cursor, success) == 1
+        assert save_event(cursor, local) == 0
+    mysql.commit()
+    events = read_events(mysql)
+    assert len(events) == 3
+    for event in events:
+        if event["event_type"] == "LOCAL_LOGIN_SUCCESS":
+            assert event["source_ip"] is None
+            assert event["source_port"] is None
+            assert event["auth_method"] == "pam"
+        if event["event_type"] == "SSH_LOGIN_SUCCESS":
+            assert event["auth_method"] == "publickey"
+            assert event["source_port"] == 54321
+    assert detect_ssh_brute_force(events) == []

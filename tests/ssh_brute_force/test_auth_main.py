@@ -12,8 +12,8 @@ def test_manual_entry_point(monkeypatch):
     monkeypatch.setattr(main, "collect_auth_events", collect)
     assert main.main(["--logfile", "/tmp/example.log", "--collector-id", "test"]) == 0
     collect.assert_called_once_with(connection, "/tmp/example.log", collector_id="test",
-                                    stats={"lines_read": 0, "failures_recognized": 0, "duplicates": 0},
-                                    max_lines=5000)
+                                    stats={}, max_lines=5000, max_seconds=30,
+                                    syslog_start=None, syslog_end=None, syslog_timezone=None)
     connection.close.assert_called_once()
 
 

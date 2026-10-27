@@ -10,7 +10,13 @@ def save_event(cursor, event, *, identity=None):
     try:
         fields = ("event_time", "hostname", "source_ip", "username", "event_type",
                   "service", "raw_message", "event_hash")
-        values = tuple(event[key] for key in fields)
+        values = []
+        for key in fields:
+            values.append(event[key])
+        fields += ("auth_method", "source_port")
+        values.append(event.get("auth_method"))
+        values.append(event.get("source_port"))
+        values = tuple(values)
         if identity is not None:
             fields += ("host_id", "source_id", "collector_id", "sender_id", "source_scope")
             values += identity.values() + (identity.source_id,)

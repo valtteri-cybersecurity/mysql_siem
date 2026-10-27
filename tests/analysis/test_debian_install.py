@@ -87,6 +87,7 @@ install_virtualenv() { printf 'VENV_CHECK\n'; }
     'ID=debian\nVERSION_ID="13"\n',
     'ID=debian\nVERSION_ID="13.1"\n',
     'ID=ubuntu\nVERSION_ID="24.04"\n',
+    'ID=ubuntu\nVERSION_ID="26.04"\n',
     'ID=linuxmint\nVERSION_ID="22.3"\nID_LIKE="ubuntu debian"\n',
 ])
 @pytest.mark.parametrize("version", ["8.0.46", "8.4.13"])

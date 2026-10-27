@@ -3,6 +3,7 @@
 
 Versions 013-016 preserve the existing schema and add host identities.
 Version 017 upgrades UFW event timestamps to microsecond precision.
+Version 021 adds nullable Auth login metadata and local source addresses.
 MySQL DDL is resumed through schema inspection, not transaction rollback.
 """
 
@@ -38,6 +39,7 @@ MIGRATIONS = (
     ("018", "processes", ROOT / "migrations/018_processes.sql"),
     ("019", "services", ROOT / "migrations/019_services.sql"),
     ("020", "audit", ROOT / "migrations/020_audit.sql"),
+    ("021", "auth_logins", ROOT / "migrations/021_auth_logins.sql"),
 )
 
 
@@ -300,6 +302,10 @@ def apply_one(connection, version):
     elif version == "020":
         from database.audit_migrations import upgrade_audit
         upgrade_audit(connection, ROOT / "migrations/020_audit.sql")
+
+    elif version == "021":
+        from database.auth_migrations import upgrade_auth_events
+        upgrade_auth_events(connection, ROOT / "migrations/021_auth_logins.sql")
 
     else:
         raise MigrationError(

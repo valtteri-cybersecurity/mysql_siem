@@ -203,3 +203,44 @@ def test_results_do_not_include_raw_messages_or_extra_secrets():
     result = detect_ssh_brute_force(events)[0]
     assert "password" not in result
     assert "raw_message" not in result
+
+
+@pytest.mark.parametrize("message", [
+    "sshd[100]: Accepted password for alice from 192.0.2.1 port 54321 ssh2",
+    "sshd-session[100]: Accepted publickey for alice from 192.0.2.1 port 54321 ssh2",
+    "login[100]: LOGIN ON tty1 BY alice",
+    "login[100]: pam_unix(login:auth): authentication failure; logname= uid=0 euid=0 tty=/dev/tty1 ruser= rhost=  user=alice",
+])
+def test_new_login_types_do_not_complete_ssh_brute_force(message):
+    from ingestion.auth.parser import parse_auth_line
+
+    event = parse_auth_line("2026-10-22T12:00:04Z server-a " + message)
+    assert event is not None
+    event["id"] = 100
+    assert detect_ssh_brute_force(make_events(4) + [event]) == []
+    result = detect_ssh_brute_force(make_events(5) + [event])
+    assert len(result) == 1
+    assert result[0]["failure_count"] == 5
+    assert result[0]["evidence_ids"] == [1, 2, 3, 4, 5]
+
+
+def test_publickey_failure_counts_once_and_distinct_attempts_count():
+    from ingestion.auth.parser import parse_auth_line
+
+    raw = (
+        "2026-10-22T12:00:04Z server-a sshd-auth[100]: "
+        "Failed publickey for alice from 192.0.2.1 port 54321 ssh2"
+    )
+    event = parse_auth_line(raw)
+    assert event is not None
+    event["id"] = 100
+    duplicate = dict(event)
+    duplicate["id"] = 101
+    assert detect_ssh_brute_force(make_events(3) + [event, duplicate]) == []
+    separate = parse_auth_line(raw.replace("sshd-auth[100]", "sshd-auth[102]"))
+    assert separate is not None
+    separate["id"] = 102
+    result = detect_ssh_brute_force(make_events(3) + [event, duplicate, separate])
+    assert len(result) == 1
+    assert result[0]["failure_count"] == 5
+    assert result[0]["evidence_ids"] == [1, 2, 3, 100, 102]

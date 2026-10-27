@@ -195,7 +195,8 @@ load_port_scan_env() {
 load_ssh_env() {
     local env_file="$PROJECT_DIR/config/ssh.env"
     local line key value
-    unset SSH_AUTH_LOGFILE SSH_AUTH_COLLECTOR_ID
+    unset SSH_AUTH_LOGFILE SSH_AUTH_COLLECTOR_ID SSH_AUTH_MAX_SECONDS
+    unset SSH_AUTH_SYSLOG_START SSH_AUTH_SYSLOG_END SSH_AUTH_SYSLOG_TIMEZONE
     unset SSH_BRUTE_FORCE_BATCH_SIZE SSH_BRUTE_FORCE_LATE_SECONDS SSH_BRUTE_FORCE_MAX_BUFFER_EVENTS
     [[ -f "$env_file" ]] || return 0
     while IFS= read -r line || [[ -n "$line" ]]; do
@@ -204,7 +205,9 @@ load_ssh_env() {
         key="${line%%=*}"
         value="${line#*=}"
         case "$key" in
-            SSH_AUTH_LOGFILE|SSH_AUTH_COLLECTOR_ID|SSH_BRUTE_FORCE_BATCH_SIZE|SSH_BRUTE_FORCE_LATE_SECONDS|SSH_BRUTE_FORCE_MAX_BUFFER_EVENTS)
+            SSH_AUTH_LOGFILE|SSH_AUTH_COLLECTOR_ID|SSH_AUTH_MAX_SECONDS|\
+            SSH_AUTH_SYSLOG_START|SSH_AUTH_SYSLOG_END|SSH_AUTH_SYSLOG_TIMEZONE|\
+            SSH_BRUTE_FORCE_BATCH_SIZE|SSH_BRUTE_FORCE_LATE_SECONDS|SSH_BRUTE_FORCE_MAX_BUFFER_EVENTS)
                 export "$key=$value" ;;
             *) printf 'Unknown SSH configuration key.\n' >&2; return 1 ;;
         esac

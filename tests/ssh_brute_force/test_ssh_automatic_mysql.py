@@ -257,15 +257,35 @@ def test_global_writer_lock_prevents_out_of_order_collector_commits(automatic_my
 
 def test_bounded_collection_counts_and_resumes_without_loss(automatic_mysql, tmp_path):
     logfile = tmp_path / "auth.log"
-    logfile.write_text("".join(
-        f"2026-10-22T12:00:0{i}Z server-a sshd[{100+i}]: Failed password for alice from 192.0.2.1 port 22 ssh2\n"
-        for i in range(3)))
+    lines = []
+    for index in range(3):
+        lines.append(
+            f"2026-10-22T12:00:0{index}Z server-a sshd[{100 + index}]: "
+            "Failed password for alice from 192.0.2.1 port 22 ssh2\n"
+        )
+    logfile.write_text("".join(lines))
     stats = {}
     assert collect_auth_events(automatic_mysql, logfile, collector_id="test", stats=stats, max_lines=2)["inserted"] == 2
-    assert stats == {"lines_read": 2, "failures_recognized": 2, "duplicates": 0}
+    assert stats["lines_read"] == 2
+    assert stats["failures_recognized"] == 2
+    assert stats["duplicates"] == 0
+    assert stats["successes_recognized"] == 0
+    assert stats["local_logins_recognized"] == 0
+    assert stats["budget_exhausted"] is True
+    assert stats["remaining_bytes"] == len(lines[2].encode())
     assert collect_auth_events(automatic_mysql, logfile, collector_id="test", stats=stats, max_lines=2)["inserted"] == 1
     assert stats["lines_read"] == 1
+    assert stats["failures_recognized"] == 1
+    assert stats["budget_exhausted"] is False
+    assert stats["remaining_bytes"] == 0
     replay = tmp_path / "replayed-auth.log"
     replay.write_bytes(logfile.read_bytes())
     assert collect_auth_events(automatic_mysql, replay, collector_id="test", stats=stats)["inserted"] == 0
-    assert stats == {"lines_read": 3, "failures_recognized": 3, "duplicates": 3}
+    assert stats["lines_read"] == 3
+    assert stats["failures_recognized"] == 3
+    assert stats["duplicates"] == 3
+    assert stats["unrecognized_lines"] == 0
+    assert stats["invalid_lines"] == 0
+    assert stats["remaining_bytes"] == 0
+    assert stats["budget_exhausted"] is False
+    assert stats["elapsed_seconds"] >= 0

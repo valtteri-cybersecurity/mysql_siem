@@ -2,6 +2,7 @@
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,11 @@ def project(tmp_path):
     (root / "config").mkdir(parents=True)
     for name in ("run_with_env.sh", "ssh.env.example"):
         shutil.copy(ROOT / "config" / name, root / "config" / name)
+    runtime = root / "config/run_with_env.sh"
+    runtime.write_text(runtime.read_text().replace(
+        "LOCAL_STATE_DIR=/usr/local/lib/.mysql_siem-local",
+        "LOCAL_STATE_DIR=" + shlex.quote(str(root / "local-state")),
+    ))
     (root / "config/mysql.env").write_text(
         "DB_HOST=localhost\nDB_USER=test\nDB_PASSWORD=test-only\nDB_NAME=test\n"
     )
@@ -77,6 +83,9 @@ def test_cron_paths_environment_and_rotation(project):
         assert '--log-file ' in job and '>>' not in job
 
     assert "ingestion.auth.main --allow-missing-source" in jobs[0]
+    assert "/usr/bin/timeout --verbose --signal=TERM --kill-after=5s 50s " in jobs[0]
+    assert jobs[0].index("/usr/bin/timeout") < jobs[0].index("config/run_with_env.sh")
+    assert "/usr/bin/timeout" not in jobs[1]
     assert "detection.ssh_brute_force.main --automatic" in jobs[1]
 
     for name in (
@@ -223,3 +232,51 @@ def test_ssh_fresh_setup_has_no_legacy_opt_in_branch():
     assert 'SSH_READY=1' in block
     assert 'SSH_TABLE_COUNT' not in block
     assert 'SSH_RULE_COUNT' not in block
+
+
+def test_auth_source_context_and_budget_are_loaded_literally(project):
+    settings = project / "config/ssh.env"
+    settings.write_text(
+        "SSH_AUTH_MAX_SECONDS=30\n"
+        "SSH_AUTH_SYSLOG_START=2026-01-01T00:00:00+02:00\n"
+        "SSH_AUTH_SYSLOG_END=2027-01-01T00:00:00+02:00\n"
+        "SSH_AUTH_SYSLOG_TIMEZONE=Europe/Helsinki\n"
+    )
+    command = (
+        'printf "%s\\n" "$SSH_AUTH_MAX_SECONDS" "$SSH_AUTH_SYSLOG_START" '
+        '"$SSH_AUTH_SYSLOG_END" "$SSH_AUTH_SYSLOG_TIMEZONE"'
+    )
+    result = subprocess.run(
+        ["bash", str(project / "config/run_with_env.sh"), "--ssh", "bash", "-c", command],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.splitlines() == [
+        "30", "2026-01-01T00:00:00+02:00", "2027-01-01T00:00:00+02:00", "Europe/Helsinki",
+    ]
+
+
+def test_absent_ssh_config_clears_inherited_source_context(project):
+    environment = dict(os.environ)
+    for key in ("SSH_AUTH_MAX_SECONDS", "SSH_AUTH_SYSLOG_START", "SSH_AUTH_SYSLOG_END", "SSH_AUTH_SYSLOG_TIMEZONE"):
+        environment[key] = "untrusted inherited value"
+    command = (
+        'printf "%s\\n" "${SSH_AUTH_MAX_SECONDS-unset}" "${SSH_AUTH_SYSLOG_START-unset}" '
+        '"${SSH_AUTH_SYSLOG_END-unset}" "${SSH_AUTH_SYSLOG_TIMEZONE-unset}"'
+    )
+    result = subprocess.run(
+        ["bash", str(project / "config/run_with_env.sh"), "--ssh", "bash", "-c", command],
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout.splitlines() == ["unset", "unset", "unset", "unset"]
+
+
+def test_auth_login_migration_is_required_before_installation():
+    installer = (ROOT / "install.sh").read_text()
+    preflight = installer.split("for path in ", 1)[1].split("done", 1)[0]
+    assert "database/auth_migrations.py" in preflight
+    assert "database/migrations/021_auth_logins.sql" in preflight

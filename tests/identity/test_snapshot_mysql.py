@@ -201,7 +201,7 @@ def test_concurrent_collectors_use_separate_locks_but_overlap_is_rejected(mysql,
         other.close()
 
 
-@pytest.mark.parametrize('version', ['018', '019', '020'])
+@pytest.mark.parametrize('version', ['018', '019', '020', '021'])
 @pytest.mark.parametrize('fault', ['ddl-committed', 'process-exit'])
 def test_new_migrations_resume_without_changing_history(empty_mysql, monkeypatch, version, fault):
     original = migrate.apply_one
@@ -231,7 +231,7 @@ def test_new_migrations_resume_without_changing_history(empty_mysql, monkeypatch
         empty_mysql.commit()
         audit_targets = rows(empty_mysql, 'audit_targets')
     remaining = []
-    for step in ('018', '019', '020'):
+    for step in ('018', '019', '020', '021'):
         if step >= version:
             remaining.append(step)
     assert migrate.migrate(empty_mysql) == remaining

@@ -619,6 +619,8 @@ for path in \
     database/snapshot_migrations.py \
     database/audit_migrations.py \
     database/migrations/020_audit.sql \
+    database/auth_migrations.py \
+    database/migrations/021_auth_logins.sql \
     ingestion/audit/main.py \
     ingestion/audit/get.py \
     ingestion/audit/parser.py \
@@ -992,7 +994,7 @@ if [[ "${SSH_READY:-0}" == "1" ]]; then
         mkdir -p "$PROJECT_DIR/ingestion/auth" "$PROJECT_DIR/detection/ssh_brute_force"
         prepare_runtime_log "$PROJECT_DIR/ingestion/auth/cron.log"
         prepare_runtime_log "$PROJECT_DIR/detection/ssh_brute_force/cron.log"
-        SSH_AUTH_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh \"$APP_PYTHON\" -m ingestion.auth.main --allow-missing-source --log-file \"$PROJECT_DIR/ingestion/auth/cron.log\""
+        SSH_AUTH_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" /usr/bin/timeout --verbose --signal=TERM --kill-after=5s 50s \"$PROJECT_DIR/config/run_with_env.sh\" --ssh \"$APP_PYTHON\" -m ingestion.auth.main --allow-missing-source --log-file \"$PROJECT_DIR/ingestion/auth/cron.log\""
         SSH_DETECTION_CRON="* * * * * cd \"$PROJECT_DIR\" && umask 077 && PYTHONPATH=\"$PROJECT_DIR\" \"$PROJECT_DIR/config/run_with_env.sh\" --ssh \"$APP_PYTHON\" -m detection.ssh_brute_force.main --automatic --log-file \"$PROJECT_DIR/detection/ssh_brute_force/cron.log\""
     fi
 fi

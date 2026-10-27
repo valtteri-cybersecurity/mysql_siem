@@ -257,3 +257,49 @@ def test_daily_bounds_match_existing_ssh_and_ufw_timestamp_conversions(timestamp
         get_data.get_blocks_today(connection, instant)
     start, end = connection.cursor.return_value.execute.call_args.args[1]
     assert (start <= event_time < end) is belongs
+
+
+def test_new_auth_types_and_publickey_keep_daily_ssh_failure_semantics(legacy_identity):
+    import sqlite3
+
+    from ingestion.auth.parser import parse_auth_line
+
+    messages = [
+        "sshd[1]: Failed password for alice from 192.0.2.1 port 54321 ssh2",
+        "sshd-auth[2]: Failed publickey for alice from 192.0.2.1 port 54322 ssh2",
+        "sshd[3]: Accepted password for alice from 192.0.2.1 port 54323 ssh2",
+        "sshd-session[4]: Accepted publickey for alice from 192.0.2.1 port 54324 ssh2",
+        "login[5]: LOGIN ON tty1 BY alice",
+        "login[6]: pam_unix(login:auth): authentication failure; logname= uid=0 euid=0 tty=/dev/tty1 ruser= rhost=  user=alice",
+    ]
+    with sqlite3.connect(":memory:") as source:
+        source.execute(
+            "CREATE TABLE auth_events (event_time TEXT, event_type TEXT, service TEXT, "
+            "source_ip TEXT, event_hash TEXT UNIQUE)"
+        )
+        for message in messages:
+            event = parse_auth_line("2026-10-22T12:00:00Z host " + message)
+            assert event is not None
+            values = (
+                str(event["event_time"]), event["event_type"], event["service"],
+                event["source_ip"], event["event_hash"],
+            )
+            source.execute("INSERT INTO auth_events VALUES (?, ?, ?, ?, ?)", values)
+            source.execute("INSERT OR IGNORE INTO auth_events VALUES (?, ?, ?, ?, ?)", values)
+        source.execute(
+            "INSERT INTO auth_events VALUES (?, ?, ?, ?, ?)",
+            ("2026-10-21 23:59:59", "SSH_AUTH_FAILURE", "sshd", "192.0.2.1", "previous-day"),
+        )
+        query_cursor = source.cursor()
+        connection = MagicMock()
+        cursor = connection.cursor.return_value
+
+        def execute(query, values):
+            start, end = values
+            query_cursor.execute(query.replace("%s", "?"), (str(start), str(end)))
+
+        cursor.execute.side_effect = execute
+        cursor.fetchone.side_effect = query_cursor.fetchone
+        assert get_data.get_failed_logins(connection, datetime(2026, 10, 22, 12, tzinfo=timezone.utc)) == 2
+        cursor.close.assert_called_once()
+        assert source.execute("SELECT COUNT(*) FROM auth_events").fetchone()[0] == 7
