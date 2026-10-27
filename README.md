@@ -1,51 +1,107 @@
 # mysql_siem
 
-mysql_siem is a Python-based security monitoring application for Linux. It collects local events and system metrics, stores them in MySQL, and analyzes them for suspicious activity.
+**Linux Security Monitoring & Intrusion Detection**
 
-The project is actively evolving into a **centralized security monitoring service** for multiple Linux machines. Local Server installation is available today; remote Collector registration and HTTPS event delivery are still under development.
+mysql_siem is an open-source security monitoring project built with Python and MySQL.
+
+It collects security events, monitors Linux system activity, analyzes network traffic and detects potentially suspicious behavior.
+
+The project combines log collection, host monitoring, security analysis and threat detection into a single system.
 
 ## Features
 
-- UFW firewall event collection and traffic analysis
-- SSH authentication monitoring and brute-force detection
+**Network Security**
+- UFW firewall log collection and traffic analysis
+- Source IP and network port analysis
 - Port scan detection
-- DNS event collection through AdGuard Home
-- System, filesystem and security metrics
-- Process and systemd service snapshots with change history
-- Linux Audit metadata collection for passwd, shadow and sudo configuration
-- MySQL event history, security alerts and automated cron jobs
+- Optional DNS monitoring through AdGuard Home
+
+**Authentication Monitoring**
+- SSH login attempts and authentication events
+- Successful and failed SSH logins
+- Local login activity
+- SSH brute-force detection
+
+**System Monitoring**
+- System performance and resource metrics
+- Filesystem and security metrics
+- Running process monitoring and change detection
+- systemd service monitoring and change history
+
+**Security Auditing**
+- Linux Audit integration
+- Monitoring of sensitive system configuration files
+- Detection of changes to user account and sudo configurations
+
+**Data Storage & Automation**
+- MySQL database for collected events, metrics and security alerts
+- Automated collection and detection tasks
+- Incremental log processing and persistent collection state
+- Database migrations for version upgrades
+
+## Supported Linux Distributions
+
+Installation has been successfully tested on:
+
+- Debian 13
+- Ubuntu 24.04 LTS
+- Ubuntu 26.04 LTS
+- Linux Mint 22.3 
+
+The application uses Python 3 and MySQL 8.0 or 8.4.
+
+**Note:** Debian 13 requires an existing Oracle MySQL server and client installation. On Ubuntu and Linux Mint, the installer can install MySQL when needed. MariaDB is not currently supported.
 
 ## Installation
 
-Installation has been tested on **Debian 13, Ubuntu 24.04/26.04 and Linux Mint 22.3**. The current automatic installer recognizes Debian 13, Ubuntu and Linux Mint.
-
-Clone the project and start the Server installation:
+Clone the repository:
 
 ```bash
 git clone https://github.com/valtteri-cybersecurity/mysql_siem.git
 cd mysql_siem
+```
+
+Start the installation:
+
+```bash
 sudo bash install.sh --role server
 ```
 
-The installer downloads the current official `main` branch and shows its commit. Confirm the Server role when prompted. The installer creates the service account, installs dependencies, prepares an isolated Python environment and configures collection and analysis jobs. You can run it from a private home directory without moving the clone or opening access to your home.
+The installer retrieves the latest version from the official main branch and prepares the application environment, database, dependencies and automated monitoring tasks.
 
-- Service code: `/usr/local/lib/mysql_siem`
-- Python environment: `/opt/mysql_siem-venv`
-- Machine settings: `/usr/local/lib/mysql_siem/config/*.env`
+Follow the installation prompts. Certain monitoring features require the corresponding Linux services and log sources to be available.
 
-**Development reset installer:** if `mysql_siem` already exists, installation requires typing `RESET` and permanently deletes its events, metrics, alerts and database configuration. A fresh schema and local identities are created. File-based settings and logs are retained; the original Git clone and local changes stay untouched. Back up anything you want to keep before reinstalling. A failed reset installation keeps collection paused until a successful retry.
+DNS monitoring requires separate AdGuard Home configuration.
 
-To preserve an existing database, use `sudo bash install.sh --upgrade --role server`.
-The upgrade validates existing history and applies additive migrations. See the
-[local collector installation and acceptance checks](docs/local-collectors.md)
-for Processes, Services and Audit prerequisites, recovery and remaining host-level
-validation. Earlier platform installation tests do not establish acceptance of
-these new collectors.
+## Updating mysql_siem
 
-**Debian 13 requires a preinstalled Oracle MySQL 8.0 or 8.4 server and client**, with local administrative socket access. On Ubuntu and Mint, the installer can install MySQL when needed. MariaDB is not supported. Optional AdGuard Home integration requires separate configuration.
+Existing installations can be upgraded without intentionally deleting stored events, metrics or alerts.
 
-The `collector` installation role is reserved for future development and currently stops before making system changes.
+```bash
+cd mysql_siem
+sudo bash install.sh --upgrade --role server
+```
 
-## Project status
+The upgrade preserves the existing database and collection history while applying supported database migrations.
 
-This is an actively developed learning project focused on Python, MySQL, Linux administration and cybersecurity. It is not a replacement for a production-grade SIEM. The centralized architecture is being built incrementally while retaining the existing local collectors and detection capabilities.
+**Important:** Running the installer without `--upgrade` on an existing installation uses the reset installation path. If a database already exists, the installer requires explicit `RESET` confirmation before deleting its data.
+
+Back up important data before installation or upgrades.
+
+## Project Status
+
+mysql_siem is under active development.
+
+The current version operates as a local SIEM server with automated collection, monitoring, analysis and detection capabilities.
+
+Development is moving toward a centralized architecture where multiple Linux machines can report security events to a central server.
+
+Remote collector registration and HTTPS event delivery are not yet available.
+
+This is an educational and experimental cybersecurity project, not a replacement for a production-grade SIEM platform.
+
+## Technologies
+
+Python · MySQL · Linux · Bash · SQL · Linux Audit · Git
+
+
