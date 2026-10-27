@@ -29,7 +29,7 @@ def account_setup(tmp_path, *, exists=False, group=False, repeat=1, **settings):
     log = tmp_path / "calls"
     start = INSTALLER.index("# Application account management")
     end = INSTALLER.index("# End application account management.", start)
-    functions = INSTALLER[start:end]
+    functions = INSTALLER[start:end].replace('/etc/sudoers.d/zz-mysql-siem', str(tmp_path / 'managed-sudo-policy'))
     assignment = ''
     for line in INSTALLER.splitlines():
         if line.startswith("readonly INSTALL_USER="):
@@ -103,6 +103,7 @@ stat() { printf '%s\n' "${HOME_METADATA:-mysql_siem:mysql_siem:750}"; }
     binaries.mkdir()
     env = dict(os.environ)
     env["PATH"] = str(binaries)
+    env.pop("INSTALL_DISTRIBUTION", None)
     env.update({"STATE": str(state), "GROUP_STATE": str(group_state), "APP_HOME": str(account_home),
                 "CALLS": str(log), "SUDO_USER": "root"})
     env.update(settings)

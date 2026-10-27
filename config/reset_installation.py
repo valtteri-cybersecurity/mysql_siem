@@ -249,33 +249,81 @@ RUNTIME_TABLE_PRIVILEGES = {
 }
 
 
+# Historical installers granted these exact table permissions. They may only
+# be removed through the separate, administrator-approved legacy transition.
+LEGACY_RUNTIME_PRIVILEGES = {
+    'mysql_siem': {
+        'top_attacking_ips': 'SELECT, INSERT, UPDATE',
+        'top_targeted_ports': 'SELECT, INSERT, UPDATE',
+        'ufw_daily_actions_counts': 'SELECT, INSERT, UPDATE',
+    },
+    'ufw_monitor': {
+        'filesystem_metrics': 'SELECT, INSERT, UPDATE',
+        'security_metrics': 'SELECT, INSERT, UPDATE',
+        'system_metrics': 'SELECT, INSERT',
+        'top_attacking_ips': 'SELECT, INSERT, UPDATE',
+        'top_targeted_ports': 'SELECT, INSERT, UPDATE',
+        'ufw_daily_actions_counts': 'SELECT, INSERT, UPDATE',
+        'ufw_log': 'SELECT, INSERT',
+        'ufw_state': 'SELECT, INSERT, UPDATE',
+    },
+}
+
+
+def parse_runtime_grant(row):
+    if not isinstance(row, (tuple, list)) or len(row) != 1 or not isinstance(row[0], str):
+        raise ResetError('Cannot verify pythonuser privileges: invalid SHOW GRANTS result.')
+    grant = re.fullmatch(
+        r'GRANT ([A-Z_]+(?:, *[A-Z_]+)*) ON (\*|`[a-zA-Z0-9_]+`)\.'
+        r'(\*|`[a-zA-Z0-9_]+`) TO `pythonuser`@`localhost`', row[0])
+    if grant is None:
+        raise ResetError('Unsafe runtime privileges: unsupported grant, role or GRANT OPTION for '
+                         'pythonuser@localhost. Review manually.')
+    privileges = set()
+    for privilege in grant[1].split(','):
+        privileges.add(privilege.strip())
+    return grant[2].strip('`'), grant[3].strip('`'), privileges
+
+
+def runtime_grant_allowed(schema, table, privileges):
+    if privileges == {'USAGE'} and schema == '*' and table == '*':
+        return True
+    allowed = set(RUNTIME_TABLE_PRIVILEGES.get(table, '').split(', '))
+    return schema == DATABASE and table in RUNTIME_TABLE_PRIVILEGES and privileges <= allowed
+
+
 def validate_runtime_grants(rows):
-    """Accept complete SHOW GRANTS rows only for approved tables and rights."""
+    """Accept only approved table rights; legacy recognition never grants trust."""
     if not rows:
         raise ResetError('Cannot verify pythonuser privileges: SHOW GRANTS returned no rows.')
     for row in rows:
-        if not isinstance(row, (tuple, list)) or len(row) != 1 or not isinstance(row[0], str):
-            raise ResetError('Cannot verify pythonuser privileges: invalid SHOW GRANTS result.')
-        grant = re.fullmatch(
-            r'GRANT ([A-Z_]+(?:, *[A-Z_]+)*) ON (\*|`[a-zA-Z0-9_]+`)\.'
-            r'(\*|`[a-zA-Z0-9_]+`) TO `pythonuser`@`localhost`', row[0])
-        if grant is None:
-            raise ResetError('Unsafe runtime privileges: unsupported grant, role or GRANT OPTION for '
-                             'pythonuser@localhost. Review manually.')
-        privileges = set()
-        for privilege in grant[1].split(','):
-            privileges.add(privilege.strip())
-        schema = grant[2].strip('`')
-        table = grant[3].strip('`')
-        if privileges == {'USAGE'} and schema == '*' and table == '*':
+        schema, table, privileges = parse_runtime_grant(row)
+        if not runtime_grant_allowed(schema, table, privileges):
+            raise ResetError('Unsafe runtime privileges: unapproved rights or target '
+                             + schema + '.' + table + ' (' + ', '.join(sorted(privileges))
+                             + ') for pythonuser@localhost. Review manually.')
+
+
+def legacy_runtime_grant_plan(rows):
+    """Classify a finite historical policy, without changing or approving it."""
+    if not rows:
+        raise ResetError('Cannot verify pythonuser privileges: SHOW GRANTS returned no rows.')
+    planned = {}
+    for row in rows:
+        schema, table, privileges = parse_runtime_grant(row)
+        if runtime_grant_allowed(schema, table, privileges):
             continue
-        allowed = set(RUNTIME_TABLE_PRIVILEGES.get(table, '').split(', '))
-        if schema != DATABASE or table not in RUNTIME_TABLE_PRIVILEGES or not privileges <= allowed:
-            raise ResetError('Unsafe runtime privileges: unapproved rights or target for '
-                             'pythonuser@localhost. Review manually.')
+        maximum = LEGACY_RUNTIME_PRIVILEGES.get(schema, {}).get(table)
+        if maximum is None or not privileges <= set(maximum.split(', ')):
+            validate_runtime_grants([row])
+        planned.setdefault((schema, table), set()).update(privileges)
+    result = []
+    for (schema, table), privileges in sorted(planned.items()):
+        result.append({'schema': schema, 'table': table, 'privileges': sorted(privileges)})
+    return result
 
 
-def validate_account(connection, *, allow_missing=True):
+def read_account_grants(connection, *, allow_missing=True):
     """Read and validate direct/implicit rights; never repair an account."""
     try:
         with connection.cursor() as cursor:
@@ -298,7 +346,17 @@ def validate_account(connection, *, allow_missing=True):
     except pymysql.MySQLError:
         raise ResetError('Cannot verify pythonuser privileges: MySQL account/SHOW GRANTS query failed. '
                          'Review administrator access.') from None
+    return rows
+
+
+def validate_account(connection, *, allow_missing=True, allow_legacy=False):
+    rows = read_account_grants(connection, allow_missing=allow_missing)
+    if rows is None:
+        return []
+    if allow_legacy:
+        return legacy_runtime_grant_plan(rows)
     validate_runtime_grants(rows)
+    return []
 
 
 def clear_old_identity(state, project):
@@ -487,10 +545,12 @@ def upgrade_database(connection, settings):
     check_ufw_utc_readiness(connection)
 
 
-def database_preflight(operation):
+def database_preflight(operation, *, allow_legacy=False):
     """Check the running local server using SELECT/SHOW only; never start it."""
     if operation not in ('reset', 'upgrade'):
         raise ResetError('Unknown database preflight operation.')
+    if allow_legacy and operation != 'reset':
+        raise ResetError('Legacy grant preparation requires an explicit RESET installation.')
     result = run_command(['/usr/bin/systemctl', 'is-active', '--quiet', 'mysql.service'])
     if result.returncode:
         raise ResetError('MySQL must already be running; preflight does not start services.')
@@ -503,7 +563,10 @@ def database_preflight(operation):
             check_upgrade_database(connection)
         else:
             check_server_version(connection)
-            validate_account(connection)
+            if allow_legacy:
+                validate_account(connection, allow_legacy=True)
+            else:
+                validate_account(connection)
     finally:
         connection.close()
 
@@ -540,6 +603,7 @@ def main(argv=None):
     parser.add_argument('action', choices=('check', 'reset', 'upgrade', 'recovery-check', 'resume'))
     parser.add_argument('--operation', choices=('reset', 'upgrade'), default='upgrade')
     parser.add_argument('--project', type=Path, required=True)
+    parser.add_argument('--allow-legacy-grants', action='store_true')
     args = parser.parse_args(argv)
     connection = None
     try:
@@ -559,7 +623,10 @@ def main(argv=None):
                 raise ResetError('Database preflight requires administrator privileges.')
             trusted_directory(args.project)
             validate_settings(os.environ)
-            database_preflight(args.operation)
+            if args.allow_legacy_grants:
+                database_preflight(args.operation, allow_legacy=True)
+            else:
+                database_preflight(args.operation)
             if args.operation == 'reset':
                 check_system_cron()
             print('Database preflight passed; no database or scheduler changes were made.')

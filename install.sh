@@ -604,6 +604,7 @@ for path in \
     requirements-runtime.txt \
     config/service_installation.py \
     config/reset_installation.py \
+    config/legacy_runtime.py \
     config/install_bootstrap.sh \
     config/installation_state.py \
     database/local_identity.py \
@@ -734,7 +735,9 @@ load_mysql_env "$ENV_FILE"
 # These checks only read prepared state, MySQL and log prerequisites.
 # They must pass before starting a new maintenance period or database operation.
 service_installation preflight "$PROJECT_DIR" "$SERVICE_DIR" "$INSTALL_USER"
-PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation check --operation "$INSTALL_OPERATION" --project "$PROJECT_DIR"
+DATABASE_PREFLIGHT_OPTIONS=()
+if [[ "$INSTALL_OPERATION" == reset ]]; then DATABASE_PREFLIGHT_OPTIONS=(--allow-legacy-grants); fi
+PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation check --operation "$INSTALL_OPERATION" --project "$PROJECT_DIR" "${DATABASE_PREFLIGHT_OPTIONS[@]}"
 if [[ "$STAGING_RECOVERY" == 1 ]]; then
     local_identity_setup check-recovery
 fi
@@ -747,6 +750,9 @@ fi
 service_installation snapshot-logs-check "$INSTALL_USER"
 audit_installation permissions --operation "$INSTALL_OPERATION"
 audit_installation check --operation "$INSTALL_OPERATION"
+if [[ "$INSTALL_OPERATION" == reset ]]; then
+    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.legacy_runtime approve --project "$PROJECT_DIR"
+fi
 
 # Final database reset approval follows successful Audit preparation and all preflights.
 if [[ "${INSTALL_OPERATION:-reset}" == reset && "${EXISTING_DATABASE:-0}" == 1 && "${RESET_RECOVERY:-0}" != 1 ]]; then
@@ -770,6 +776,9 @@ export SIEM_INSTALL_MAINTENANCE=1
 # Prepare and verify snapshot logs under both inherited locks, before database changes.
 SNAPSHOT_LOGS_SETUP_STARTED=1
 service_installation snapshot-logs "$INSTALL_USER"
+if [[ "$INSTALL_OPERATION" == reset ]]; then
+    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.legacy_runtime apply --project "$PROJECT_DIR"
+fi
 
 # Normal service enablement follows successful checks; never use it to pass them.
 log "Starting services."

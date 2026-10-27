@@ -87,7 +87,7 @@ def restriction_exists():
     return True
 
 
-def restrict_mint_sudo(output, status, *, confirm=input):
+def restrict_mint_sudo(output, status):
     commands = mint_commands(output, status)
     if os.geteuid() != OWNER:
         raise InstallationError('Sudo restriction requires the installer administrator.')
@@ -95,10 +95,7 @@ def restrict_mint_sudo(output, status, *, confirm=input):
     trusted_directory(POLICY.parent)
     check_syntax('/etc/sudoers')
     if not restriction_exists():
-        print('Mint grants update/driver sudo helpers to every user. The private mysql_siem account '
-              'must not inherit these grants. Other users and Mint package files are unchanged.')
-        if confirm('Type RESTRICT-SUDO to deny sudo only for mysql_siem: ') != 'RESTRICT-SUDO':
-            raise InstallationError('Service sudo restriction declined; sudo policy was not changed.')
+        print('Restricting Mint helper sudo grants for the private mysql_siem service account.')
         descriptor, name = tempfile.mkstemp(prefix='.mysql-siem-', dir=POLICY.parent)
         temporary = Path(name)
         try:

@@ -63,12 +63,11 @@ def test_packaged_mint_helpers_are_restricted_with_native_read_only_queries(envi
         return result
 
     policy.command.side_effect = command
-    policy.restrict_mint_sudo(listing(commands), 0, confirm=lambda _: 'RESTRICT-SUDO')
+    policy.restrict_mint_sudo(listing(commands), 0)
     assert environment.read_text() == policy.TEXT
     assert environment.stat().st_mode & 0o777 == 0o440
     before = environment.stat().st_ino
-    policy.restrict_mint_sudo(listing(commands, restricted=True), 0,
-                              confirm=Mock(side_effect=AssertionError('Unexpected second approval')))
+    policy.restrict_mint_sudo(listing(commands, restricted=True), 0)
     assert environment.stat().st_ino == before
     for call in policy.command.call_args_list:
         arguments = call.args[0]
@@ -82,16 +81,16 @@ def test_packaged_mint_helpers_are_restricted_with_native_read_only_queries(envi
 def test_unexpected_grants_are_not_silently_repaired(environment, entry):
     output = listing() + '    ' + entry + '\n'
     with pytest.raises(policy.InstallationError, match='unexpected sudo'):
-        policy.restrict_mint_sudo(output, 0, confirm=lambda _: 'RESTRICT-SUDO')
+        policy.restrict_mint_sudo(output, 0)
     assert not environment.exists()
     policy.command.assert_not_called()
 
 
-def test_declining_restriction_changes_no_policy(environment):
-    with pytest.raises(policy.InstallationError, match='declined'):
-        policy.restrict_mint_sudo(listing(), 0, confirm=lambda _: 'no')
-    assert not environment.exists()
-    assert list(environment.parent.iterdir()) == []
+def test_known_mint_restriction_never_reads_interactive_input(environment, monkeypatch):
+    monkeypatch.setattr('builtins.input', Mock(side_effect=AssertionError('Unexpected interactive approval')))
+    policy.restrict_mint_sudo(listing(), 0)
+    assert environment.read_text() == policy.TEXT
+    assert list(environment.parent.iterdir()) == [environment]
 
 
 @pytest.mark.parametrize('fault', ['foreign', 'symlink', 'hardlink', 'unsafe-mode'])
@@ -108,7 +107,7 @@ def test_foreign_or_unsafe_destination_is_never_overwritten(environment, fault):
         environment.chmod(0o666 if fault == 'unsafe-mode' else 0o440)
     before = other.read_bytes()
     with pytest.raises((OSError, policy.InstallationError)):
-        policy.restrict_mint_sudo(listing(), 0, confirm=lambda _: 'RESTRICT-SUDO')
+        policy.restrict_mint_sudo(listing(), 0)
     assert other.read_bytes() == before
 
 
@@ -134,20 +133,19 @@ def test_failure_stops_and_retains_published_deny_without_restoring_grants(envir
 
     policy.command.side_effect = command
     with pytest.raises(policy.InstallationError):
-        policy.restrict_mint_sudo(listing(), 0, confirm=lambda _: 'RESTRICT-SUDO')
+        policy.restrict_mint_sudo(listing(), 0)
     assert environment.exists() == (fault not in ('syntax', 'candidate'))
     if environment.exists():
         assert environment.read_text() == policy.TEXT
         policy.command.side_effect = native
-        policy.restrict_mint_sudo(listing(restricted=True), 0,
-                                  confirm=Mock(side_effect=AssertionError('Already approved')))
+        policy.restrict_mint_sudo(listing(restricted=True), 0)
 
 
 @pytest.mark.parametrize('output,status', [('', 0), ('policy failed\n', 1), (listing(), 2),
                                          ('sudo: error\n' + listing(), 0)])
 def test_uncertain_listing_is_rejected_before_any_change(environment, output, status):
     with pytest.raises(policy.InstallationError):
-        policy.restrict_mint_sudo(output, status, confirm=lambda _: 'RESTRICT-SUDO')
+        policy.restrict_mint_sudo(output, status)
     assert not environment.exists()
 
 
@@ -165,6 +163,5 @@ def test_existing_deny_only_policy_is_accepted_without_rewriting_it(environment)
 
     policy.command.side_effect = command
     before = environment.stat().st_ino
-    policy.restrict_mint_sudo(listing([], restricted=True), 0,
-                              confirm=Mock(side_effect=AssertionError('Unexpected approval')))
+    policy.restrict_mint_sudo(listing([], restricted=True), 0)
     assert environment.stat().st_ino == before

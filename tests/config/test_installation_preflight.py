@@ -475,3 +475,35 @@ systemctl() { printf 'UNEXPECTED service change\\n'; exit 91; }
     assert 'UNEXPECTED' not in result.stdout
     assert 'recovery journal were retained' in result.stderr
     assert saved.read_bytes() == b'protected recovery evidence'
+
+
+def test_legacy_grant_transition_is_approved_before_maintenance_and_applied_before_database():
+    installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
+    check = installer.index('-m config.reset_installation check --operation')
+    audit = installer.index('audit_installation check --operation')
+    approval = installer.index('-m config.legacy_runtime approve')
+    reset_confirmation = installer.index('Type RESET to continue:')
+    maintenance = installer.index('    local_identity_setup begin --reset')
+    lock = installer.index('flock -x -w 30 8', maintenance)
+    apply = installer.index('-m config.legacy_runtime apply')
+    database = installer.index('\\nDATABASE_SETUP_STARTED=1\\n'.replace('\\n', '\n'))
+    assert check < audit < approval < reset_confirmation < maintenance < lock < apply < database
+    assert '(--allow-legacy-grants)' in installer[check - 200:check]
+
+
+@pytest.mark.parametrize('action', ['approve', 'apply'])
+def test_failed_legacy_grant_transition_never_reaches_database(action):
+    installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
+    marker = 'if [[ "$INSTALL_OPERATION" == reset ]]; then\n    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.legacy_runtime ' + action
+    start = installer.index(marker)
+    end = installer.index('\nfi\n', start) + len('\nfi\n')
+    prefix = '''set -euo pipefail
+INSTALL_OPERATION=reset
+PROJECT_DIR=/synthetic/stage
+APP_PYTHON=grant_probe
+grant_probe() { return 17; }
+'''
+    result = subprocess.run(['bash', '-c', prefix + installer[start:end] + '\nprintf "UNEXPECTED database change"\n'],
+                            input='', capture_output=True, text=True, timeout=5, check=False)
+    assert result.returncode == 17
+    assert 'UNEXPECTED' not in result.stdout
