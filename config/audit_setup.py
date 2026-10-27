@@ -241,49 +241,44 @@ def rule_lines(targets, arches, *, present_paths=None):
 def rule_signature(line):
     tokens = shlex.split(line)
     fields = {}
+    syscalls = []
     index = 0
-
     while index < len(tokens):
         option = tokens[index]
-
-        if (
-            option not in ('-a', '-F', '-k', '-S')
-            or index + 1 >= len(tokens)
-        ):
-            raise ValueError(
-                'Unsupported rule using a mysql_siem Audit key.'
-            )
-
+        if option not in ('-a', '-F', '-k', '-S') or index + 1 >= len(tokens):
+            raise ValueError('Unsupported rule using a mysql_siem Audit key.')
         value = tokens[index + 1]
-
-        if option == '-a':
-            fields['action'] = ','.join(sorted(value.split(',')))
-
-        elif option == '-k':
-            fields['key'] = value
-
-        elif option == '-S':
-            if value != 'all':
-                raise ValueError(
-                    'Unexpected syscall list using a mysql_siem Audit key.'
-                )
-
+        if option == '-S':
+            for name in value.split(','):
+                if not re.fullmatch(r'[a-z][a-z0-9_]*|[0-9]+', name):
+                    raise ValueError('Malformed Audit syscall list.')
+                syscalls.append(name)
         else:
-            name, separator, setting = value.partition('=')
-
-            if not separator or name in fields:
-                raise ValueError(
-                    'Unsupported or repeated Audit rule field.'
-                )
-
-            fields[name] = (
-                ''.join(sorted(setting))
-                if name == 'perm'
-                else setting
-            )
-
+            if option == '-a':
+                name, setting = 'action', ','.join(sorted(value.split(',')))
+            elif option == '-k':
+                name, setting = 'key', value
+            else:
+                name, separator, setting = value.partition('=')
+                if not separator:
+                    raise ValueError('Unsupported Audit rule field.')
+            if name in fields:
+                raise ValueError('Unsupported or repeated Audit rule field.')
+            fields[name] = ''.join(sorted(setting)) if name == 'perm' else setting
         index += 2
-
+    targets = set(fields) & {'path', 'dir', 'exe'}
+    if (len(targets) != 1 or set(fields) != {'action', 'key', 'arch', 'perm'} | targets
+            or fields['action'] != 'always,exit' or fields['arch'] not in ('b64', 'b32')
+            or fields['perm'] != 'aw' or not fields['key']):
+        raise ValueError('Incomplete or unsupported mysql_siem Audit rule.')
+    if 'all' in syscalls and syscalls != ['all']:
+        raise ValueError('Ambiguous Audit syscall list.')
+    if 'exe' in fields:
+        if syscalls != ['all']:
+            raise ValueError('Executable Audit rules require the full syscall mask.')
+    elif syscalls:
+        from config.audit_syscalls import validate_syscalls
+        validate_syscalls(fields['arch'], fields['perm'], syscalls)
     return fields
 
 

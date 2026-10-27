@@ -464,6 +464,7 @@ def prepare_deployment(source, target, user, role, stable, state, *, settings_so
     trusted_directory(state)
     record = journal.read_deployment(state)
     pending_transition = None
+    pending_identity = {}
     if (not reset and record is None and ((state / 'receipt.json').exists() or (state / 'receipt.json').is_symlink())
             and not (target / 'config/mysql.env').is_file()):
         raise InstallationError('An older identity receipt exists without installed database settings or a deployment journal. '
@@ -472,6 +473,8 @@ def prepare_deployment(source, target, user, role, stable, state, *, settings_so
     if record is not None:
         if (state / 'maintenance').exists():
             pending_transition = record['checkpoint_transition']
+            if reset and record['phase'] == 'staged' and record['database_started']:
+                pending_identity = dict(record['identity'])
         deployment_paths(record, target, stable, user)
         if record['phase'] == 'publishing':
             recover_publication(state, record)
@@ -498,13 +501,13 @@ def prepare_deployment(source, target, user, role, stable, state, *, settings_so
     # including a failure after publication. Completed upgrades start fresh.
     previous_database_started = bool(record is not None and record['database_started']
                                      and (reset or (state / 'maintenance').exists()))
-    if reset and target.exists():
+    if reset and target.exists() and not pending_identity:
         settings_source = target
     if settings_source is None or (target.exists() and (record is None or record['phase'] != 'staged')):
         settings_source = target if target.exists() else (settings_source or source)
     stage = stage_service(source, target, account.pw_uid, account.pw_gid, role=role, settings_source=settings_source)
     record = {'version': 1, 'stage': str(stage), 'target': str(target), 'stable': str(stable),
-              'user': user, 'candidate': None, 'phase': 'staged', 'identity': {}, 'publication': None,
+              'user': user, 'candidate': None, 'phase': 'staged', 'identity': pending_identity, 'publication': None,
               'database_started': previous_database_started, 'database_started_current': False,
               'cron_digest': None, 'checkpoint_transition': pending_transition}
     journal.save_deployment(state, record)

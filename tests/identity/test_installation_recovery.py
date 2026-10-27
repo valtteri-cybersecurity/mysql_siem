@@ -493,7 +493,7 @@ def test_reset_retry_uses_new_code_but_retains_pending_settings(deployment):
     assert (layout.target / 'app.py').read_text() == 'working program\n'
     record = journal.read_deployment(layout.state)
     assert record['stage'] == str(fresh)
-    assert record['identity'] == {}
+    assert record['identity'] == layout.identity
     assert record['database_started'] is True
 
 
@@ -953,3 +953,107 @@ def test_missing_upgrade_state_is_diagnosed_without_creating_or_deleting_files(u
     assert after == before
     if missing == 'state':
         assert not layout.state.exists()
+
+
+def test_interrupted_reset_restages_current_code_without_losing_pending_identity(deployment):
+    layout = deployment
+    (layout.stage / 'config/mysql.env').write_text('DB_PASSWORD=synthetic-pending-reset\n')
+    saved = (layout.stage / 'config/mysql.env').read_bytes()
+    resumed = service.prepare_deployment(layout.source, layout.target, layout.user, None,
+                                        layout.stable, layout.state, reset=True)
+    record = journal.read_deployment(layout.state)
+    assert record['identity'] == layout.identity
+    assert record['database_started'] is True
+    assert record['database_started_current'] is False
+    assert (resumed / 'config/mysql.env').read_bytes() == saved
+    assert local.read_settings(resumed / 'config/identity.env') == layout.identity
+    assert (resumed / 'app.py').read_text() == 'new program\n'
+    assert layout.stage.exists()
+
+
+@pytest.mark.parametrize('fault', [None, 'missing-receipt', 'bad-receipt', 'wrong-database',
+                                 'wrong-host', 'journal-identity', 'history'])
+def test_reset_resume_requires_database_receipt_and_identity_proof(deployment, monkeypatch, fault):
+    from config import reset_installation as reset
+
+    layout = deployment
+    monkeypatch.setattr(journal, 'STATE_DIR', layout.state)
+    connection = MagicMock()
+    connect = Mock(return_value=connection)
+    monkeypatch.setattr(reset.pymysql, 'connect', connect)
+    history = Mock()
+    monkeypatch.setattr(reset, 'check_upgrade_database', history)
+    receipt = layout.state / 'receipt.json'
+    if fault == 'missing-receipt':
+        receipt.unlink()
+    elif fault == 'bad-receipt':
+        receipt.write_text('{invalid')
+    elif fault == 'wrong-database':
+        monkeypatch.setattr(local, 'database_key', lambda connection: ('other', 'other-server'))
+    elif fault == 'wrong-host':
+        monkeypatch.setattr(local, 'validate_bindings', lambda *args: 99)
+    elif fault == 'journal-identity':
+        record = journal.read_deployment(layout.state)
+        record['identity'] = dict(layout.identity, SIEM_COLLECTOR_ID=999)
+        journal.save_deployment(layout.state, record)
+    elif fault == 'history':
+        history.side_effect = reset.ResetError('unverified migration history')
+    before = {path.name: path.read_bytes() for path in layout.state.iterdir() if path.is_file()}
+    if fault is None:
+        assert reset.prepared_reset_recovery(layout.stage) is True
+        history.assert_called_once_with(connection)
+    else:
+        with pytest.raises((ValueError, reset.ResetError)):
+            reset.prepared_reset_recovery(layout.stage)
+    connection.close.assert_called_once()
+    assert {path.name: path.read_bytes() for path in layout.state.iterdir() if path.is_file()} == before
+    assert not connection.commit.called
+    cursor = connection.cursor.return_value.__enter__.return_value
+    for call in cursor.execute.call_args_list:
+        assert call.args[0].startswith(('SELECT ', 'SHOW '))
+
+
+def test_fresh_reset_does_not_treat_database_started_alone_as_completion(deployment, monkeypatch):
+    from config import reset_installation as reset
+
+    layout = deployment
+    monkeypatch.setattr(journal, 'STATE_DIR', layout.state)
+    record = journal.read_deployment(layout.state)
+    record['identity'] = {}
+    journal.save_deployment(layout.state, record)
+    (layout.state / 'receipt.json').unlink()
+    connection = Mock()
+    monkeypatch.setattr(reset.pymysql, 'connect', connection)
+    assert reset.prepared_reset_recovery(layout.stage) is False
+    connection.assert_not_called()
+
+
+def test_completed_receipt_without_journal_identity_cannot_fall_back_to_reset(deployment, monkeypatch):
+    from config import reset_installation as reset
+
+    layout = deployment
+    monkeypatch.setattr(journal, 'STATE_DIR', layout.state)
+    record = journal.read_deployment(layout.state)
+    record['identity'] = {}
+    journal.save_deployment(layout.state, record)
+    before = (layout.state / 'receipt.json').read_bytes()
+    with pytest.raises(reset.ResetError, match='No RESET was attempted'):
+        reset.prepared_reset_recovery(layout.stage)
+    assert (layout.state / 'receipt.json').read_bytes() == before
+
+
+@pytest.mark.parametrize('recovered', [True, False])
+def test_resume_cli_has_no_destructive_or_identity_recreation_fallback(monkeypatch, tmp_path, recovered):
+    from config import reset_installation as reset
+
+    monkeypatch.setattr(reset.os, 'geteuid', Mock(return_value=0))
+    monkeypatch.setattr(reset, 'trusted_directory', Mock())
+    monkeypatch.setattr(reset, 'validate_settings', Mock())
+    monkeypatch.setattr(reset, 'prepared_reset_recovery', Mock(return_value=recovered))
+    deletion = Mock(side_effect=AssertionError('Unexpected DROP or ALTER'))
+    monkeypatch.setattr(reset, 'reset_database', deletion)
+    creation = Mock(side_effect=AssertionError('Unexpected identity recreation'))
+    monkeypatch.setattr(local, 'provision', creation)
+    assert reset.main(['resume', '--project', str(tmp_path)]) == int(not recovered)
+    deletion.assert_not_called()
+    creation.assert_not_called()

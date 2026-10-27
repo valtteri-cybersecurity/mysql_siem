@@ -508,14 +508,52 @@ def database_preflight(operation):
         connection.close()
 
 
+def prepared_reset_recovery(project):
+    """Prove completed database/identities; a started flag alone is not proof."""
+    from database.local_identity import check_staged_receipt, read_receipt
+
+    record = journal.read_deployment(journal.STATE_DIR)
+    if record is None or record['phase'] != 'staged' or record['stage'] != str(project):
+        raise ResetError('RESET recovery requires the protected staging journal.')
+    if not record['identity']:
+        receipt = read_receipt(journal.STATE_DIR / 'receipt.json')
+        if receipt is not None and receipt['phase'] == 'database_ready':
+            raise ResetError('Completed receipt conflicts with missing journal identities; preserve recovery files. No RESET was attempted.')
+        return False
+    if not record['database_started']:
+        raise ResetError('Conflicting RESET recovery history; no database reset was attempted.')
+    journal.require_stage(journal.STATE_DIR, project)
+    connection = pymysql.connect(unix_socket=SOCKET, user='root', database=DATABASE,
+                                 charset='utf8mb4', autocommit=True,
+                                 connect_timeout=5, read_timeout=15, write_timeout=15)
+    try:
+        check_staged_receipt(connection, journal.STATE_DIR, project, Path(record['target']), record['user'])
+        # Reuse migration/history/account checks, without applying migrations.
+        check_upgrade_database(connection)
+    finally:
+        connection.close()
+    return True
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('check', 'reset', 'upgrade'))
+    parser.add_argument('action', choices=('check', 'reset', 'upgrade', 'recovery-check', 'resume'))
     parser.add_argument('--operation', choices=('reset', 'upgrade'), default='upgrade')
     parser.add_argument('--project', type=Path, required=True)
     args = parser.parse_args(argv)
     connection = None
     try:
+        if args.action in ('recovery-check', 'resume'):
+            if os.geteuid() != 0:
+                raise ResetError('RESET recovery requires administrator privileges.')
+            trusted_directory(args.project)
+            validate_settings(os.environ)
+            recovered = prepared_reset_recovery(args.project)
+            if args.action == 'resume' and not recovered:
+                raise ResetError('Completed RESET recovery was not proven; no destructive fallback is allowed.')
+            print(int(recovered) if args.action == 'recovery-check' else
+                  'Completed RESET database verified; database and local identities preserved.')
+            return 0
         if args.action == 'check':
             if os.geteuid() != 0:
                 raise ResetError('Database preflight requires administrator privileges.')

@@ -450,3 +450,151 @@ def test_pending_permission_migration_blocks_timer_start(activation):
     assert setup.main(['activate', '--project', str(activation['project'])]) == 1
     assert activation['commands'] == []
     assert (activation['directory'] / 'maintenance').exists()
+
+
+DEBIAN_B64_SYSCALLS = ('open,bind,truncate,ftruncate,rename,mkdir,rmdir,creat,link,unlink,symlink,chmod,'
+                      'fchmod,chown,fchown,lchown,mknod,acct,swapon,quotactl,setxattr,lsetxattr,fsetxattr,'
+                      'removexattr,lremovexattr,fremovexattr,openat,mkdirat,mknodat,fchownat,unlinkat,'
+                      'renameat,linkat,symlinkat,fchmodat,fallocate,renameat2,openat2')
+
+
+@pytest.fixture
+def canonical_syscalls(monkeypatch):
+    """Model the two native libaudit ABIs; exercise the real bitmap comparator."""
+    import ctypes
+
+    from config import audit_syscalls
+
+    names = {'b64': DEBIAN_B64_SYSCALLS.split(','),
+             'b32': ['open', 'truncate64', 'ftruncate64', 'chown32', 'fchown32', 'openat', 'openat2']}
+    library = SimpleNamespace()
+    memory = (ctypes.c_uint32 * 67)()
+    selected = {'arch': 'b64'}
+    machines = {64: 'b64', 32: 'b32'}
+    tables = {}
+    for arch, calls in names.items():
+        tables[arch] = {}
+        for number, name in enumerate(calls):
+            tables[arch][name] = number + (100 if arch == 'b32' else 0)
+
+    def create():
+        for index in range(67):
+            memory[index] = 0
+        return ctypes.addressof(memory)
+
+    def field(pointer, buffer, flags):
+        assert flags == 4  # AUDIT_FILTER_EXIT
+        value = buffer.value.decode()
+        if value.startswith('arch='):
+            selected['arch'] = value[5:]
+        else:
+            assert value == 'perm=aw'
+            for number in tables[selected['arch']].values():
+                memory[3 + number // 32] |= 1 << (number % 32)
+        return 0
+
+    library.audit_rule_create_data = Mock(side_effect=create)
+    library.audit_rule_free_data = Mock()
+    library.audit_rule_fieldpair_data = Mock(side_effect=field)
+    library.audit_determine_machine = Mock(side_effect=lambda arch: 64 if arch == b'b64' else 32)
+    library.audit_name_to_syscall = Mock(side_effect=lambda name, machine: tables[machines[machine]].get(name.decode(), -1))
+    monkeypatch.setattr(audit_syscalls.ctypes, 'CDLL', Mock(return_value=library))
+
+    def validate(arch, permissions, calls):
+        if not audit_syscalls.native_masks(arch, permissions, calls):
+            raise ValueError('Noncanonical Audit syscall list.')
+
+    # The separate-process transport is tested independently below. No auditctl
+    # rule mutations are used, and the comparison itself is production code.
+    monkeypatch.setattr(audit_syscalls, 'validate_syscalls', validate)
+    return names
+
+
+@pytest.mark.parametrize('arch', ['b64', 'b32'])
+@pytest.mark.parametrize('key_style', ['-k siem_passwd', '-F key=siem_passwd'])
+def test_native_canonical_syscalls_match_implicit_rules_in_any_field_order(canonical_syscalls, arch, key_style):
+    expected = f'-a always,exit -F arch={arch} -F path=/etc/passwd -F perm=wa -k siem_passwd'
+    calls = ','.join(reversed(canonical_syscalls[arch]))
+    active = f'{key_style} -F perm=aw -S {calls} -F path=/etc/passwd -F arch={arch} -a exit,always'
+    assert setup.verify_rules([expected], active) == []
+    assert setup.verify_rules([expected], expected) == []
+
+
+@pytest.mark.parametrize('fault', ['missing-syscall', 'extra-syscall', 'wrong-abi-list', 'wrong-arch',
+                                  'wrong-path', 'wrong-perm', 'extra-field', 'duplicate-action',
+                                  'duplicate-key', 'missing-field', 'malformed-syscall'])
+def test_non_equivalent_owned_rules_remain_rejected(canonical_syscalls, fault):
+    expected = '-a always,exit -F arch=b64 -F path=/etc/passwd -F perm=wa -k siem_passwd'
+    calls = list(canonical_syscalls['b64'])
+    if fault == 'missing-syscall':
+        calls.pop()
+    elif fault == 'extra-syscall':
+        calls.append('getpid')
+    elif fault == 'wrong-abi-list':
+        calls = canonical_syscalls['b32']
+    elif fault == 'malformed-syscall':
+        calls.append('')
+    active = expected + ' -S ' + ','.join(calls)
+    changes = {'wrong-arch': ('arch=b64', 'arch=b32'), 'wrong-path': ('/etc/passwd', '/other'),
+               'wrong-perm': ('perm=wa', 'perm=w'), 'missing-field': ('-F perm=wa ', '')}
+    if fault in changes:
+        active = active.replace(*changes[fault])
+    elif fault == 'extra-field':
+        active += ' -F uid=0'
+    elif fault == 'duplicate-action':
+        active += ' -a always,exit'
+    elif fault == 'duplicate-key':
+        active += ' -F key=siem_passwd'
+    with pytest.raises(ValueError):
+        setup.verify_rules([expected], active)
+
+
+def test_eight_debian_rules_are_not_added_again(installation, canonical_syscalls, monkeypatch):
+    targets = []
+    present = set()
+    for target in setup.DEFAULT_TARGETS:
+        targets.append(dict(target, audit_key='siem_' + target['name']))
+        present.update(target['files'])
+        present.update(target['directories'])
+    monkeypatch.setattr(setup, 'architectures', Mock(return_value=['b64', 'b32']))
+    monkeypatch.setattr(setup, 'inspect_audit_targets', Mock(return_value=(present, dict.fromkeys(present, 'PRESENT'))))
+    installation['targets'] = targets
+    expected = setup.rule_lines(targets, ['b64', 'b32'], present_paths=present)
+    assert len(expected) == 8
+    for line in expected:
+        arch = setup.rule_signature(line)['arch']
+        installation['active'].append(line + ' -S ' + ','.join(canonical_syscalls[arch]))
+    installation['rules'].write_text(setup.MARKER + '\n'.join(expected) + '\n')
+    prepare(installation)
+    prepare(installation)
+    assert len(installation['active']) == 8
+    for arguments in installation['commands']:
+        assert arguments[:2] != ['/usr/sbin/auditctl', '-a']
+        assert '-D' not in arguments
+
+
+@pytest.mark.parametrize('output,status,stderr', [('false\n', 0, ''), ('true\n', 1, ''),
+                                                ('true\n', 0, 'library error'), ('invalid', 0, '')])
+def test_failed_native_comparison_is_never_accepted(monkeypatch, output, status, stderr):
+    from config import audit_syscalls
+
+    monkeypatch.setattr(audit_syscalls.subprocess, 'run', Mock(return_value=SimpleNamespace(
+        returncode=status, stdout=output, stderr=stderr)))
+    with pytest.raises(ValueError, match='Cannot prove'):
+        audit_syscalls.validate_syscalls('b64', 'aw', ['open'])
+
+
+@pytest.mark.parametrize('arch', ['b64', 'b32'])
+def test_installed_ubuntu_libaudit_compares_rules_without_kernel_changes(arch):
+    import ctypes
+
+    from config.audit_syscalls import validate_syscalls
+
+    # On Audit 3 the documented auditctl fallback is -S all. Audit 4 instead
+    # derives a finite mask, so this probe is deliberately version-dependent.
+    library = ctypes.CDLL('libaudit.so.1')
+    if hasattr(library, 'audit_perm_to_name'):
+        pytest.skip('This probe checks the installed Audit 3 compatibility path.')
+    validate_syscalls(arch, 'aw', ['all'])
+    with pytest.raises(ValueError):
+        validate_syscalls(arch, 'aw', ['open'])

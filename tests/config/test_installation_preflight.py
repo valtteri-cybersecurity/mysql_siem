@@ -214,6 +214,7 @@ service_installation() {
     fi
 }
 preflight_python() {
+    if [[ "$*" == *'config.reset_installation recovery-check'* ]]; then printf '0'; return; fi
     [[ "$*" == *'config.reset_installation check'* ]] || { printf 'UNEXPECTED database operation\\n'; return 91; }
     printf 'mysql\\n'
     [[ "$FAILURE" != mysql ]] || return 17
@@ -419,3 +420,58 @@ die() { printf '%s\n' "$*" >&2; exit 19; }
         assert result.stdout.strip().endswith('approved:' + ('1' if approved else '0'))
     if exists == '1':
         assert 'Type RESET to continue' in result.stdout
+
+
+def test_completed_reset_recovery_skips_new_reset_consent_and_uses_only_resume():
+    installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
+    start = installer.index('# Final database reset approval')
+    end = installer.index('if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then\n    local_identity_setup begin', start)
+    dispatch = installer.index('if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then\n    PYTHONPATH=', end)
+    finish = installer.index('# Both schema paths', dispatch)
+    prefix = '''set -euo pipefail
+INSTALL_OPERATION=reset
+EXISTING_DATABASE=1
+RESET_RECOVERY=1
+PROJECT_DIR=/synthetic/stage
+APP_PYTHON=database_probe
+die() { printf 'UNEXPECTED consent\\n'; exit 91; }
+database_probe() {
+    [[ "$*" == '-m config.reset_installation resume --project /synthetic/stage' ]] || exit 92
+    printf 'resumed without database reset\\n'
+}
+'''
+    result = subprocess.run(['bash', '-c', prefix + installer[start:end] + installer[dispatch:finish]],
+                            input='', capture_output=True, text=True, check=False, timeout=5)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == 'resumed without database reset'
+
+
+def test_invalid_reset_recovery_stops_before_any_new_maintenance_or_database_action(tmp_path):
+    installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
+    start = installer.index('if [[ "$INSTALL_OPERATION" == reset ]]; then\n    RESET_RECOVERY_CHECK_ACTIVE=1')
+    end = installer.index('# Both schema paths', start)
+    cleanup_start = installer.index('cleanup_prepared_installation() {')
+    cleanup_end = installer.index('\n}\n', cleanup_start) + 3
+    saved = tmp_path / 'deployment.json'
+    saved.write_bytes(b'protected recovery evidence')
+    prefix = '''set -euo pipefail
+INSTALL_OPERATION=reset
+SERVICE_PUBLISHED=0
+LOCAL_DEPLOYMENT_STARTED=1
+warn() { printf '%s\\n' \"$*\" >&2; }
+PROJECT_DIR=/synthetic/stage
+APP_PYTHON=database_probe
+database_probe() {
+    [[ "$*" == *'config.reset_installation recovery-check'* ]] || exit 91
+    return 17
+}
+service_installation() { printf 'UNEXPECTED installation change\\n'; exit 91; }
+local_identity_setup() { printf 'UNEXPECTED maintenance change\\n'; exit 91; }
+systemctl() { printf 'UNEXPECTED service change\\n'; exit 91; }
+'''
+    result = subprocess.run(['bash', '-c', prefix + installer[cleanup_start:cleanup_end] + '\ntrap cleanup_prepared_installation EXIT\n' + installer[start:end]],
+                            input='', capture_output=True, text=True, check=False, timeout=5)
+    assert result.returncode == 17
+    assert 'UNEXPECTED' not in result.stdout
+    assert 'recovery journal were retained' in result.stderr
+    assert saved.read_bytes() == b'protected recovery evidence'

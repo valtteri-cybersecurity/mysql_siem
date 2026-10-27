@@ -30,6 +30,7 @@ SERVICE_PUBLISHED=0
 DATABASE_SETUP_STARTED=0
 LOCAL_DEPLOYMENT_STARTED=0
 STAGING_RECOVERY=0
+RESET_RECOVERY=0
 
 log()  { printf '[INFO] %s\n' "$*"; }
 warn() { printf '[WARN] %s\n' "$*" >&2; }
@@ -169,6 +170,10 @@ activate_service_installation() {
 }
 
 cleanup_prepared_installation() {
+    if [[ "${RESET_RECOVERY_CHECK_ACTIVE:-0}" == 1 && "${SERVICE_PUBLISHED:-0}" != 1 ]]; then
+        warn "RESET recovery could not be verified; staged settings and recovery journal were retained. No destructive fallback was attempted."
+        return
+    fi
     if [[ "${SNAPSHOT_LOGS_SETUP_STARTED:-0}" == 1 && "${SERVICE_PUBLISHED:-0}" != 1 ]]; then
         warn "Snapshot log preparation began under maintenance; staged settings and recovery journal were retained. Rerun the same installation command."
         return
@@ -220,6 +225,7 @@ detect_distribution() {
             die "Supported systems: Debian 13, Ubuntu and Linux Mint."
             ;;
     esac
+    INSTALL_DISTRIBUTION="$ID"
     log "Detected $ID $VERSION_ID."
 }
 
@@ -356,7 +362,12 @@ validate_application_user() {
               "$sudo_denial_host" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*\.$ ]]; then
             :
         elif [[ "$sudo_output" == *"User $INSTALL_USER may run the following commands on "* ]]; then
-            die "mysql_siem has sudo privileges; remove them manually before installing."
+            if [[ "${INSTALL_DISTRIBUTION:-}" == linuxmint || -e /etc/sudoers.d/zz-mysql-siem || -L /etc/sudoers.d/zz-mysql-siem ]]; then
+                /usr/bin/python3 -I -B -c 'import sys; sys.path.insert(0, sys.argv[1]); from config.sudo_policy import main; sys.exit(main(sys.argv[2:]))' \
+                    "$SOURCE_DIR" "$sudo_status" "$sudo_output" || die "Cannot safely restrict mysql_siem sudo policy."
+            else
+                die "mysql_siem has sudo privileges; remove them manually before installing."
+            fi
         else
             die "Cannot verify that mysql_siem has no sudo privileges; review sudo policy."
         fi
@@ -612,6 +623,8 @@ for path in \
     ingestion/audit/parser.py \
     ingestion/audit/database.py \
     ingestion/audit/targets.py \
+    config/sudo_policy.py \
+    config/audit_syscalls.py \
     config/audit_setup.py \
     config/audit_permissions.py \
     config/audit_launcher.py \
@@ -725,12 +738,18 @@ PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation check --ope
 if [[ "$STAGING_RECOVERY" == 1 ]]; then
     local_identity_setup check-recovery
 fi
+if [[ "$INSTALL_OPERATION" == reset ]]; then
+    RESET_RECOVERY_CHECK_ACTIVE=1
+    RESET_RECOVERY="$(PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation recovery-check --project "$PROJECT_DIR")"
+    [[ "$RESET_RECOVERY" == 0 || "$RESET_RECOVERY" == 1 ]] || die "Unexpected RESET recovery result; database was preserved."
+    RESET_RECOVERY_CHECK_ACTIVE=0
+fi
 service_installation snapshot-logs-check "$INSTALL_USER"
 audit_installation permissions --operation "$INSTALL_OPERATION"
 audit_installation check --operation "$INSTALL_OPERATION"
 
 # Final database reset approval follows successful Audit preparation and all preflights.
-if [[ "${INSTALL_OPERATION:-reset}" == reset && "${EXISTING_DATABASE:-0}" == 1 ]]; then
+if [[ "${INSTALL_OPERATION:-reset}" == reset && "${EXISTING_DATABASE:-0}" == 1 && "${RESET_RECOVERY:-0}" != 1 ]]; then
         printf '%s\n' 'Existing local mysql_siem database detected.' \
             'Reinstallation permanently deletes all events, metrics, alerts and database records.'
         printf 'Type RESET to continue: '
@@ -763,6 +782,8 @@ DATABASE_SETUP_STARTED=1
 service_installation database-started
 if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
     PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation upgrade --project "$PROJECT_DIR"
+elif [[ "${RESET_RECOVERY:-0}" == 1 ]]; then
+    PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation resume --project "$PROJECT_DIR"
 else
     PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation reset --project "$PROJECT_DIR"
 fi

@@ -241,3 +241,21 @@ def test_uncertain_sudo_check_stops_without_modifying_account(tmp_path, sudo_out
     assert result.returncode != 0
     assert "Cannot verify" in result.stderr
     assert calls == "passwd -S mysql_siem\n"
+
+
+@pytest.mark.parametrize("distribution", ["debian", "ubuntu"])
+def test_debian_and_ubuntu_still_reject_real_sudo_grants(tmp_path, distribution):
+    result, calls = account_setup(tmp_path, exists=True, HAS_SUDO="1", INSTALL_DISTRIBUTION=distribution)
+    assert result.returncode != 0
+    assert "sudo privileges" in result.stderr
+    assert calls == "passwd -S mysql_siem\n"
+
+
+def test_mint_restriction_is_only_called_from_the_verified_account_path():
+    start = INSTALLER.index('validate_application_user() {')
+    end = INSTALLER.index('ensure_application_user() {', start)
+    body = INSTALLER[start:end]
+    assert body.index('password_state') < body.index('config.sudo_policy')
+    assert '"${INSTALL_DISTRIBUTION:-}" == linuxmint' in body
+    assert 'INSTALL_DISTRIBUTION="$ID"' in INSTALLER
+    assert INSTALLER.index('flock -n 9') < INSTALLER.index('\nensure_application_user\n')
