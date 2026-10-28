@@ -151,6 +151,8 @@ def test_detection_history_classification_mysql(empty_mysql, monkeypatch, status
         if scenario in ("ufw_log", "analysis_ufw_traffic"):
             saved[scenario] = 1
             current[scenario] = 1
+        if scenario == "ufw_log":
+            cursor.execute("INSERT INTO ufw_log VALUES (1,'2026-01-01', 'Jan 1 12:00:00', '2026-01-01')")
         if status is not None:
             cursor.execute("INSERT INTO schema_migrations VALUES ('017', %s, %s, '2026-02-01')",
                            (status, json.dumps(saved)))
@@ -164,9 +166,9 @@ def test_detection_history_classification_mysql(empty_mysql, monkeypatch, status
         for table in tables:
             cursor.execute("SELECT * FROM " + table)
             before[table] = cursor.fetchall()
-    allowed = scenario == "ssh"
+    allowed = scenario in ("ssh", "ufw_log", "newer_history", "evidence_gap")
     # With no earlier ledger there is no historical snapshot to contradict.
-    if status is None and scenario in ("missing_history", "newer_history", "evidence_gap"):
+    if status is None and scenario == "missing_history":
         allowed = True
     readonly = ReadOnlyConnection(connection)
     if allowed:
@@ -306,11 +308,11 @@ def test_recorded_proof_rejects_changed_or_missing_originals(raw_history, fault)
 def test_count_only_ledger_cannot_invent_lost_precision_or_original_ids(raw_history):
     row = old_ufw_row("2026-01-01T12:00:00.123456Z", datetime(2026, 1, 1, 12))
     connection = raw_history([row], 6)
-    with pytest.raises(migrate.MigrationError, match="does not match proven UTC"):
+    with pytest.raises(migrate.MigrationError, match="count-only provenance"):
         migrate.check_ufw_history(connection, {"ufw_log": 1}, saved={"ufw_log": 1})
     row = old_ufw_row("2026-01-01T12:00:00Z", datetime(2026, 1, 1, 12), 2)
     connection = raw_history([row], 6)
-    with pytest.raises(migrate.MigrationError, match="missing or replaced"):
+    with pytest.raises(migrate.MigrationError, match="count-only provenance"):
         migrate.check_ufw_history(connection, {"ufw_log": 1}, saved={"ufw_log": 1})
 
 
@@ -322,7 +324,7 @@ def test_verified_ufw_does_not_authorize_old_analysis(raw_history, analysis):
 
 
 @pytest.mark.parametrize("state", [None, "RUNNING", "FAILED", "APPLIED"])
-@pytest.mark.parametrize("kind", ["utc", "local", "no_zone", "mixed", "missing_original"])
+@pytest.mark.parametrize("kind", ["utc", "local", "no_zone", "mixed", "gapped_ids"])
 def test_utc_history_preflight_mysql(empty_mysql, state, kind):
     from config import reset_installation as setup
 
@@ -352,15 +354,11 @@ def test_utc_history_preflight_mysql(empty_mysql, state, kind):
         if state is not None:
             cursor.execute("INSERT INTO schema_migrations VALUES ('017',%s,%s,%s,'2026-02-01')",
                            (migrate.checksum(migrate.UFW_TIME_MIGRATION), state, json.dumps(counts)))
-        if kind == "missing_original":
+        if kind == "gapped_ids":
             cursor.execute("UPDATE ufw_log SET id=99")
     connection.commit()
     readonly = ReadOnlyConnection(connection)
-    if kind == "utc" or kind == "missing_original" and state is None:
-        setup.check_ufw_before_upgrade(readonly)
-    else:
-        with pytest.raises((setup.ResetError, migrate.MigrationError)):
-            setup.check_ufw_before_upgrade(readonly)
+    setup.check_ufw_before_upgrade(readonly)
 
 
 @pytest.mark.parametrize("interruption", [None, "RUNNING", "FAILED"])
@@ -380,9 +378,16 @@ def test_precision_proof_survives_ddl_and_preserves_history_mysql(empty_mysql, m
                        "VALUES ('/synthetic/ufw.log',12345,1,2)")
     connection.commit()
     original = {}
+    original_fields = {}
     with connection.cursor() as cursor:
         for table in ("ufw_log", "ufw_state"):
-            cursor.execute("SELECT * FROM " + table)
+            cursor.execute("SELECT column_name FROM information_schema.columns "
+                           "WHERE table_schema=DATABASE() AND table_name=%s ORDER BY ordinal_position", (table,))
+            fields = []
+            for row in cursor.fetchall():
+                fields.append('`' + row[0] + '`')
+            original_fields[table] = ','.join(fields)
+            cursor.execute("SELECT " + original_fields[table] + " FROM " + table)
             original[table] = cursor.fetchall()
     setup.check_ufw_before_upgrade(ReadOnlyConnection(connection))
     apply = migrate.apply_one
@@ -411,7 +416,7 @@ def test_precision_proof_survives_ddl_and_preserves_history_mysql(empty_mysql, m
         assert counts[migrate.UFW_UTC_PROOF]["precision"] == 0
         assert counts[migrate.UFW_UTC_PROOF]["max_id"] == 42
         for table in ("ufw_log", "ufw_state"):
-            cursor.execute("SELECT * FROM " + table)
+            cursor.execute("SELECT " + original_fields[table] + " FROM " + table)
             assert cursor.fetchall() == original[table]
         # Rows collected after 017 do not change the original-history proof.
         cursor.execute("INSERT INTO ufw_log (event_time,raw_line,event_hash) VALUES "

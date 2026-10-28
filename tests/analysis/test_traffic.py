@@ -29,7 +29,7 @@ def test_invalid_range_rejected_before_database_access(connection, start, end):
 
 def test_aggregate_query_uses_half_open_parameterized_range_and_no_row_limit(connection):
     cursor = connection.cursor.return_value.__enter__.return_value
-    cursor.fetchone.side_effect = [ZERO]
+    cursor.fetchone.side_effect = [None, ZERO]
     result = traffic.analyze_traffic(connection, START, END)
     assert all(result[name] == 0 for name in traffic.METRICS)
     assert result["first_seen"] is None and result["last_seen"] is None

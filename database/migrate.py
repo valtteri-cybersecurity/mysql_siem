@@ -43,6 +43,7 @@ MIGRATIONS = (
     ("019", "services", ROOT / "migrations/019_services.sql"),
     ("020", "audit", ROOT / "migrations/020_audit.sql"),
     ("021", "auth_logins", ROOT / "migrations/021_auth_logins.sql"),
+    ("022", "ufw_history_isolation", ROOT / "migrations/022_ufw_history_isolation.sql"),
 )
 
 
@@ -248,9 +249,8 @@ def check_ufw_raw_history(connection, count, *, saved=None):
     """Prove UTC without rewriting rows; return bounded-size ledger evidence.
 
     TIMESTAMP provenance uses epoch seconds, independent of session timezone.
-    Old count-only ledgers need a surviving dense original ID prefix and rows
-    created before 017. Without recorded precision, only the current precision
-    is known. A recorded digest allows gaps and preserves pre-ALTER precision.
+    Count-only ledgers cannot prove original IDs and require 022 isolation.
+    A recorded digest allows gaps and preserves pre-ALTER precision.
     """
     from ingestion.splitter import parse_ufw_line
     from ingestion.ufw_to_mysql import convert_timestamp
@@ -276,7 +276,6 @@ def check_ufw_raw_history(connection, count, *, saved=None):
         raise MigrationError("Legacy UFW history has unsupported timestamp precision.")
     precision = column[1]
     upper = None
-    cutoff = None
     if proof is not None:
         if (not isinstance(proof, dict) or set(proof) != {"version", "precision", "count", "max_id", "sha256"}
                 or type(proof["version"]) is not int or proof["version"] != 1
@@ -293,14 +292,7 @@ def check_ufw_raw_history(connection, count, *, saved=None):
         precision = proof["precision"]
         upper = proof["max_id"]
     elif previous:
-        # Counts alone do not tell which IDs existed at migration start.
-        upper = previous
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT UNIX_TIMESTAMP(started_at) FROM schema_migrations WHERE version = '017'")
-            row = cursor.fetchone()
-        if row is None or not isinstance(row[0], (int, Decimal)):
-            raise MigrationError("Legacy UFW history origin cannot be verified.")
-        cutoff = row[0]
+        raise MigrationError('Legacy UFW history has count-only provenance; migration 022 isolation is required.')
     else:
         with connection.cursor() as cursor:
             cursor.execute("SELECT /*+ MAX_EXECUTION_TIME(5000) */ MAX(id) FROM ufw_log")
@@ -332,8 +324,6 @@ def check_ufw_raw_history(connection, count, *, saved=None):
                     or not isinstance(created, (int, Decimal))
                     or not isinstance(raw_line, str) or len(raw_line) > 65536):
                 raise MigrationError("Legacy UFW history has invalid timestamp evidence.")
-            if cutoff is not None and (event_id != seen + 1 or created > cutoff):
-                raise MigrationError("Legacy UFW history original rows cannot be established.")
             timestamp = parse_ufw_line(raw_line)["timestamp"]
             if not isinstance(timestamp, str):
                 raise MigrationError("Legacy UFW history has no timestamp evidence.")
@@ -393,8 +383,8 @@ def check_ufw_history(connection, counts, *, saved=None):
     """Read-only classification; aggregate legacy counts are never provenance.
 
     Shared detection totals require surviving SSH rows from before 017 started.
-    Evidence has no creation timestamp: require its complete original dense ID
-    prefix as well as old SSH parents. Missing/replaced/ambiguous history fails.
+    Older evidence needs surviving old SSH parents. A 022 baseline records
+    actual immutable IDs independently of the count-only 017 provenance.
     """
     for source in (counts, saved):
         if source is None:
@@ -439,11 +429,8 @@ def check_ufw_history(connection, counts, *, saved=None):
             previous = 0
             if saved is not None:
                 previous = saved.get(table, 0)
-            if previous:
-                if row[0] != previous or row[2] != previous:
-                    raise MigrationError("Legacy UFW history provenance cannot be established from the migration ledger.")
-                if table == 'alert_evidence' and (len(row) != 4 or row[3] != previous):
-                    raise MigrationError("Legacy UFW history evidence identities cannot be established.")
+            if previous and (row[0] < previous or (table != "detection_state" and row[2] < previous)):
+                raise MigrationError("Legacy UFW history provenance cannot be established from the migration ledger.")
         cursor.execute("SELECT s.rule_id FROM detection_state s JOIN detection_rules r ON r.id=s.rule_id "
                        "WHERE r.rule_key = 'SSH_BRUTE_FORCE_001'")
         rules = cursor.fetchall()
@@ -469,6 +456,10 @@ def check_ufw_utc_readiness(connection):
     """Require completed precision migration and proven historical UTC values."""
     if ufw_timestamp_schema(connection) != ("datetime", 6, "YES", None):
         raise MigrationError("UFW UTC deployment requires DATETIME(6).")
+    if migration_status(connection).get("022", (None, None))[1] == "APPLIED":
+        from database.ufw_history import preflight
+        preflight(connection)
+        return
     with connection.cursor() as cursor:
         cursor.execute("SELECT row_counts FROM schema_migrations WHERE version = '017' AND status = 'APPLIED'")
         row = cursor.fetchone()
@@ -527,6 +518,10 @@ def apply_one(connection, version):
     elif version == "020":
         from database.audit_migrations import upgrade_audit
         upgrade_audit(connection, ROOT / "migrations/020_audit.sql")
+
+    elif version == "022":
+        from database.ufw_history import isolate
+        isolate(connection)
 
     elif version == "021":
         from database.auth_migrations import upgrade_auth_events
@@ -611,13 +606,33 @@ def migrate(connection):
                 if previous is not None:
                     counts = json.loads(previous[0])
 
-                if version == "017" and counts.get("ufw_log", 0):
-                    saved = None
-                    if previous is not None:
-                        saved = counts
-                    counts[UFW_UTC_PROOF] = check_ufw_raw_history(
-                        connection, counts["ufw_log"], saved=saved,
-                    )
+                from database.ufw_history import (
+                    KEY,
+                    SSH_KEY,
+                    raw_baseline,
+                    ssh_baseline,
+                )
+                if version == "017" and KEY not in counts:
+                    counts[KEY] = raw_baseline(connection)
+                    if (counts[KEY]['all_utc'] and counts.get('ufw_log', 0)
+                            and counts['ufw_log'] == counts[KEY]['count']):
+                        saved = None
+                        if UFW_UTC_PROOF in counts:
+                            saved = counts
+                        counts[UFW_UTC_PROOF] = check_ufw_raw_history(connection, counts['ufw_log'], saved=saved)
+                if version == "022" and KEY not in counts:
+                    cursor.execute("SELECT row_counts FROM schema_migrations WHERE version='017'")
+                    original = json.loads(cursor.fetchone()[0])
+                    baseline = original.get(KEY)
+                    if baseline is None:
+                        baseline = raw_baseline(connection)
+                        old_proof = original.get(UFW_UTC_PROOF)
+                        if old_proof is not None:
+                            check_ufw_raw_history(connection, original['ufw_log'], saved=original)
+                            baseline['previous_max_id'] = old_proof['max_id']
+                            baseline['previous_precision'] = old_proof['precision']
+                    counts[KEY] = baseline
+                    counts[SSH_KEY] = ssh_baseline(connection)
 
                 cursor.execute(
                     """
@@ -645,7 +660,7 @@ def migrate(connection):
                 actual_counts = history_counts(connection)
 
                 for table in counts:
-                    if version == "017" and table == UFW_UTC_PROOF:
+                    if table in ("_ufw_compatibility", "_ssh_baseline", UFW_UTC_PROOF):
                         continue
                     original_count = counts[table]
                     current_count = actual_counts.get(table)

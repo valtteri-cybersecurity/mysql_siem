@@ -480,47 +480,12 @@ def reset_database(connection, settings, *, approved=False, prepare=lambda: None
 def check_ufw_before_upgrade(connection):
     """Validate legacy UFW history without changing the database."""
 
-    from database.migrate import (
-        check_ufw_utc_readiness,
-        history_counts,
-        migration_status,
-    )
+    from database.ufw_history import preflight
 
-    # Check whether migration 017 is already complete.
-    state = migration_status(connection).get(
-        "017", (None, None)
-    )[1]
-
-    if state == "APPLIED":
-        check_ufw_utc_readiness(connection)
-        return
-
-    if state not in (None, "RUNNING", "FAILED"):
-        raise ResetError(
-            "Unknown UFW migration 017 state; upgrade stopped."
-        )
-
-    from database.migrate import check_ufw_history
-
-    counts = history_counts(connection)
-    saved = None
-    if state in ("RUNNING", "FAILED"):
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT row_counts FROM schema_migrations WHERE version = %s", ("017",))
-            row = cursor.fetchone()
-        if row is None:
-            raise ResetError("UFW migration 017 ledger is missing; upgrade stopped.")
-        try:
-            saved = json.loads(row[0])
-            if not isinstance(saved, dict):
-                raise TypeError
-        except (TypeError, ValueError):
-            raise ResetError("UFW migration 017 history counts are invalid.") from None
     try:
-        check_ufw_history(connection, counts, saved=saved)
+        preflight(connection)
     except MigrationError as error:
-        raise ResetError("UFW-related history predates a verified UTC migration or its counts are invalid: "
-                         + str(error)) from None
+        raise ResetError('UFW history compatibility check failed: ' + str(error)) from None
 
 
 def check_upgrade_database(connection):

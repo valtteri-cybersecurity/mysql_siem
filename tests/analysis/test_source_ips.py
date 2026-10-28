@@ -122,7 +122,8 @@ def test_streaming_bounded_parameterized_query(connection, events):
     cursor.__iter__.return_value = iter(tuple(event[field] for field in source_ips.EVENT_FIELDS) for event in events)
     result = source_ips.analyze_source_ips(connection, START, END)
     assert result[0]["total_events"] == 5
-    connection.cursor.assert_called_once_with(pymysql.cursors.SSCursor)
+    assert connection.cursor.call_count == 2
+    assert connection.cursor.call_args.args == (pymysql.cursors.SSCursor,)
     sql, params = cursor.execute.call_args.args
     assert params == (START, END, source_ips.MAX_EVENTS + 1)
     assert "event_time >= %s AND event_time < %s" in sql

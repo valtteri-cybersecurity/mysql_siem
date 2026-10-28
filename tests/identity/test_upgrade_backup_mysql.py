@@ -34,7 +34,7 @@ def test_dump_restore_and_additive_upgrade_preserve_identifiers_and_settings(ide
         connection.select_db('mysql_siem')
         # A real pre-021 installation, without modifying any migration source.
         with monkeypatch.context() as before_upgrade:
-            before_upgrade.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-1])
+            before_upgrade.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-2])
             migrate.migrate(connection)
         with connection.cursor() as cursor:
             cursor.execute("CREATE USER 'pythonuser'@'localhost' IDENTIFIED BY 'synthetic-private-test'")

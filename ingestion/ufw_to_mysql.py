@@ -103,6 +103,28 @@ def validate_limits(max_lines, max_seconds):
         raise ValueError("--max-seconds must be within 1..50.")
 
 
+def decode_log_line(raw_line, filename, position):
+    """Recover only unambiguous leading NUL padding; retain ordinary decoding."""
+    if not raw_line.startswith(b"\x00"):
+        return raw_line.decode("utf-8", errors="ignore")
+    recovered = raw_line.lstrip(b"\x00")
+    nul_count = len(raw_line) - len(recovered)
+    if b"\x00" in recovered:
+        raise ValueError("Ambiguous NUL bytes in UFW log line; collection rolled back.")
+    try:
+        line = recovered.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError("Invalid UTF-8 in NUL-prefixed UFW line; collection rolled back.") from None
+    parsed = parse_ufw_line(line)
+    convert_timestamp(parsed.get("timestamp"))
+    if parsed.get("action") not in ("BLOCK", "ALLOW", "AUDIT"):
+        raise ValueError("NUL-prefixed line has no recognized UFW event; collection rolled back.")
+    digest = hashlib.sha256(raw_line).hexdigest()
+    print(f"UFW NUL prefix recovered: file={filename!r} position={position} "
+          f"nul_count={nul_count} sha256={digest}")
+    return line
+
+
 def save_event(cursor, line, *, identity=None):
     """Parse and save one UFW event."""
 
@@ -323,7 +345,7 @@ def process_file(
                 stats["stop_reason"] = "time_limit"
                 break
 
-            line = raw_line.decode("utf-8", errors="ignore")
+            line = decode_log_line(raw_line, filename, line_start)
 
             inserted_rows += save_event(
                 cursor,

@@ -35,7 +35,7 @@ def alter_statements(cursor):
 
 
 def test_auth_upgrade_is_registered_and_only_additive():
-    assert MIGRATIONS[-1] == ("021", "auth_logins", MIGRATION)
+    assert ("021", "auth_logins", MIGRATION) in MIGRATIONS
     connection, cursor = migration_connection([
         [LEGACY_IP], [SOURCE_IP], [SOURCE_IP, AUTH_METHOD],
         [SOURCE_IP, AUTH_METHOD, SOURCE_PORT],

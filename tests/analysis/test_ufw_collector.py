@@ -266,3 +266,80 @@ def test_invalid_cli_limits_fail_before_connecting(monkeypatch, args):
     with pytest.raises(SystemExit):
         ufw.main(args)
     connect.assert_not_called()
+
+
+@pytest.mark.parametrize('padding', [1, 3000])
+def test_nul_prefix_recovery_preserves_event_hash_and_byte_position(tmp_path, capsys, padding):
+    import hashlib
+    from datetime import datetime
+
+    clean = line()
+    padded = b"\x00" * padding + clean
+    logfile = tmp_path / 'ufw.log'
+    logfile.write_bytes(clean + padded)
+    cursor = cursor_at()
+    assert ufw.process_file(cursor, str(logfile)) == 2
+    writes = []
+    for call in cursor.execute.call_args_list:
+        if 'INSERT INTO ufw_log' in call.args[0]:
+            writes.append(call.args[1])
+    assert writes[0] == writes[1]
+    assert writes[0][:7] == (datetime(2026, 10, 22, 9, 0, 0, 123456), 'BLOCK',
+                             '192.0.2.1', '198.51.100.1', 'TCP', 0, 1000)
+    assert writes[0][7] == clean.decode().strip()
+    assert writes[0][8] == hashlib.sha256(clean.decode().strip().encode()).hexdigest()
+    assert saved_position(cursor) == len(clean) + len(padded)
+    diagnostic = capsys.readouterr().out
+    assert 'position=' + str(len(clean)) in diagnostic
+    assert 'nul_count=' + str(padding) in diagnostic
+    assert hashlib.sha256(padded).hexdigest() in diagnostic
+    assert str(logfile) in diagnostic
+    assert '192.0.2.1' not in diagnostic
+    assert '\x00' not in diagnostic
+
+
+@pytest.mark.parametrize('damaged', [
+    b'\x00' * 3000 + b'bad host [UFW BLOCK]\n',
+    b'\x00' + b'2026-10-22T12:00:00Z host ordinary message\n',
+    b'\x00' + line().replace(b'SRC=', b'\x00SRC='),
+    b'\x00' + line().replace(b'host', b'\xffhost'),
+    b'\x00' * 10 + b'\n',
+])
+def test_unrecoverable_nul_event_rolls_back_entire_pass(tmp_path, monkeypatch, damaged):
+    logfile = tmp_path / 'ufw.log'
+    logfile.write_bytes(line() + damaged)
+    monkeypatch.setattr(ufw, 'LOGFILE', str(logfile))
+    connection = connection_for_files()
+    with pytest.raises(ValueError):
+        ufw.process_log(connection)
+    connection.commit.assert_not_called()
+    connection.rollback.assert_called_once()
+    cursor = connection.cursor.return_value
+    for call in cursor.execute.call_args_list:
+        assert 'INSERT INTO ufw_state' not in call.args[0]
+
+
+def test_middle_nul_is_not_removed_from_ordinary_line():
+    raw = line().replace(b'host', b'ho\x00st')
+    assert ufw.decode_log_line(raw, 'synthetic.log', 0) == raw.decode()
+
+
+def test_nul_padding_still_counts_towards_raw_line_limit(tmp_path):
+    logfile = tmp_path / 'ufw.log'
+    logfile.write_bytes(b'\x00' * ufw.MAX_LINE_BYTES + line())
+    cursor = cursor_at()
+    with pytest.raises(RuntimeError, match='64 KiB'):
+        ufw.process_file(cursor, str(logfile))
+    for call in cursor.execute.call_args_list:
+        assert 'INSERT INTO' not in call.args[0]
+
+
+def test_recovered_line_obeys_line_budget(tmp_path):
+    raw = b'\x00' * 3000 + line()
+    logfile = tmp_path / 'ufw.log'
+    logfile.write_bytes(raw + line(1))
+    cursor = cursor_at()
+    stats = {'lines_read': 0, 'stop_reason': 'snapshot_end'}
+    assert ufw.process_file(cursor, str(logfile), stats=stats, max_lines=1) == 1
+    assert stats == {'lines_read': 1, 'stop_reason': 'line_limit'}
+    assert saved_position(cursor) == len(raw)

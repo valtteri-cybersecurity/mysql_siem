@@ -110,13 +110,15 @@ def analyze_source_ips(connection, start_time, end_time, *, max_events=MAX_EVENT
     validate_time_range(start_time, end_time)
     if type(max_events) is not int or not 1 <= max_events <= 1000000:
         raise ValueError("max_events must be within 1..1000000.")
+    from database.ufw_history import active_filter
+    utc_only = active_filter(connection)
     identity_fields = ", host_id" if identity_schema_enabled(connection) else ""
     with connection.cursor(pymysql.cursors.SSCursor) as cursor:
         cursor.execute(
             f"""
             SELECT event_time, src_ip, action, protocol, dst_port, dst_ip{identity_fields}
             FROM ufw_log
-            WHERE event_time >= %s AND event_time < %s
+            WHERE event_time >= %s AND event_time < %s{utc_only}
             ORDER BY event_time, id LIMIT %s
             """,
             (start_time, end_time, max_events + 1),

@@ -116,7 +116,8 @@ def test_streaming_query_is_bounded_and_parameterized(connection, port_events):
     cursor = connection.cursor.return_value
     cursor.__iter__.return_value = iter(tuple(event[field] for field in ports.EVENT_FIELDS) for event in port_events)
     assert ports.analyze_ports(connection, START, END)[0]["total_events"] == 5
-    connection.cursor.assert_called_once_with(pymysql.cursors.SSCursor)
+    assert connection.cursor.call_count == 2
+    assert connection.cursor.call_args.args == (pymysql.cursors.SSCursor,)
     sql, parameters = cursor.execute.call_args.args
     assert parameters == (START, END, ports.MAX_EVENTS + 1)
     assert "event_time >= %s AND event_time < %s" in sql

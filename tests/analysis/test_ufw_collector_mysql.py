@@ -188,3 +188,25 @@ def test_each_commit_is_visible_to_port_scan_detection_between_collection_passes
             assert cursor.fetchone() == (10,)
     finally:
         observer.close()
+
+
+def test_nul_recovery_deduplicates_and_commits_original_byte_offset(collection):
+    connection, logfile = collection
+    # This fixture intentionally uses the original DATETIME(0) baseline.
+    clean = line(0).replace(b'12:00:00 ', b'12:00:00+02:00 ')
+    raw = clean + b"\x00" * 3000 + clean
+    logfile.write_bytes(raw)
+    assert ufw.process_log(connection)['inserted'] == 1
+    assert state(connection)[str(logfile)] == len(raw)
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT event_time,raw_line FROM ufw_log')
+        assert cursor.fetchall() == ((datetime(2026, 10, 22, 10, 0), clean.decode().strip()),)
+    assert ufw.process_log(connection)['inserted'] == 0
+    before = state(connection)
+    with logfile.open('ab') as output:
+        output.write(clean.replace(b'12:00:00', b'12:00:01'))
+        output.write(b'\x00' * 3000 + b'bad host [UFW BLOCK]\n')
+    with pytest.raises(ValueError):
+        ufw.process_log(connection)
+    assert state(connection) == before
+    assert events(connection) == [1000]

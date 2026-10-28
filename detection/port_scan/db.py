@@ -24,6 +24,8 @@ def get_db_data(connection, start_time, end_time):
     propagated; a failed query must never look like an empty successful run.
     """
     validate_time_range(start_time, end_time)
+    from database.ufw_history import active_filter
+    utc_only = active_filter(connection)
     identity_fields = ", host_id, source_id" if identity_schema_enabled(connection) else ""
     cursor = connection.cursor()
     try:
@@ -31,7 +33,7 @@ def get_db_data(connection, start_time, end_time):
             f"""
             SELECT id, event_time, action, src_ip, dst_ip, protocol, dst_port{identity_fields}
             FROM ufw_log
-            WHERE event_time >= %s AND event_time < %s
+            WHERE event_time >= %s AND event_time < %s{utc_only}
               AND action IN (%s, %s, %s)
               AND protocol IN (%s, %s)
             ORDER BY event_time, id
@@ -63,12 +65,14 @@ def get_new_events(connection, last_event_id, batch_size):
     Read every action so unsupported rows also advance the ID checkpoint.
     The existing collector serializes its writes through commit with GET_LOCK.
     """
+    from database.ufw_history import active_filter
+    utc_only = active_filter(connection)
     identity_fields = ", host_id, source_id" if identity_schema_enabled(connection) else ""
     with connection.cursor() as cursor:
         cursor.execute(
             f"""
             SELECT id, event_time, action, src_ip, dst_ip, protocol, dst_port{identity_fields}
-            FROM ufw_log WHERE id > %s ORDER BY id LIMIT %s
+            FROM ufw_log WHERE id > %s{utc_only} ORDER BY id LIMIT %s
             """,
             (last_event_id, batch_size),
         )

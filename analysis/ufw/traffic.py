@@ -65,7 +65,8 @@ def analyze_traffic(connection, start_time, end_time, *, host_id=None):
     validate_time_range(start_time, end_time)
     if host_id is not None:
         validate_id(host_id)
-    sql = AGGREGATE_SQL
+    from database.ufw_history import active_filter
+    sql = AGGREGATE_SQL + active_filter(connection)
     parameters = (start_time, end_time)
     if identity_schema_enabled(connection):
         sql += " AND host_id <=> %s"

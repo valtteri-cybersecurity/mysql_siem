@@ -9,7 +9,7 @@ import pytest
 
 from config import installation_backup as backup
 from config import reset_installation as setup
-from database import migrate
+from database import migrate, ufw_history
 from database.snapshot_migrations import source_clause
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -55,6 +55,7 @@ def test_upgrade_never_resets_database_registry_passwords_or_checkpoints(monkeyp
     connection = upgrade_connection()
     calls = []
     monkeypatch.setattr(migrate, 'migration_status', lambda _: {'017': (migrate.checksum(migrate.UFW_TIME_MIGRATION), 'APPLIED')})
+    monkeypatch.setattr(ufw_history, 'preflight', lambda _: calls.append('preflight'))
     monkeypatch.setattr(migrate, 'migrate', lambda _: calls.append('migrate'))
     monkeypatch.setattr(migrate, 'check_ufw_utc_readiness', lambda _: calls.append('utc'))
     settings = {'DB_HOST': 'localhost', 'DB_USER': 'pythonuser', 'DB_PASSWORD': 'synthetic', 'DB_NAME': 'mysql_siem'}
@@ -63,7 +64,7 @@ def test_upgrade_never_resets_database_registry_passwords_or_checkpoints(monkeyp
     monkeypatch.setattr(backup, 'verify_rows', MagicMock())
     setup.upgrade_database(connection, settings, project=tmp_path)
     backup.verify_rows.assert_called_once_with(connection, tmp_path, {})
-    assert calls == ['utc', 'migrate', 'utc']
+    assert calls == ['preflight', 'migrate', 'utc']
     connection.select_db.assert_called_once_with('mysql_siem')
     cursor = connection.cursor.return_value.__enter__.return_value
     assert all(call.args[0].startswith(('SELECT', 'SHOW')) for call in cursor.execute.call_args_list)
