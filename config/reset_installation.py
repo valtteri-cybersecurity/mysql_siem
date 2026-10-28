@@ -481,7 +481,6 @@ def check_ufw_before_upgrade(connection):
     """Validate legacy UFW history without changing the database."""
 
     from database.migrate import (
-        ANALYSIS_TABLES,
         check_ufw_utc_readiness,
         history_counts,
         migration_status,
@@ -501,65 +500,27 @@ def check_ufw_before_upgrade(connection):
             "Unknown UFW migration 017 state; upgrade stopped."
         )
 
-    # These tables may contain historical UFW-related data.
-    tables = ("ufw_log",) + ANALYSIS_TABLES + (
-        "detection_state",
-        "detection_alerts",
-        "alert_evidence",
-    )
+    from database.migrate import check_ufw_history
 
-    # Read current row counts without modifying anything.
     counts = history_counts(connection)
-
-    # An interrupted migration may have stored older row counts.
-    # Check those too before allowing the migration to resume.
+    saved = None
     if state in ("RUNNING", "FAILED"):
         with connection.cursor() as cursor:
-            cursor.execute(
-                "SELECT row_counts FROM schema_migrations "
-                "WHERE version = %s",
-                ("017",),
-            )
+            cursor.execute("SELECT row_counts FROM schema_migrations WHERE version = %s", ("017",))
             row = cursor.fetchone()
-
         if row is None:
-            raise ResetError(
-                "UFW migration 017 ledger is missing; "
-                "upgrade stopped."
-            )
-
+            raise ResetError("UFW migration 017 ledger is missing; upgrade stopped.")
         try:
             saved = json.loads(row[0])
-
             if not isinstance(saved, dict):
                 raise TypeError
-
-            for table in tables:
-                value = saved.get(table, 0)
-
-                if type(value) is not int or value < 0:
-                    raise ValueError
-
-                counts[table] = max(
-                    counts.get(table, 0),
-                    value,
-                )
-
         except (TypeError, ValueError):
-            raise ResetError(
-                "UFW migration 017 history counts are invalid; "
-                "upgrade stopped."
-            ) from None
-
-    # Do not migrate ambiguous historical timestamps.
-    for table in tables:
-        if counts.get(table, 0):
-            raise ResetError(
-                "UFW-related history predates a verified UTC migration. "
-                "Upgrade stopped before schema changes. "
-                "Review historical timestamps offline; "
-                "no data was converted or deleted."
-            )
+            raise ResetError("UFW migration 017 history counts are invalid.") from None
+    try:
+        check_ufw_history(connection, counts, saved=saved)
+    except MigrationError as error:
+        raise ResetError("UFW-related history predates a verified UTC migration or its counts are invalid: "
+                         + str(error)) from None
 
 
 def check_upgrade_database(connection):

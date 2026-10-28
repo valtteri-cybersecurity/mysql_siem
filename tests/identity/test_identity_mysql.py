@@ -569,15 +569,14 @@ def test_private_session_is_utc(empty_mysql):
         assert cursor.fetchone() == ("+00:00",)
 
 
-def test_utc_deployment_check_rejects_legacy_history(empty_mysql):
+def test_utc_deployment_check_accepts_proven_legacy_history(empty_mysql):
     tables, rules = read_schema()
     ensure_tables(empty_mysql, tuple(tables), rule_keys=tuple(rules))
     with empty_mysql.cursor() as cursor:
         save_event(cursor, ufw_line())
     empty_mysql.commit()
     migrations.migrate(empty_mysql)
-    with pytest.raises(migrations.MigrationError, match="Legacy UFW history"):
-        migrations.check_ufw_utc_readiness(empty_mysql)
+    migrations.check_ufw_utc_readiness(empty_mysql)
 
 
 def test_utc_deployment_check_accepts_fresh_database(mysql):

@@ -11,6 +11,9 @@ import argparse
 import hashlib
 import json
 import os
+import time
+from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 import pymysql
@@ -233,12 +236,237 @@ def upgrade_ufw_timestamp_precision(connection):
         )
 
 
-def check_ufw_utc_readiness(connection):
-    """Fail the deployment check for ambiguous history; never convert old rows.
+UFW_HISTORY_TABLES = ("ufw_log",) + ANALYSIS_TABLES
+SHARED_HISTORY_TABLES = ("detection_state", "detection_alerts", "alert_evidence")
 
-    A 017 ledger with pre-existing UFW rows is an offline historical database.
-    New UTC collection must use a fresh migrated database (see the runbook).
+UFW_UTC_PROOF = "_ufw_utc_proof"
+UFW_HISTORY_SECONDS = 120
+UFW_HISTORY_BATCH = 256
+
+
+def check_ufw_raw_history(connection, count, *, saved=None):
+    """Prove UTC without rewriting rows; return bounded-size ledger evidence.
+
+    TIMESTAMP provenance uses epoch seconds, independent of session timezone.
+    Old count-only ledgers need a surviving dense original ID prefix and rows
+    created before 017. Without recorded precision, only the current precision
+    is known. A recorded digest allows gaps and preserves pre-ALTER precision.
     """
+    from ingestion.splitter import parse_ufw_line
+    from ingestion.ufw_to_mysql import convert_timestamp
+
+    if type(count) is not int or count < 0:
+        raise MigrationError("Legacy UFW history row count is invalid.")
+    deadline = time.monotonic() + UFW_HISTORY_SECONDS
+    proof = None
+    previous = 0
+    if saved is not None:
+        previous = saved.get("ufw_log", 0)
+        proof = saved.get(UFW_UTC_PROOF)
+        if previous != count:
+            raise MigrationError("Legacy UFW history counts no longer identify the original rows.")
+    if count == 0:
+        if proof is not None:
+            raise MigrationError("Legacy UFW history proof contradicts the row count.")
+        return None
+    column = ufw_timestamp_schema(connection)
+    if (not isinstance(column, tuple) or len(column) != 4
+            or column[0] != "datetime" or column[1] not in (0, 6)
+            or column[2:] != ("YES", None)):
+        raise MigrationError("Legacy UFW history has unsupported timestamp precision.")
+    precision = column[1]
+    upper = None
+    cutoff = None
+    if proof is not None:
+        if (not isinstance(proof, dict) or set(proof) != {"version", "precision", "count", "max_id", "sha256"}
+                or type(proof["version"]) is not int or proof["version"] != 1
+                or type(proof["precision"]) is not int or proof["precision"] not in (0, 6)
+                or proof["precision"] > precision
+                or type(proof["count"]) is not int or proof["count"] != count
+                or type(proof["max_id"]) is not int or not 0 < proof["max_id"] < 2**64
+                or not isinstance(proof["sha256"], str)
+                or len(proof["sha256"]) != 64):
+            raise MigrationError("Legacy UFW history proof is invalid.")
+        for character in proof["sha256"]:
+            if character not in "0123456789abcdef":
+                raise MigrationError("Legacy UFW history proof digest is invalid.")
+        precision = proof["precision"]
+        upper = proof["max_id"]
+    elif previous:
+        # Counts alone do not tell which IDs existed at migration start.
+        upper = previous
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT UNIX_TIMESTAMP(started_at) FROM schema_migrations WHERE version = '017'")
+            row = cursor.fetchone()
+        if row is None or not isinstance(row[0], (int, Decimal)):
+            raise MigrationError("Legacy UFW history origin cannot be verified.")
+        cutoff = row[0]
+    else:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT /*+ MAX_EXECUTION_TIME(5000) */ MAX(id) FROM ufw_log")
+            row = cursor.fetchone()
+        if row is None or type(row[0]) is not int or not 0 < row[0] < 2**64:
+            raise MigrationError("Legacy UFW history rows cannot be identified.")
+        upper = row[0]
+    digest = hashlib.sha256()
+    last_id = 0
+    seen = 0
+    while last_id < upper:
+        if time.monotonic() >= deadline:
+            raise MigrationError("Legacy UFW history verification exceeded its time budget.")
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT /*+ MAX_EXECUTION_TIME(5000) */ id, event_time, raw_line, UNIX_TIMESTAMP(created_at) "
+                "FROM ufw_log WHERE id > %s AND id <= %s ORDER BY id LIMIT %s",
+                (last_id, upper, UFW_HISTORY_BATCH),
+            )
+            rows = cursor.fetchall()
+        if not rows:
+            break
+        for event_id, stored, raw_line, created in rows:
+            if time.monotonic() >= deadline:
+                raise MigrationError("Legacy UFW history verification exceeded its time budget.")
+            if type(event_id) is not int or not last_id < event_id <= upper:
+                raise MigrationError("Legacy UFW history IDs are inconsistent.")
+            if (not isinstance(stored, datetime) or stored.tzinfo is not None
+                    or not isinstance(created, (int, Decimal))
+                    or not isinstance(raw_line, str) or len(raw_line) > 65536):
+                raise MigrationError("Legacy UFW history has invalid timestamp evidence.")
+            if cutoff is not None and (event_id != seen + 1 or created > cutoff):
+                raise MigrationError("Legacy UFW history original rows cannot be established.")
+            timestamp = parse_ufw_line(raw_line)["timestamp"]
+            if not isinstance(timestamp, str):
+                raise MigrationError("Legacy UFW history has no timestamp evidence.")
+            if timestamp.endswith("Z"):
+                local_time = timestamp[:-1]
+            else:
+                zone = timestamp[-6:]
+                if (len(zone) != 6 or zone[0] not in ("+", "-") or zone[3] != ":"
+                        or not zone[1:3].isascii() or not zone[1:3].isdigit()
+                        or not zone[4:6].isascii() or not zone[4:6].isdigit()
+                        or zone == "-00:00"):
+                    raise MigrationError("Legacy UFW history has no unambiguous timezone evidence.")
+                if int(zone[1:3]) > 23 or int(zone[4:6]) > 59:
+                    raise MigrationError("Legacy UFW history has invalid timezone evidence.")
+                local_time = timestamp[:-6]
+            base_time, point, fraction = local_time.partition(".")
+            if len(base_time) != 19 or base_time[10] != "T":
+                raise MigrationError("Legacy UFW history has invalid timestamp evidence.")
+            if point:
+                if not 1 <= len(fraction) <= 6:
+                    raise MigrationError("Legacy UFW history has unsupported fractional precision.")
+                if not fraction.isascii() or not fraction.isdigit():
+                    raise MigrationError("Legacy UFW history has invalid fractional seconds.")
+            try:
+                utc = convert_timestamp(timestamp)
+            except ValueError:
+                raise MigrationError("Legacy UFW history has invalid timestamp evidence.") from None
+            matches = stored == utc
+            if precision == 0:
+                # MySQL DATETIME(0) either truncates or rounds fractional seconds,
+                # depending on the writer's TIME_TRUNCATE_FRACTIONAL SQL mode.
+                truncated = utc.replace(microsecond=0)
+                rounded = truncated
+                if utc.microsecond >= 500000:
+                    try:
+                        rounded += timedelta(seconds=1)
+                    except OverflowError:
+                        raise MigrationError("Legacy UFW history rounding is outside the MySQL range.") from None
+                matches = stored in (truncated, rounded)
+            if not matches:
+                raise MigrationError("Legacy UFW history event_time does not match proven UTC.")
+            payload = (event_id, stored.isoformat(timespec="microseconds"), raw_line,
+                       str(created))
+            digest.update(json.dumps(payload, ensure_ascii=True).encode("ascii") + b"\n")
+            last_id = event_id
+            seen += 1
+    if seen != count or last_id != upper:
+        raise MigrationError("Legacy UFW history original rows are missing or replaced.")
+    verified = {"version": 1, "precision": precision, "count": seen,
+                "max_id": upper, "sha256": digest.hexdigest()}
+    if proof is not None and verified != proof:
+        raise MigrationError("Legacy UFW history no longer matches its verified original rows.")
+    return verified
+
+
+def check_ufw_history(connection, counts, *, saved=None):
+    """Read-only classification; aggregate legacy counts are never provenance.
+
+    Shared detection totals require surviving SSH rows from before 017 started.
+    Evidence has no creation timestamp: require its complete original dense ID
+    prefix as well as old SSH parents. Missing/replaced/ambiguous history fails.
+    """
+    for source in (counts, saved):
+        if source is None:
+            continue
+        if not isinstance(source, dict):
+            raise MigrationError("Historical counts are invalid.")
+        for table in UFW_HISTORY_TABLES + SHARED_HISTORY_TABLES:
+            value = source.get(table, 0)
+            if type(value) is not int or value < 0:
+                raise MigrationError("Historical counts are invalid.")
+            if table in ANALYSIS_TABLES and value:
+                raise MigrationError("Legacy UFW history predates a verified UTC migration.")
+    proof = check_ufw_raw_history(connection, counts.get("ufw_log", 0), saved=saved)
+    relevant = False
+    for table in SHARED_HISTORY_TABLES:
+        if counts.get(table, 0) or saved is not None and saved.get(table, 0):
+            relevant = True
+    if not relevant:
+        return proof
+    cutoff = "(SELECT started_at FROM schema_migrations WHERE version = '017')"
+    queries = (
+        ("detection_state", "SELECT COUNT(*), COALESCE(SUM(CASE WHEN r.rule_key = 'SSH_BRUTE_FORCE_001' "
+         "THEN 0 ELSE 1 END),0), COALESCE(SUM(CASE WHEN s.updated_at <= " + cutoff +
+         " THEN 1 ELSE 0 END),0) FROM detection_state s LEFT JOIN detection_rules r ON r.id=s.rule_id"),
+        ("detection_alerts", "SELECT COUNT(*), COALESCE(SUM(CASE WHEN r.rule_key = 'SSH_BRUTE_FORCE_001' "
+         "THEN 0 ELSE 1 END),0), COALESCE(SUM(CASE WHEN a.detected_at <= " + cutoff +
+         " THEN 1 ELSE 0 END),0) FROM detection_alerts a LEFT JOIN detection_rules r ON r.id=a.rule_id"),
+        ("alert_evidence", "SELECT COUNT(*), COALESCE(SUM(CASE WHEN r.rule_key = 'SSH_BRUTE_FORCE_001' "
+         "AND e.event_type = 'AUTH' AND h.id IS NOT NULL AND h.event_type = 'SSH_AUTH_FAILURE' "
+         "AND h.service = 'sshd' THEN 0 ELSE 1 END),0), COALESCE(SUM(CASE WHEN a.detected_at <= " + cutoff +
+         " AND h.created_at <= " + cutoff + " THEN 1 ELSE 0 END),0), COALESCE(MAX(e.id),0) "
+         "FROM alert_evidence e LEFT JOIN detection_alerts a ON a.id=e.alert_id "
+         "LEFT JOIN detection_rules r ON r.id=a.rule_id LEFT JOIN auth_events h ON h.id=e.event_id"),
+    )
+    with connection.cursor() as cursor:
+        for table, query in queries:
+            cursor.execute(query)
+            row = cursor.fetchone()
+            if (not isinstance(row, tuple) or len(row) < 3 or type(row[0]) is not int
+                    or row[1] != 0):
+                raise MigrationError("Legacy UFW history or unclassifiable detection history blocks migration 017.")
+            previous = 0
+            if saved is not None:
+                previous = saved.get(table, 0)
+            if previous:
+                if row[0] != previous or row[2] != previous:
+                    raise MigrationError("Legacy UFW history provenance cannot be established from the migration ledger.")
+                if table == 'alert_evidence' and (len(row) != 4 or row[3] != previous):
+                    raise MigrationError("Legacy UFW history evidence identities cannot be established.")
+        cursor.execute("SELECT s.rule_id FROM detection_state s JOIN detection_rules r ON r.id=s.rule_id "
+                       "WHERE r.rule_key = 'SSH_BRUTE_FORCE_001'")
+        rules = cursor.fetchall()
+    from detection.ssh_brute_force.state import load_state
+    try:
+        for rule in rules:
+            _last_id, records = load_state(connection, rule[0])
+            with connection.cursor() as cursor:
+                for record in records:
+                    event = record['event']
+                    cursor.execute("SELECT id FROM auth_events WHERE id=%s AND event_hash=%s "
+                                   "AND event_type='SSH_AUTH_FAILURE' AND service='sshd'",
+                                   (event['id'], event['event_hash']))
+                    if cursor.fetchone() != (event['id'],):
+                        raise MigrationError("Legacy UFW history: SSH state references an unverified event.")
+    except (ValueError, RuntimeError, TypeError, KeyError):
+        raise MigrationError("Legacy UFW history: detection state cannot be classified safely.") from None
+
+    return proof
+
+
+def check_ufw_utc_readiness(connection):
+    """Require completed precision migration and proven historical UTC values."""
     if ufw_timestamp_schema(connection) != ("datetime", 6, "YES", None):
         raise MigrationError("UFW UTC deployment requires DATETIME(6).")
     with connection.cursor() as cursor:
@@ -251,16 +479,13 @@ def check_ufw_utc_readiness(connection):
         tables = ("ufw_log",) + ANALYSIS_TABLES + (
             "detection_state", "detection_alerts", "alert_evidence",
         )
-        values = [counts[table] for table in tables]
-        if any(type(value) is not int or value < 0 for value in values):
-            raise ValueError
+        for table in tables:
+            value = counts[table]
+            if type(value) is not int or value < 0:
+                raise ValueError
     except (KeyError, TypeError, ValueError):
         raise MigrationError("Cannot verify the UFW historical time basis.") from None
-    if any(values):
-        raise MigrationError(
-            "Legacy UFW history has an unverified time basis; keep this database offline. "
-            "Use a fresh migrated database for UTC collection. The development installer recreates mysql_siem only after explicit RESET confirmation."
-        )
+    check_ufw_history(connection, counts, saved=counts)
 
 
 def apply_one(connection, version):
@@ -386,6 +611,14 @@ def migrate(connection):
                 if previous is not None:
                     counts = json.loads(previous[0])
 
+                if version == "017" and counts.get("ufw_log", 0):
+                    saved = None
+                    if previous is not None:
+                        saved = counts
+                    counts[UFW_UTC_PROOF] = check_ufw_raw_history(
+                        connection, counts["ufw_log"], saved=saved,
+                    )
+
                 cursor.execute(
                     """
                     INSERT INTO schema_migrations
@@ -393,6 +626,7 @@ def migrate(connection):
                     VALUES (%s, %s, %s, 'RUNNING', %s)
                     ON DUPLICATE KEY UPDATE
                         status = 'RUNNING',
+                        row_counts = VALUES(row_counts),
                         finished_at = NULL
                     """,
                     (
@@ -411,6 +645,8 @@ def migrate(connection):
                 actual_counts = history_counts(connection)
 
                 for table in counts:
+                    if version == "017" and table == UFW_UTC_PROOF:
+                        continue
                     original_count = counts[table]
                     current_count = actual_counts.get(table)
 
