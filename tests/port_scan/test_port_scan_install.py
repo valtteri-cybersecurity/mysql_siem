@@ -1,4 +1,5 @@
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,6 +18,11 @@ def project(tmp_path):
         ROOT / "config/port_scan.env.example", root / "config/port_scan.env.example"
     )
     shutil.copy(ROOT / "config/run_with_env.sh", root / "config/run_with_env.sh")
+    runtime = root / "config/run_with_env.sh"
+    runtime.write_text(runtime.read_text().replace(
+        "LOCAL_STATE_DIR=/usr/local/lib/.mysql_siem-local",
+        "LOCAL_STATE_DIR=" + shlex.quote(str(root / "local-state")),
+    ))
     (root / "config/mysql.env").write_text(
         "DB_HOST=localhost\nDB_USER=test-user\nDB_PASSWORD=test-only\nDB_NAME=mysql_siem\n"
     )
@@ -97,6 +103,7 @@ def test_managed_cron_is_repeatable_and_preserves_other_jobs(project, tmp_path):
     )
     script = (
         r"""set -euo pipefail
+verify_installation_health() { :; }
 local_identity_setup() { :; }
 audit_installation() { :; }
 crontab() {

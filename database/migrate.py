@@ -414,9 +414,9 @@ def migrate(connection):
                     original_count = counts[table]
                     current_count = actual_counts.get(table)
 
-                    if original_count != current_count:
+                    if current_count is None or current_count < original_count:
                         raise MigrationError(
-                            "Historical row counts changed; "
+                            "Historical row counts decreased; "
                             "inspect the database before resuming jobs."
                         )
 

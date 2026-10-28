@@ -5,6 +5,7 @@ import json
 import os
 import pwd
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 import pymysql
 
 from config import installation_state as journal
+from config.installation_backup import BackupError
 from config.installation_role import RoleConfigurationError, get_installation_role
 from config.service_installation import InstallationError, trusted_directory
 from database.migrate import LOCK_NAME, MigrationError
@@ -584,19 +586,39 @@ def check_upgrade_database(connection):
     check_ufw_before_upgrade(connection)
 
 
-def upgrade_database(connection, settings):
-    """Additive upgrade without deleting existing data."""
+def upgrade_database(connection, settings, *, project, state=None):
+    """Back up and verify before DDL; never restore production automatically."""
+    from config.installation_backup import (
+        create_verified_backup,
+        mark_upgrade_phase,
+        verify_rows,
+    )
     from database.migrate import check_ufw_utc_readiness, migrate
 
     validate_settings(settings)
     check_upgrade_database(connection)
+    if state is None:
+        state = journal.STATE_DIR
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT GET_LOCK(%s, 0)', (LOCK_NAME,))
+        if cursor.fetchone() != (1,):
+            raise ResetError('Another migration is running; upgrade stopped before backup or DDL.')
+    try:
+        folder, manifest = create_verified_backup(connection, project, state=state)
+        print('Verified upgrade backup retained at ' + str(folder))
+        mark_upgrade_phase(folder, state, 'MIGRATING')
+        try:
+            migrate(connection)
+            check_ufw_utc_readiness(connection)
+            verify_rows(connection, folder, manifest['tables'])
+        except BaseException:
+            mark_upgrade_phase(folder, state, 'FAILED')
+            raise
+        mark_upgrade_phase(folder, state, 'MIGRATED')
+    finally:
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT RELEASE_LOCK(%s)', (LOCK_NAME,))
 
-    # Apply missing migrations using the existing framework.
-    migrate(connection)
-
-    # REQUIRED: Verify UTC readiness after migration 017.
-    # Never bypass the existing historical timestamp policy.
-    check_ufw_utc_readiness(connection)
 
 
 def database_preflight(operation, *, allow_legacy=False):
@@ -652,14 +674,19 @@ def prepared_reset_recovery(project):
     return True
 
 
+def stop_installation(signum, frame):
+    raise ResetError('Installation interrupted; collection remains paused. Preserve backups and retry the same approved operation.')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('check', 'reset', 'upgrade', 'recovery-check', 'resume'))
+    parser.add_argument('action', choices=('check', 'reset', 'upgrade', 'verify-upgrade', 'recovery-check', 'resume'))
     parser.add_argument('--operation', choices=('reset', 'upgrade'), default='upgrade')
     parser.add_argument('--project', type=Path, required=True)
     parser.add_argument('--allow-legacy-grants', action='store_true')
     args = parser.parse_args(argv)
     connection = None
+    previous_handler = signal.signal(signal.SIGTERM, stop_installation)
     try:
         if args.action in ('recovery-check', 'resume'):
             if os.geteuid() != 0:
@@ -683,18 +710,33 @@ def main(argv=None):
                 database_preflight(args.operation)
             if args.operation == 'reset':
                 check_system_cron()
+            if args.operation == 'upgrade':
+                from config.installation_backup import check_prerequisites
+
+                connection = pymysql.connect(unix_socket=SOCKET, user='root', database=DATABASE,
+                                             charset='utf8mb4', autocommit=True, connect_timeout=5,
+                                             read_timeout=15, write_timeout=15)
+                check_prerequisites(connection)
             print('Database preflight passed; no database or scheduler changes were made.')
             return 0
         journal.require_maintenance(journal.STATE_DIR)
-        journal.require_stage(journal.STATE_DIR, args.project)
+        if args.action != 'verify-upgrade':
+            journal.require_stage(journal.STATE_DIR, args.project)
         if get_installation_role(path=args.project / 'config/role.env') != 'server':
             raise ResetError('Database setup is available only for the Server installation role.')
         validate_settings(os.environ)
         connection = pymysql.connect(unix_socket=SOCKET, user='root', charset='utf8mb4', autocommit=True,
                                      connect_timeout=5, read_timeout=30, write_timeout=30,
                                      init_command="SET time_zone = '+00:00'")
+        if args.action == 'verify-upgrade':
+            from config.installation_backup import verify_final_backup
+
+            connection.select_db(DATABASE)
+            verify_final_backup(connection, args.project, journal.read_deployment(journal.STATE_DIR))
+            print('Original database values and settings verified before releasing collection.')
+            return 0
         if args.action == 'upgrade':
-            upgrade_database(connection, os.environ)
+            upgrade_database(connection, os.environ, project=args.project)
             print('Database upgraded; history and identities preserved.')
             return 0
         exists = database_exists(connection)
@@ -710,7 +752,7 @@ def main(argv=None):
                        prepare=lambda: clear_old_identity(journal.STATE_DIR, args.project))
         print('Fresh mysql_siem database initialized; migrations and UTC readiness verified.')
         return 0
-    except (ResetError, RoleConfigurationError) as error:
+    except (ResetError, RoleConfigurationError, BackupError) as error:
         print(str(error), file=sys.stderr)
         return 1
     except (OSError, ValueError, EOFError, subprocess.SubprocessError, InstallationError,
@@ -732,6 +774,7 @@ def main(argv=None):
     finally:
         if connection is not None:
             connection.close()
+        signal.signal(signal.SIGTERM, previous_handler)
 
 
 if __name__ == '__main__':

@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from config import installation_backup as backup
 from config import reset_installation as setup
 from database import migrate
 from database.snapshot_migrations import source_clause
@@ -42,7 +43,7 @@ def test_cron_grants_and_required_sources_cover_both_collectors():
 def upgrade_connection(grants=None):
     connection = MagicMock()
     cursor = connection.cursor.return_value.__enter__.return_value
-    cursor.fetchone.side_effect = [(1,), ('8.0.46',), ('',), (1,)]
+    cursor.fetchone.side_effect = [(1,), ('8.0.46',), ('',), (1,), (1,)]
     cursor.fetchall.return_value = [(grant,) for grant in (grants or [
         'GRANT SELECT ON `mysql_siem`.`hosts` TO `pythonuser`@`localhost`',
         'GRANT SELECT, INSERT ON `mysql_siem`.`ufw_log` TO `pythonuser`@`localhost`',
@@ -50,14 +51,18 @@ def upgrade_connection(grants=None):
     return connection
 
 
-def test_upgrade_never_resets_database_registry_passwords_or_checkpoints(monkeypatch):
+def test_upgrade_never_resets_database_registry_passwords_or_checkpoints(monkeypatch, tmp_path):
     connection = upgrade_connection()
     calls = []
     monkeypatch.setattr(migrate, 'migration_status', lambda _: {'017': (migrate.checksum(migrate.UFW_TIME_MIGRATION), 'APPLIED')})
     monkeypatch.setattr(migrate, 'migrate', lambda _: calls.append('migrate'))
     monkeypatch.setattr(migrate, 'check_ufw_utc_readiness', lambda _: calls.append('utc'))
     settings = {'DB_HOST': 'localhost', 'DB_USER': 'pythonuser', 'DB_PASSWORD': 'synthetic', 'DB_NAME': 'mysql_siem'}
-    setup.upgrade_database(connection, settings)
+    monkeypatch.setattr(backup, 'create_verified_backup', lambda *args, **kwargs: (tmp_path, {'tables': {}}))
+    monkeypatch.setattr(backup, 'mark_upgrade_phase', MagicMock())
+    monkeypatch.setattr(backup, 'verify_rows', MagicMock())
+    setup.upgrade_database(connection, settings, project=tmp_path)
+    backup.verify_rows.assert_called_once_with(connection, tmp_path, {})
     assert calls == ['utc', 'migrate', 'utc']
     connection.select_db.assert_called_once_with('mysql_siem')
     cursor = connection.cursor.return_value.__enter__.return_value
@@ -70,13 +75,13 @@ def test_upgrade_never_resets_database_registry_passwords_or_checkpoints(monkeyp
     'GRANT SELECT, UPDATE ON `mysql_siem`.`hosts` TO `pythonuser`@`localhost`',
     'GRANT CREATE ON `mysql_siem`.`service_events` TO `pythonuser`@`localhost`',
 ])
-def test_upgrade_rejects_administrative_runtime_grants(monkeypatch, grant):
+def test_upgrade_rejects_administrative_runtime_grants(monkeypatch, grant, tmp_path):
     connection = upgrade_connection([grant])
     apply = MagicMock()
     monkeypatch.setattr(migrate, 'migrate', apply)
     settings = {'DB_HOST': 'localhost', 'DB_USER': 'pythonuser', 'DB_PASSWORD': 'synthetic', 'DB_NAME': 'mysql_siem'}
     with pytest.raises(setup.ResetError):
-        setup.upgrade_database(connection, settings)
+        setup.upgrade_database(connection, settings, project=tmp_path)
     apply.assert_not_called()
 
 

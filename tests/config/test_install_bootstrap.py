@@ -39,6 +39,9 @@ if 'init' in args:
     target = Path(args[-1])
     (target / 'config').mkdir(parents=True)
     shutil.copyfile(os.environ['TEST_HELPER'], target / 'config/install_bootstrap.sh')
+    for name in ('installation_backup.py', 'installation_health.py'):
+        if failure != 'missing-backup' or name != 'installation_backup.py':
+            (target / 'config' / name).write_text('synthetic approved helper\\n')
     child = """#!/bin/bash
 set -euo pipefail
 SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -200,3 +203,10 @@ def test_git_transport_cannot_inherit_disabled_tls_or_external_helpers(download)
                      GIT_ASKPASS='/untrusted/askpass', GIT_TERMINAL_PROMPT='1')
     assert result.returncode == 0, result.stderr
     assert 'NEW_INSTALLER:' in result.stdout
+
+
+def test_old_commit_without_backup_support_is_never_executed(download):
+    result = execute(download, TEST_FAILURE='missing-backup')
+    assert result.returncode != 0
+    assert 'lacks verified upgrade backup/health support' in result.stderr
+    assert 'NEW_INSTALLER:' not in result.stdout

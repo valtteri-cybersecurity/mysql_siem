@@ -4,6 +4,7 @@ import grp
 import json
 import os
 import pwd
+import re
 import shutil
 import stat
 import subprocess
@@ -33,6 +34,39 @@ def trusted_directory(path):
         info = directory.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
             raise InstallationError('Installation directories must be root-owned without group/other writes.')
+
+
+def read_revision(project):
+    descriptor = os.open(project / 'config/installed-version', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o640):
+            raise InstallationError('Installed version file has unsafe ownership or permissions.')
+        value = os.read(descriptor, 128).decode('ascii')
+    finally:
+        os.close(descriptor)
+    if re.fullmatch(r'[0-9a-f]{40}\n', value) is None:
+        raise InstallationError('Installed version is not a complete approved commit ID.')
+    return value.strip()
+
+
+def check_deployment_space(source, target, stable):
+    size = 0
+    roots = [source]
+    if target.exists():
+        roots.append(target)
+    for root in roots:
+        for path in tree_files(root):
+            size += path.stat().st_size
+    required = max(512 * 1024 * 1024, size * 2)
+    for location in (target.parent, stable.parent):
+        existing = location
+        while not existing.exists() and not existing.is_symlink():
+            existing = existing.parent
+        trusted_directory(existing)
+        if shutil.disk_usage(existing).free < required:
+            raise InstallationError('Insufficient disk space for staging and the new Python environment.')
 
 
 def validate_role_sources(source, target, user):
@@ -457,6 +491,7 @@ def prepare_deployment(source, target, user, role, stable, state, *, settings_so
     from config import installation_state as journal
 
     journal.require_install_lock()
+    check_deployment_space(source, target, stable)
     trusted_directory(state.parent)
     if not state.exists() and not state.is_symlink():
         state.mkdir(mode=0o755)
@@ -817,7 +852,11 @@ def prepare_snapshot_logs(user, root=Path('/var/log/mysql_siem'), *, check_only=
 def main(arguments):
     try:
         action = arguments[0]
-        if action == 'check':
+        if action == 'version':
+            target = Path(arguments[1])
+            trusted_directory(target)
+            print('Installed official commit: ' + read_revision(target))
+        elif action == 'check':
             source = Path(arguments[1])
             target = Path(arguments[2])
             trusted_directory(target.parent)

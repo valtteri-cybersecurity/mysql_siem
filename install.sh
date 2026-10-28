@@ -50,6 +50,7 @@ select_installation_role() {
                 ;;
             --role)
                 [[ $# -ge 2 && -z "$requested_role" ]] || die "Specify --role server or collector exactly once."
+                [[ "$2" == server || "$2" == collector ]] || die "Invalid installation role; use server or collector."
                 requested_role="$2"
                 shift 2
                 ;;
@@ -244,6 +245,14 @@ audit_installation() {
 verify_local_identity() {
     runuser -u "$INSTALL_USER" -- env PYTHONPATH="$PROJECT_DIR" \
         "$APP_PYTHON" -m database.local_identity verify --project "$PROJECT_DIR" --operation "${INSTALL_OPERATION:-reset}"
+}
+
+verify_installation_health() {
+    if [[ "$INSTALL_OPERATION" == upgrade ]]; then
+        PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" -m config.reset_installation verify-upgrade --project "$PROJECT_DIR"
+    fi
+    "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" -m config.installation_health \
+        --project "$PROJECT_DIR" --revision "$SIEM_BOOTSTRAP_COMMIT" --during-maintenance
 }
 
 # Platform and dependency checks (no database writes).
@@ -634,6 +643,12 @@ fi
 
 [[ $EUID -eq 0 ]] || die "Run: sudo bash install.sh"
 
+# Inspect the platform and published version before downloading a candidate.
+detect_distribution
+if [[ "$INSTALL_OPERATION" == upgrade && ( -e "$SERVICE_DIR" || -L "$SERVICE_DIR" ) ]]; then
+    service_installation version "$SERVICE_DIR"
+fi
+
 # The first invocation downloads; the verified invocation continues without a loop.
 . "$SOURCE_DIR/config/install_bootstrap.sh"
 bootstrap_latest_release
@@ -646,6 +661,8 @@ for path in \
     config/reset_installation.py \
     config/legacy_runtime.py \
     config/install_bootstrap.sh \
+    config/installation_backup.py \
+    config/installation_health.py \
     config/installation_state.py \
     database/local_identity.py \
     database/schema.sql \
@@ -745,6 +762,8 @@ if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
     fi
 fi
 trap cleanup_prepared_installation EXIT
+trap 'warn "Installation interrupted; preserve maintenance, backups and recovery files. Retry the same operation and approved revision."; exit 130' INT
+trap 'warn "Installation terminated; preserve maintenance, backups and recovery files. Retry the same operation and approved revision."; exit 143' TERM
 
 detect_distribution
 select_mysql_package
@@ -797,12 +816,15 @@ if [[ "$INSTALL_OPERATION" == reset ]]; then
 fi
 
 # Final database reset approval follows successful Audit preparation and all preflights.
-if [[ "${INSTALL_OPERATION:-reset}" == reset && "${EXISTING_DATABASE:-0}" == 1 && "${RESET_RECOVERY:-0}" != 1 ]]; then
+if [[ "${INSTALL_OPERATION:-reset}" == reset && "${RESET_RECOVERY:-0}" != 1 ]]; then
         printf '%s\n' 'WARNING: RESET INSTALLATION' '' \
             'This operation will permanently delete the' \
             'existing MySQL SIEM application database data.' '' \
             'All collected events, metrics, alerts and' \
             'collection checkpoints may be lost.' ''
+        if [[ "${EXISTING_DATABASE:-0}" != 1 ]]; then
+            printf '%s\n' 'No existing application database was found; this creates a fresh database without dropping a nonexistent one.'
+        fi
         printf 'Type RESET to confirm: '
         IFS= read -r reset_answer || die "Reset cancelled; Audit preparation may already have completed; no database reset was performed."
         [[ "$reset_answer" == RESET ]] || die "Reset cancelled; Audit preparation may already have completed; no database reset was performed."
@@ -1150,6 +1172,7 @@ crontab -u "$INSTALL_USER" "$CRON_TMP"
 # Audit uses a fixed status preflight then permanently drops root. The service
 # account receives no sudo/capabilities and all DB work uses run_with_env.sh.
 audit_installation activate
+verify_installation_health
 local_identity_setup finish
 unset SIEM_INSTALL_MAINTENANCE
 rm -f "$CRON_TMP"

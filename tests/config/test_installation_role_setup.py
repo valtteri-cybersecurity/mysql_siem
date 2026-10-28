@@ -139,6 +139,7 @@ def test_role_cron_selection_and_repeatable_managed_block(tmp_path, role):
     cron.write_text('MAILTO=keep\n17 * * * * echo external-job\n')
     block = INSTALLER.split("# Update only this installation's marked cron block.", 1)[1].split('log "Installation steps completed.', 1)[0]
     extra = '''
+verify_installation_health() { :; }
 local_identity_setup() { :; }
 audit_installation() { :; }
 crontab() {
@@ -258,3 +259,19 @@ def test_explicit_reset_flag_preserves_separate_destructive_confirmation(tmp_pat
     assert 'OPERATION:reset' in result.stdout
     assert 'SIEM_DATABASE_RESET_APPROVED=1' not in result.stdout
     assert 'Type RESET to confirm:' in INSTALLER
+
+
+@pytest.mark.parametrize('existing', ['0', '1'])
+@pytest.mark.parametrize('answer,approved', [('RESET\n', True), ('reset\n', False), ('\n', False), ('RESET \n', False)])
+def test_reset_always_requires_exact_confirmation_even_for_new_database(tmp_path, existing, answer, approved):
+    start = INSTALLER.index('# Final database reset approval')
+    end = INSTALLER.index('if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then', start)
+    script = '''set -euo pipefail
+INSTALL_OPERATION=reset
+RESET_RECOVERY=0
+SIEM_DATABASE_RESET_APPROVED=0
+die() { echo "$*" >&2; exit 1; }
+''' + 'EXISTING_DATABASE=' + existing + '\n' + INSTALLER[start:end] + '\necho APPROVED:$SIEM_DATABASE_RESET_APPROVED\n'
+    result = subprocess.run(['bash', '-c', script], input=answer, capture_output=True, text=True, check=False, timeout=5)
+    assert (result.returncode == 0) == approved
+    assert ('APPROVED:1' in result.stdout) == approved

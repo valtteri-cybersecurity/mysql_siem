@@ -448,3 +448,17 @@ def test_failed_database_setup_retains_prepared_credentials_without_publication(
     assert candidate.is_dir()
     assert (target / "install.sh").read_text() == "working installer\n"
     assert cron.read_text() == "existing cron jobs\n"
+
+
+@pytest.mark.parametrize('free,accepted', [(1, False), (1024**3, True)])
+def test_staging_space_is_checked_before_new_journal_or_stage(deployment, monkeypatch, free, accepted):
+    from types import SimpleNamespace
+
+    source, target = deployment
+    monkeypatch.setattr(service.shutil, 'disk_usage', lambda path: SimpleNamespace(free=free))
+    if accepted:
+        service.check_deployment_space(source, target, target.parent / 'python')
+    else:
+        with pytest.raises(service.InstallationError, match='disk space'):
+            service.check_deployment_space(source, target, target.parent / 'python')
+    assert not target.exists()

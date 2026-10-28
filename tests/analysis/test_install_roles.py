@@ -67,7 +67,7 @@ def project_snapshot(project):
 
 @pytest.mark.parametrize("arguments,selection", [
     (["--role", "collector"], ""),
-    ([], "2\n"),
+    ([], "2\n2\n"),
 ])
 def test_collector_refuses_before_any_installation_work(isolated_installer, arguments, selection):
     installer, _env, calls = isolated_installer
@@ -102,15 +102,15 @@ def test_repeated_collector_attempt_preserves_existing_installation(isolated_ins
     (["--role", "invalid"], "", "Invalid installation role"),
     (["--role", "Server"], "", "Invalid installation role"),
     (["--role", ""], "", "Invalid installation role"),
-    (["--role"], "", "Usage:"),
+    (["--role"], "", "Specify --role"),
     (["server"], "", "Usage:"),
     (["--unknown", "server"], "", "Usage:"),
-    (["--role", "server", "--role", "collector"], "", "Usage:"),
+    (["--role", "server", "--role", "collector"], "", "Specify --role"),
     (["--role", "collector", "--token", "secret-test-value"], "", "Usage:"),
-    ([], "0\n", "Invalid installation selection"),
-    ([], "server\n", "Invalid installation selection"),
-    ([], "\n", "Invalid installation selection"),
-    ([], "", "No installation type selected"),
+    ([], "0\n", "Invalid installation operation"),
+    ([], "server\n", "Invalid installation operation"),
+    ([], "\n", "Invalid installation operation"),
+    ([], "", "No installation operation selected"),
 ])
 def test_invalid_selection_fails_without_changes(isolated_installer, arguments, selection, message):
     installer, _env, calls = isolated_installer
@@ -126,7 +126,7 @@ def test_invalid_selection_fails_without_changes(isolated_installer, arguments, 
 
 @pytest.mark.parametrize("arguments,selection", [
     (["--role", "server"], ""),
-    ([], "1\n"),
+    ([], "2\n1\n"),
 ])
 def test_server_reaches_existing_installation_path(isolated_installer, arguments, selection):
     installer, _env, calls = isolated_installer

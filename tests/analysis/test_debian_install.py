@@ -43,7 +43,7 @@ def dependency_setup(tmp_path, distribution, version="8.4.13", *, client=True, m
     functions = functions.replace("/usr/sbin/mariadbd", str(binaries / "mariadbd"))
     functions = functions.replace("/usr/bin/mysql", str(binaries / "mysql"))
 
-    start = INSTALLER.index("\ndetect_distribution\n")
+    start = INSTALLER.index("\ndetect_distribution\n", INSTALLER.index("trap cleanup_prepared_installation EXIT"))
     end = INSTALLER.index("\nprintf '%s\\n' \"$SIEM_BOOTSTRAP_COMMIT\"", start)
 
     # Stub every privilege-changing, filesystem-changing and package-installing

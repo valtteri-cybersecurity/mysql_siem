@@ -816,6 +816,9 @@ def finish_maintenance(state, identity_file, connection, *, user, installed, aut
         verify_audit_activation(installed)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
         raise IdentityError('Audit activation is not verified; collection remains paused.') from None
+    from config.installation_backup import complete_upgrade_backup
+
+    complete_upgrade_backup(state, record)
     # Persist completion first. The public maintenance marker is always removed
     # last, and the inherited exclusive runtime lock still covers this process.
     atomic_write(state / 'required', 'Local bindings are required.\n', mode=0o644)

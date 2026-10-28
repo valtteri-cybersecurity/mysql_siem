@@ -396,7 +396,7 @@ def test_missing_migration_ledger_is_read_only(mysql):
     assert mysql.cursor.execute.call_args.args[0].startswith('SELECT ')
 
 
-@pytest.mark.parametrize('exists,answer,approved', [('1', 'RESET', True), ('1', 'cancel', False), ('0', '', False)])
+@pytest.mark.parametrize('exists,answer,approved', [('1', 'RESET', True), ('1', 'cancel', False), ('0', '', False), ('0', 'RESET', True)])
 def test_fresh_install_requires_explicit_reset_confirmation_for_an_existing_database(exists, answer, approved):
     installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
     start = installer.index('# Final database reset approval')
@@ -411,7 +411,7 @@ die() { printf '%s\n' "$*" >&2; exit 19; }
     result = subprocess.run(['bash', '-c', prefix + block + '\nprintf "approved:%s\n" "$SIEM_DATABASE_RESET_APPROVED"\n',
                              'first-install-test', exists], input=answer + '\n',
                             capture_output=True, text=True, timeout=5, check=False)
-    if exists == '1' and not approved:
+    if not approved:
         assert result.returncode == 19
         assert 'Reset cancelled' in result.stderr
         assert 'approved:' not in result.stdout

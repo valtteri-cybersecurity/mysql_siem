@@ -20,8 +20,13 @@ verify_release_checkout() {
 }
 
 bootstrap_latest_release() {
-    local download checkout revision status
+    local download checkout revision status required
     local -a operation_arguments=()
+    if [[ -z "${INSTALL_REVISION:-}" && -t 0 ]]; then
+        printf 'Approved official commit (full 40-character SHA): '
+        IFS= read -r INSTALL_REVISION || die "No approved commit supplied; no installation changes were made."
+        INSTALL_REVISION="${INSTALL_REVISION,,}"
+    fi
     [[ "${INSTALL_REVISION:-}" =~ ^[0-9a-f]{40}$ ]] ||
         die "An explicitly approved commit is required: use --revision with its full 40-character lowercase SHA. GitHub main is not an approved release."
     case "${INSTALL_OPERATION:-reset}" in
@@ -37,7 +42,7 @@ bootstrap_latest_release() {
         log "Installing approved official commit $INSTALL_REVISION."
         return
     fi
-    log "Approved official commit: $INSTALL_REVISION. Approval is supplied by the administrator; no signed-release policy is available."
+    log "Approved official commit: $INSTALL_REVISION. Approval is supplied by the administrator; automatic signed-release approval is not configured."
     download="$(mktemp -d /tmp/mysql_siem-download-XXXXXXXX)" || die "Cannot prepare GitHub download."
     chmod 700 "$download"
     checkout="$download/project"
@@ -61,6 +66,12 @@ bootstrap_latest_release() {
         rm -rf -- "$download"
         die "Approved commit does not contain the required installer."
     fi
+    for required in installation_backup.py installation_health.py; do
+        if [[ ! -f "$checkout/config/$required" || -L "$checkout/config/$required" ]]; then
+            rm -rf -- "$download"
+            die "Approved commit lacks verified upgrade backup/health support; no downloaded installer was executed."
+        fi
+    done
     status=0
     SIEM_BOOTSTRAP_CHECKOUT="$checkout" SIEM_BOOTSTRAP_COMMIT="$revision" \
         SIEM_BOOTSTRAP_SETTINGS="$SOURCE_DIR" SIEM_BOOTSTRAP_CONFIRMED="$checkout" \

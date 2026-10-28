@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -18,6 +19,11 @@ def project(tmp_path):
     config = root / "config"
     config.mkdir(parents=True)
     shutil.copy(ROOT / "config/run_with_env.sh", config / "run_with_env.sh")
+    runtime = root / "config/run_with_env.sh"
+    runtime.write_text(runtime.read_text().replace(
+        "LOCAL_STATE_DIR=/usr/local/lib/.mysql_siem-local",
+        "LOCAL_STATE_DIR=" + shlex.quote(str(root / "local-state")),
+    ))
     (config / "mysql.env").write_text(
         "DB_HOST=localhost\nDB_USER=test-user\nDB_PASSWORD=literal-password\n"
         "DB_NAME=mysql_siem\nDB_READ_TIMEOUT=15\n"

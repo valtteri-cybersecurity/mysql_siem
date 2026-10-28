@@ -421,6 +421,7 @@ def test_crontab_write_failure_never_calls_finish_or_releases_gate(tmp_path):
     gate.write_text('paused\n')
     marker = tmp_path / 'finish-called'
     script = '''set -Eeuo pipefail
+verify_installation_health() { :; }
 local_identity_setup() {
     if [[ "$1" == finish ]]; then touch "$FINISH_MARKER"; fi
 }

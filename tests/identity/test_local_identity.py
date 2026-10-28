@@ -161,7 +161,7 @@ def test_required_identity_cannot_fall_back_to_inherited_values(tmp_path):
 
 
 @pytest.mark.parametrize('operation', ['reset', 'upgrade'])
-@pytest.mark.parametrize('failure', [None, 'prepare', 'verify', 'published-verify', 'audit-activate'])
+@pytest.mark.parametrize('failure', [None, 'prepare', 'verify', 'published-verify', 'audit-activate', 'health'])
 def test_installer_verifies_identity_before_publication_and_cron(operation, failure):
     lines = (Path(__file__).resolve().parents[2] / 'install.sh').read_text().splitlines()
     commands = (
@@ -169,7 +169,7 @@ def test_installer_verifies_identity_before_publication_and_cron(operation, fail
         'local_identity_setup prepare', 'verify_local_identity',
         'audit_installation prepare', 'activate_service_installation',
         'local_identity_setup schedule --cron-file "$CRON_TMP"',
-        'crontab -u "$INSTALL_USER" "$CRON_TMP"', 'audit_installation activate', 'local_identity_setup finish',
+        'crontab -u "$INSTALL_USER" "$CRON_TMP"', 'audit_installation activate', 'verify_installation_health', 'local_identity_setup finish',
     )
     positions = {}
     for number, line in enumerate(lines):
@@ -187,7 +187,8 @@ def test_installer_verifies_identity_before_publication_and_cron(operation, fail
     cron = positions['crontab -u "$INSTALL_USER" "$CRON_TMP"'][0]
     finish = positions['local_identity_setup finish'][0]
     activation = positions['audit_installation activate'][0]
-    assert begin < reset_begin < prepare < verify < publish < published_verify < schedule < cron < activation < finish
+    health = positions['verify_installation_health'][0]
+    assert begin < reset_begin < prepare < verify < publish < published_verify < schedule < cron < activation < health < finish
     condition = 'if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then'
     assert lines[begin - 1].strip() == condition
     assert lines[reset_begin + 1].strip() == 'fi'
@@ -219,6 +220,7 @@ audit_installation() {
     printf 'audit:%s\n' "$*"
     if [[ "$1" == activate && "$FAILURE" == audit-activate ]]; then return 23; fi
 }
+verify_installation_health() { printf 'health\n'; [[ "$FAILURE" != health ]] || return 23; }
 crontab() { printf 'cron\n'; }
 '''
     result = subprocess.run(['bash', '-c', prefix + '\n'.join(selected),
@@ -227,7 +229,7 @@ crontab() { printf 'cron\n'; }
     expected = [
         'identity:begin' + (' --reset' if operation == 'reset' else ''),
         'identity:prepare', 'verify:1', 'audit:prepare', 'publish', 'verify:2',
-        'identity:schedule --cron-file /synthetic/cron', 'cron', 'audit:activate', 'identity:finish',
+        'identity:schedule --cron-file /synthetic/cron', 'cron', 'audit:activate', 'health', 'identity:finish',
     ]
     if failure == 'prepare':
         expected = expected[:2]
@@ -237,6 +239,8 @@ crontab() { printf 'cron\n'; }
         expected = expected[:6]
     elif failure == 'audit-activate':
         expected = expected[:9]
+    elif failure == 'health':
+        expected = expected[:10]
     assert result.returncode == (23 if failure else 0), result.stderr
     assert result.stdout.splitlines() == expected
 
