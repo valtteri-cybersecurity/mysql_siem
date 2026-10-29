@@ -6,16 +6,17 @@ import pytest
 
 from analysis.ufw import ports, source_ips
 from database import ufw_analysis_history
+from database.migrate import MigrationError
 
 
 @pytest.mark.parametrize('writer', [ports.run_port_analysis, source_ips.run_source_ip_analysis])
 def test_protected_interval_rolls_back_before_any_write(monkeypatch, writer):
     connection = MagicMock()
     cursor = connection.cursor.return_value.__enter__.return_value
-    cursor.fetchone.side_effect = [(1,), (1,), (1,)]
+    cursor.fetchone.side_effect = [(1,), None, (1,)]
     monkeypatch.setattr(ufw_analysis_history, 'marked', lambda connection, table: True)
     start = datetime(2026, 1, 1)
-    with pytest.raises(ValueError, match='Protected historical'):
+    with pytest.raises(MigrationError, match='migration 027'):
         writer(connection, start, start + timedelta(hours=1))
     connection.commit.assert_not_called()
     connection.rollback.assert_called_once()

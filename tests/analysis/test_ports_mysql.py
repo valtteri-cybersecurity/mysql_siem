@@ -19,12 +19,15 @@ MIGRATION = "011_analysis_ufw_ports.sql"
 @pytest.fixture
 def mysql(unmigrated_mysql, migrate_analysis):
     migrate_analysis(unmigrated_mysql, MIGRATION)
+    from database.migrate import migrate
+    migrate(unmigrated_mysql)
     return unmigrated_mysql
 
 
 def seed(connection, events):
     with connection.cursor() as cursor:
         for index, event in enumerate(events):
+            event.setdefault("host_id", None)
             cursor.execute("""INSERT INTO ufw_log
                 (event_time, src_ip, dst_ip, dst_port, protocol, action, raw_line, event_hash)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
@@ -38,7 +41,13 @@ def saved(connection):
     with connection.cursor(pymysql.cursors.DictCursor) as cursor:
         cursor.execute("""SELECT * FROM analysis_ufw_ports ORDER BY
                        period_start, period_end, destination_ip, destination_port, protocol""")
-        return [{field: row[field] for field in ports.RESULT_FIELDS} for row in cursor.fetchall()]
+        results = []
+        for row in cursor.fetchall():
+            result = {}
+            for field in ports.RESULT_FIELDS + ("host_id", "host_scope"):
+                result[field] = row[field]
+            results.append(result)
+        return results
 
 
 def create_legacy(connection):
@@ -143,8 +152,11 @@ def test_additive_migration_preserves_legacy_raw_and_new_results_and_can_repeat(
     assert source_before
     ports.validate_ports_schema(mysql)
     create_legacy(mysql)
-    migrate_analysis(mysql, MIGRATION)
-    migrate_analysis(mysql, MIGRATION)
+    # The legacy 011 validator intentionally rejects the expanded modern schema.
+    with pytest.raises(pymysql.MySQLError):
+        migrate_analysis(mysql, MIGRATION)
+    from database.migrate import migrate
+    assert migrate(mysql) == []
     assert saved(mysql) == before
     with mysql.cursor() as cursor:
         cursor.execute("SELECT hits FROM top_targeted_ports")

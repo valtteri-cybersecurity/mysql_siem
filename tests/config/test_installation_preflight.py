@@ -374,7 +374,10 @@ def test_migration_conflicts_stop_read_only_preflight_before_maintenance(mysql, 
 
 
 @pytest.mark.parametrize('status', ['APPLIED', 'RUNNING', 'FAILED'])
-def test_migration_history_preflight_accepts_original_sources_using_select_only(mysql, status):
+def test_migration_history_preflight_accepts_original_sources_using_select_only(mysql, status, monkeypatch):
+    from database import ufw_analysis_keys
+    guard = Mock()
+    monkeypatch.setattr(ufw_analysis_keys, "preflight", guard)
     mysql.cursor.fetchone.side_effect = [('schema_migrations',)]
     rows = []
     expected = {}
@@ -384,6 +387,10 @@ def test_migration_history_preflight_accepts_original_sources_using_select_only(
         expected[version] = (digest, status)
     mysql.cursor.fetchall.return_value = rows
     assert migrate.check_migration_history(mysql.connection) == expected
+    if status == "APPLIED":
+        guard.assert_called_once_with(mysql.connection)
+    else:
+        guard.assert_not_called()
     mysql.connection.commit.assert_not_called()
     for call in mysql.cursor.execute.call_args_list:
         assert call.args[0].startswith('SELECT ')

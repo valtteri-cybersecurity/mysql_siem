@@ -51,10 +51,17 @@ def test_preserve_40_hourly_6_daily_and_refuse_overwrite(empty_mysql, monkeypatc
         with connection.cursor() as cursor:
             cursor.execute('SELECT COUNT(*) FROM ' + table + " WHERE time_basis='HISTORICAL'")
             assert cursor.fetchone() == (count,)
-    with pytest.raises(ValueError, match='Protected historical'):
-        traffic.save_traffic(connection, start, start + timedelta(hours=1), daily=False, now=start)
-    with pytest.raises(ValueError, match='Protected historical'):
-        traffic.save_traffic(connection, start, start + timedelta(days=1), daily=True, now=start)
+    from database.ufw_analysis_history import snapshot as history_snapshot
+    preserved = {}
+    for table in ('analysis_ufw_traffic', 'analysis_ufw_traffic_daily'):
+        preserved[table] = history_snapshot(connection, table)
+    traffic.save_traffic(connection, start, start + timedelta(hours=1), daily=False, now=start)
+    traffic.save_traffic(connection, start, start + timedelta(days=1), daily=True, now=start)
+    for table, original_history in preserved.items():
+        assert history_snapshot(connection, table) == original_history
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT COUNT(*) FROM ' + table + " WHERE time_basis='UTC_VERIFIED'")
+            assert cursor.fetchone() == (1,)
     future = datetime(2026, 1, 10)
     with connection.cursor() as cursor:
         for event_id, tag in [(1, 'UTC_VERIFIED'), (2, 'UNVERIFIED')]:

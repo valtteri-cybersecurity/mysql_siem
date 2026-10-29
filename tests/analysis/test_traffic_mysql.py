@@ -18,6 +18,8 @@ MIGRATION = "012_analysis_ufw_traffic.sql"
 @pytest.fixture
 def mysql(unmigrated_mysql, migrate_analysis):
     migrate_analysis(unmigrated_mysql, MIGRATION)
+    from database.migrate import migrate
+    migrate(unmigrated_mysql)
     return unmigrated_mysql
 
 
@@ -154,7 +156,8 @@ def test_naive_calendar_days_follow_ufw_basis_even_on_dst_dates(mysql, events, s
 
 def test_additive_repeatable_migration_and_other_analyses(mysql, events, migrate_analysis):
     seed(mysql, events)
-    migrate_analysis(mysql, "011_analysis_ufw_ports.sql")
+    from database.migrate import migrate
+    assert migrate(mysql) == []
     source = run_source_ip_analysis(mysql, START, END)
     ports = run_port_analysis(mysql, START, END)
     assert source["total_events"] == 5 and ports["total_events"] == 4

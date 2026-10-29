@@ -27,7 +27,10 @@ def events():
 
 
 @pytest.fixture
-def connection():
+def connection(monkeypatch):
+    from database import ufw_analysis_keys
+    # These unit tests isolate aggregation/transactions; guard invariants have dedicated tests.
+    monkeypatch.setattr(ufw_analysis_keys, "require_ready", lambda connection, table: None)
     connection = MagicMock()
     connection._siem_identity_ready = False
     cursor = connection.cursor.return_value

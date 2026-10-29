@@ -78,7 +78,7 @@ def ensure_tables(connection, table_names, *, rule_keys=(), schema_file=SCHEMA_F
     return created
 
 
-def validate_source_ips_schema(connection):
+def validate_source_ips_schema(connection, *, parallel=None):
     """Check the Source IP table without altering data or its analysis algorithm."""
     table = "analysis_source_ips"
     with connection.cursor() as cursor:
@@ -118,6 +118,11 @@ def validate_source_ips_schema(connection):
         if scoped:
             expected_indexes["PRIMARY"][1].append("host_scope")
             expected_indexes["fk_analysis_source_ips_host"] = (1, ["host_id"])
+        if parallel is None:
+            from database.ufw_analysis_keys import applied
+            parallel = applied(connection)
+        if parallel:
+            expected_indexes['PRIMARY'][1].append('time_basis')
         if indexes != expected_indexes:
             raise SchemaError("analysis_source_ips: incompatible keys; inspect database/schema.sql.")
 

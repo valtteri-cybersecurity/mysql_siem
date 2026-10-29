@@ -48,6 +48,7 @@ MIGRATIONS = (
     ("024", "ufw_quarantine_archives", ROOT / "migrations/024_ufw_quarantine_archives.sql"),
     ("025", "ufw_continuity", ROOT / "migrations/025_ufw_continuity.sql"),
     ("026", "ufw_filtering", ROOT / "migrations/026_ufw_filtering.sql"),
+    ("027", "ufw_analysis_parallel_time_basis", ROOT / "migrations/027_ufw_analysis_parallel_time_basis.sql"),
 )
 
 
@@ -166,6 +167,9 @@ def check_migration_history(connection):
                     "restore its original source."
                 )
 
+    if records.get('027', (None, None))[1] == 'APPLIED':
+        from database.ufw_analysis_keys import preflight
+        preflight(connection)
     return records
 
 
@@ -525,6 +529,10 @@ def apply_one(connection, version):
         from database.audit_migrations import upgrade_audit
         upgrade_audit(connection, ROOT / "migrations/020_audit.sql")
 
+    elif version == "027":
+        from database.ufw_analysis_keys import upgrade
+        upgrade(connection)
+
     elif version == "026":
         path = ROOT / "migrations/026_ufw_filtering.sql"
         tables, _rules = read_schema(path)
@@ -667,6 +675,12 @@ def migrate(connection):
                 if version == "023" and "_analysis_baseline" not in counts:
                     from database.ufw_analysis_history import capture
                     counts["_analysis_baseline"] = capture(connection)
+                if version == '027' and '_analysis_parallel_baseline' not in counts:
+                    from database.ufw_analysis_keys import KEY as PARALLEL_KEY
+                    from database.ufw_analysis_keys import capture
+                    if previous is not None:
+                        raise MigrationError('027: original analysis snapshot is missing; upgrade stopped.')
+                    counts[PARALLEL_KEY] = capture(connection)
                 cursor.execute(
                     """
                     INSERT INTO schema_migrations
@@ -693,7 +707,7 @@ def migrate(connection):
                 actual_counts = history_counts(connection)
 
                 for table in counts:
-                    if table in ("_ufw_compatibility", "_ssh_baseline", "_analysis_baseline", UFW_UTC_PROOF):
+                    if table in ("_ufw_compatibility", "_ssh_baseline", "_analysis_baseline", "_analysis_parallel_baseline", UFW_UTC_PROOF):
                         continue
                     original_count = counts[table]
                     current_count = actual_counts.get(table)

@@ -96,8 +96,11 @@ def save_traffic(connection, start_time, end_time, *, daily, now, host_id=None):
             values = (start_time, end_time) + tuple(result[name] for name in METRICS) + (result["first_seen"], result["last_seen"])
         from database.ufw_analysis_history import protect_interval
         protect_interval(connection, table, start_time, end_time)
-        fields += ("period_status", "coverage_status")
-        values += ("OPEN" if now < end_time else "CLOSED", "UNKNOWN")
+        fields += ("period_status", "coverage_status", "time_basis")
+        period_status = "CLOSED"
+        if now < end_time:
+            period_status = "OPEN"
+        values += (period_status, "UNKNOWN", "UTC_VERIFIED")
         if identity_schema_enabled(connection):
             fields += ("host_id", "host_scope")
             values += (host_id, host_id or 0)
@@ -177,10 +180,12 @@ def run_traffic_analysis(connection, start_time, end_time, *, now=None, previous
                 raise TrafficAnalysisError("Traffic Analysis lock was lost.")
 
 
-def validate_traffic_schema(connection):
+def validate_traffic_schema(connection, *, parallel=None, only_table=None):
     """Installer preflight: fail closed on incompatible existing summary tables."""
     for table, keys in (("analysis_ufw_traffic", ["period_start", "period_end"]),
                         ("analysis_ufw_traffic_daily", ["analysis_date"])):
+        if only_table is not None and table != only_table:
+            continue
         with connection.cursor() as cursor:
             cursor.execute("""SELECT engine FROM information_schema.tables
                            WHERE table_schema = DATABASE() AND table_name = %s AND table_type = 'BASE TABLE'""", (table,))
@@ -216,5 +221,10 @@ def validate_traffic_schema(connection):
             if scoped:
                 expected_indexes["uq_traffic_period"][1].append("host_scope")
                 expected_indexes[f"fk_{table}_host"] = (1, ["host_id"])
+            if parallel is None:
+                from database.ufw_analysis_keys import applied
+                parallel = applied(connection)
+            if parallel:
+                expected_indexes['uq_traffic_period'][1].append('time_basis')
             if indexes != expected_indexes:
                 raise TrafficAnalysisError(f"{table}: incompatible period keys; inspect database/schema.sql.")

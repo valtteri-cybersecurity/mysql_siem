@@ -133,8 +133,12 @@ def test_exact_period_replacement_commits(connection, port_events, monkeypatch):
     assert summary["status"] == "SUCCESS" and summary["group_count"] == 1
     cursor = connection.cursor.return_value
     delete = next(call.args for call in cursor.execute.call_args_list if "DELETE" in call.args[0])
-    assert delete == ("DELETE FROM analysis_ufw_ports WHERE period_start = %s AND period_end = %s", (START, END))
-    assert cursor.executemany.call_args.args[1] == [tuple(rows[0][field] for field in ports.RESULT_FIELDS)]
+    assert delete == ("DELETE FROM analysis_ufw_ports WHERE period_start = %s AND period_end = %s AND time_basis = 'UTC_VERIFIED'", (START, END))
+    expected_values = []
+    for field in ports.RESULT_FIELDS:
+        expected_values.append(rows[0][field])
+    expected_values.append("UTC_VERIFIED")
+    assert cursor.executemany.call_args.args[1] == [tuple(expected_values)]
     connection.begin.assert_called_once()
     connection.commit.assert_called_once()
     connection.rollback.assert_not_called()

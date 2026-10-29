@@ -141,8 +141,12 @@ def test_exact_interval_replacement_and_commit(connection, events, monkeypatch):
     assert summary["source_count"] == 1 and summary["total_events"] == 5
     cursor = connection.cursor.return_value
     delete = next(call for call in cursor.execute.call_args_list if "DELETE" in call.args[0])
-    assert delete.args == ("DELETE FROM analysis_source_ips WHERE period_start = %s AND period_end = %s", (START, END))
-    assert cursor.executemany.call_args.args[1] == [tuple(result[0][field] for field in source_ips.RESULT_FIELDS)]
+    assert delete.args == ("DELETE FROM analysis_source_ips WHERE period_start = %s AND period_end = %s AND time_basis = 'UTC_VERIFIED'", (START, END))
+    expected_values = []
+    for field in source_ips.RESULT_FIELDS:
+        expected_values.append(result[0][field])
+    expected_values.append("UTC_VERIFIED")
+    assert cursor.executemany.call_args.args[1] == [tuple(expected_values)]
     connection.begin.assert_called_once()
     connection.commit.assert_called_once()
     connection.rollback.assert_not_called()

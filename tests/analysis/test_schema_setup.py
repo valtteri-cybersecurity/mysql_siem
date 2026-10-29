@@ -181,9 +181,15 @@ def test_reported_upgrade_creates_missing_analysis_and_preserves_every_existing_
     assert snapshot(connection, existing) == before
     assert schema.prepare_schema(connection, "analysis", schema_file=isolated_schema) == []
     assert snapshot(connection, existing) == before
-    assert run_source_ip_analysis(connection, start, end)["total_events"] == 1
-    assert run_port_analysis(connection, start, end)["total_events"] == 1
-    assert run_traffic_analysis(connection, start, end, now=end)["total_events"] == 1
+    from database.migrate import MigrationError
+    # Provisioning a legacy schema alone must not authorize modern UTC writes.
+    with pytest.raises(MigrationError, match='027'):
+        run_source_ip_analysis(connection, start, end)
+    with pytest.raises(MigrationError, match='027'):
+        run_port_analysis(connection, start, end)
+    with pytest.raises(MigrationError, match='027'):
+        run_traffic_analysis(connection, start, end, now=end)
+    assert snapshot(connection, existing) == before
 
 
 def test_fresh_install_import_and_repeatable_current_setup(setup_mysql):

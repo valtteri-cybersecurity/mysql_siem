@@ -21,9 +21,17 @@ START = datetime(2026, 10, 22, 12)
 END = START + timedelta(hours=1)
 
 
+@pytest.fixture
+def mysql(unmigrated_mysql):
+    from database.migrate import migrate
+    migrate(unmigrated_mysql)
+    return unmigrated_mysql
+
+
 def insert_events(connection, events):
     with connection.cursor() as cursor:
         for index, event in enumerate(events):
+            event.setdefault("host_id", None)
             digest = hashlib.sha256(f"{index}-{event}".encode()).hexdigest()
             cursor.execute(
                 """INSERT INTO ufw_log
@@ -38,7 +46,13 @@ def insert_events(connection, events):
 def saved(connection):
     with connection.cursor(pymysql.cursors.DictCursor) as cursor:
         cursor.execute("SELECT * FROM analysis_source_ips ORDER BY period_start, period_end, source_ip")
-        return [{field: row[field] for field in RESULT_FIELDS} for row in cursor.fetchall()]
+        results = []
+        for row in cursor.fetchall():
+            result = {}
+            for field in RESULT_FIELDS + ("host_id", "host_scope"):
+                result[field] = row[field]
+            results.append(result)
+        return results
 
 
 def test_real_mysql_matches_all_metrics_and_interval_boundaries(mysql, events):
@@ -144,7 +158,7 @@ def test_repeatable_migration_preserves_raw_and_new_history(mysql, events, migra
         assert cursor.fetchone()[0] == 5
         cursor.execute("SHOW INDEX FROM analysis_source_ips")
         indexes = cursor.fetchall()
-        assert [row[4] for row in indexes if row[2] == "PRIMARY"] == ["period_start", "period_end", "source_ip"]
+        assert [row[4] for row in indexes if row[2] == "PRIMARY"] == ["period_start", "period_end", "source_ip", "host_scope", "time_basis"]
         assert [row[4] for row in indexes if row[2] == "idx_analysis_source_history"] == ["source_ip", "period_start", "period_end"]
 
 
@@ -160,7 +174,8 @@ def test_real_unique_key_prevents_duplicate_period_and_ip(mysql, events):
     assert len(saved(mysql)) == 1
 
 
-def test_bootstrap_schema_never_recreates_retired_table(mysql, migrate_analysis):
+def test_bootstrap_schema_never_recreates_retired_table(unmigrated_mysql, migrate_analysis):
+    mysql = unmigrated_mysql
     root = Path(__file__).resolve().parents[2]
     schema = (root / "database/schema.sql").read_text()
     # The fixture has already created ufw_log and applied 009. Create every

@@ -21,7 +21,7 @@ class PortAnalysisError(RuntimeError):
 
 
 
-def validate_ports_schema(connection):
+def validate_ports_schema(connection, *, parallel=None):
     """Read-only installer preflight, matching the current database/schema.sql.
 
     Never repair or drop a table here. A mismatch requires explicit review of
@@ -73,6 +73,11 @@ def validate_ports_schema(connection):
         if scoped:
             expected_indexes["uq_ufw_ports_period"][1].append("host_scope")
             expected_indexes["fk_analysis_ufw_ports_host"] = (1, ["host_id"])
+        if parallel is None:
+            from database.ufw_analysis_keys import applied
+            parallel = applied(connection)
+        if parallel:
+            expected_indexes['uq_ufw_ports_period'][1].append('time_basis')
         if indexes != expected_indexes:
             raise PortAnalysisError("analysis_ufw_ports: index mismatch; inspect database/schema.sql.")
         cursor.execute("""SELECT tc.constraint_name, tc.constraint_type, tc.enforced, cc.check_clause
@@ -202,16 +207,25 @@ def run_port_analysis(connection, start_time, end_time, *, max_events=MAX_EVENTS
         protect_interval(connection, "analysis_ufw_ports", start_time, end_time)
         results = analyze_ports(connection, start_time, end_time, max_events=max_events)
         with connection.cursor() as cursor:
-            cursor.execute("DELETE FROM analysis_ufw_ports WHERE period_start = %s AND period_end = %s",
+            cursor.execute("DELETE FROM analysis_ufw_ports WHERE period_start = %s AND period_end = %s AND time_basis = 'UTC_VERIFIED'",
                            (start_time, end_time))
             if results:
                 fields = RESULT_FIELDS
                 if "host_id" in results[0]:
                     fields += ("host_id", "host_scope")
+                fields += ("time_basis",)
+                rows = []
+                for result in results:
+                    values = []
+                    for field in fields:
+                        if field == "time_basis":
+                            values.append("UTC_VERIFIED")
+                        else:
+                            values.append(result[field])
+                    rows.append(tuple(values))
                 placeholders = ", ".join(["%s"] * len(fields))
                 cursor.executemany(
-                    f"INSERT INTO analysis_ufw_ports ({', '.join(fields)}) VALUES ({placeholders})",
-                    [tuple(result[field] for field in fields) for result in results],
+                    f"INSERT INTO analysis_ufw_ports ({', '.join(fields)}) VALUES ({placeholders})", rows,
                 )
         from ingestion.ufw_filters import coverage_notice
         summary.update(coverage_notice(connection, start_time, end_time))

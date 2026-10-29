@@ -27,6 +27,8 @@ def test_preflight_allows_isolatable_raw_history_but_blocks_unsafe_dependencies(
     def execute(sql, args=None):
         query[0] = sql
     def fetchone():
+        if "version='027'" in query[0]:
+            return None  # This fixture models an installation predating 027.
         if 'row_counts' in query[0]:
             saved = {}
             for table in ('ufw_log',) + migrate.ANALYSIS_TABLES + ('detection_state', 'detection_alerts', 'alert_evidence'):

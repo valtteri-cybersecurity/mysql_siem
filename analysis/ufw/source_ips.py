@@ -157,17 +157,26 @@ def run_source_ip_analysis(connection, start_time, end_time, *, max_events=MAX_E
             # Exact replacement also removes stale IPs after a corrected source
             # or an empty rerun. It never deletes other historical periods.
             cursor.execute(
-                "DELETE FROM analysis_source_ips WHERE period_start = %s AND period_end = %s",
+                "DELETE FROM analysis_source_ips WHERE period_start = %s AND period_end = %s AND time_basis = 'UTC_VERIFIED'",
                 (start_time, end_time),
             )
             if results:
                 fields = RESULT_FIELDS
                 if "host_id" in results[0]:
                     fields += ("host_id", "host_scope")
+                fields += ("time_basis",)
+                rows = []
+                for result in results:
+                    values = []
+                    for field in fields:
+                        if field == "time_basis":
+                            values.append("UTC_VERIFIED")
+                        else:
+                            values.append(result[field])
+                    rows.append(tuple(values))
                 placeholders = ", ".join(["%s"] * len(fields))
                 cursor.executemany(
-                    f"INSERT INTO analysis_source_ips ({', '.join(fields)}) VALUES ({placeholders})",
-                    [tuple(result[field] for field in fields) for result in results],
+                    f"INSERT INTO analysis_source_ips ({', '.join(fields)}) VALUES ({placeholders})", rows,
                 )
         from ingestion.ufw_filters import coverage_notice
         summary.update(coverage_notice(connection, start_time, end_time))

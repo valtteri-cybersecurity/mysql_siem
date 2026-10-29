@@ -18,6 +18,7 @@ from analysis.ufw.source_ips import (
 from analysis.ufw.traffic import TrafficAnalysisError, run_traffic_analysis
 from config.run_logging import close_log, open_log, report
 from database.connection import get_connection
+from database.migrate import MigrationError
 
 
 def recent_hour_periods(now, hours=2):
@@ -76,6 +77,7 @@ def main(argv=None):
             report(logger, "UFW analysis: database connection failed.", error=True)
             report(logger, "Status: FAILED")
             return 1
+        report(logger, "Analysis time basis: UTC_VERIFIED; HISTORICAL results are preserved separately.")
         for name, run_analysis in analyses:
             for start, end in periods:
                 report(logger, f"Analysis: {name}")
@@ -99,9 +101,9 @@ def main(argv=None):
             if summary.get("reason"):
                 report(logger, summary["reason"])
         return 0
-    except (pymysql.MySQLError, SourceIPAnalysisError, PortAnalysisError, TrafficAnalysisError) as error:
+    except (pymysql.MySQLError, SourceIPAnalysisError, PortAnalysisError, TrafficAnalysisError, MigrationError) as error:
         message = "UFW analysis failed. Check the current database schema, permissions and the row limit."
-        if isinstance(error, (SourceIPAnalysisError, PortAnalysisError, TrafficAnalysisError)):
+        if isinstance(error, (SourceIPAnalysisError, PortAnalysisError, TrafficAnalysisError, MigrationError)):
             message = str(error)
         report(logger, message, error=True)
         report(logger, "Status: FAILED; uncommitted changes were rolled back. Completed intervals may be committed.")

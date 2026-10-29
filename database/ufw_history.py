@@ -233,6 +233,8 @@ def preflight(connection):
             analysis_saved = json.loads(cursor.fetchone()[0])
         check_counts(connection, analysis_saved, current)
         verify(connection, analysis_saved[ANALYSIS_KEY], final=analysis_state == 'APPLIED')
+    from database.ufw_analysis_keys import preflight as parallel_preflight
+    parallel_preflight(connection)
     check_detection(connection, allow_port=modern)
     if modern:
         from database.migrate import ufw_timestamp_schema

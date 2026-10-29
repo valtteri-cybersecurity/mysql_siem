@@ -709,6 +709,8 @@ for path in \
     ingestion/ufw_filters.py \
     config/ufw_filters.py \
     database/migrations/026_ufw_filtering.sql \
+    database/migrations/027_ufw_analysis_parallel_time_basis.sql \
+    database/ufw_analysis_keys.py \
     database/migrations/025_ufw_continuity.sql \
     database/migrations/024_ufw_quarantine_archives.sql \
     database/ufw_collection_schema.py \

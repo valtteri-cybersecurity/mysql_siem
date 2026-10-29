@@ -1,4 +1,4 @@
-"""Preserve historical analysis values and refuse overlapping UTC writes."""
+"""Preserve original analysis history proofs and guard parallel UTC writes."""
 import hashlib
 import json
 import time
@@ -14,7 +14,7 @@ def marked(connection, table):
         return cursor.fetchone() == (1,)
 
 
-def snapshot(connection, table, layout=None):
+def snapshot(connection, table, layout=None, *, basis='HISTORICAL'):
     from database.migrate import MigrationError
     if table not in TABLES:
         raise ValueError('Unknown analysis table.')
@@ -30,7 +30,8 @@ def snapshot(connection, table, layout=None):
                            "AND table_name=%s AND index_name='PRIMARY' ORDER BY seq_in_index", (table,))
             primary = []
             for row in cursor.fetchall():
-                primary.append(row[0])
+                if row[0] != 'time_basis':
+                    primary.append(row[0])
         if not fields or not primary:
             raise MigrationError('Analysis history requires an existing primary key.')
         layout = {'fields': fields, 'primary': primary}
@@ -59,10 +60,11 @@ def snapshot(connection, table, layout=None):
         where = '1=1'
         params = ()
         if historical:
-            where += " AND time_basis='HISTORICAL'"
+            where += " AND time_basis=%s"
+            params = (basis,)
         if last is not None:
             where += ' AND (' + key_sql + ') > (' + ','.join(['%s'] * len(keys)) + ')'
-            params = tuple(last)
+            params += tuple(last)
         with connection.cursor() as cursor:
             cursor.execute('SELECT /*+ MAX_EXECUTION_TIME(5000) */ ' + ','.join(expressions)
                            + ' FROM `' + table + '` WHERE ' + where + ' ORDER BY ' + key_sql + ' LIMIT 256', params)
@@ -127,15 +129,5 @@ def protect_interval(connection, table, start, end):
     """Run in the writer transaction before DELETE or UPSERT."""
     if table not in TABLES:
         raise ValueError('Unknown analysis table.')
-    if not marked(connection, table):
-        return
-    if table == 'analysis_ufw_traffic_daily':
-        predicate = 'analysis_date >= %s AND analysis_date < %s'
-    else:
-        predicate = 'period_start < %s AND period_end > %s'
-        start, end = end, start
-    with connection.cursor() as cursor:
-        cursor.execute('SELECT 1 FROM `' + table + "` WHERE time_basis <> 'UTC_VERIFIED' AND "
-                       + predicate + ' LIMIT 1 FOR UPDATE', (start, end))
-        if cursor.fetchone() is not None:
-            raise ValueError('Protected historical analysis overlaps this UTC recalculation: ' + table)
+    from database.ufw_analysis_keys import require_ready
+    require_ready(connection, table)
