@@ -225,7 +225,9 @@ def main():
     tracemalloc.stop()
     cpu_after = resource.getrusage(resource.RUSAGE_SELF)
     cpu = cpu_after.ru_utime + cpu_after.ru_stime - cpu_before.ru_utime - cpu_before.ru_stime
-    metrics = TimedCursor.metrics.copy()
+    metrics = {}
+    for category, values in TimedCursor.metrics.items():
+        metrics[category] = values.copy()
     actual = set()
     with connection.cursor() as cursor:
         cursor.execute('SELECT event_hash FROM ufw_log')
