@@ -53,6 +53,8 @@ def validate_ports_schema(connection):
         if scoped:
             expected["host_id"] = ("bigint unsigned", "YES", None, None, "")
             expected["host_scope"] = ("bigint unsigned", "NO", None, "0", "")
+        if "time_basis" in actual:
+            expected["time_basis"] = ("varchar(24)", "NO", "ascii_bin", "utc_verified", "")
         if actual != expected:
             raise PortAnalysisError("analysis_ufw_ports: column mismatch; inspect database/schema.sql.")
         cursor.execute("""SELECT index_name, non_unique, column_name, sub_part, index_type, is_visible
@@ -196,6 +198,8 @@ def run_port_analysis(connection, start_time, end_time, *, max_events=MAX_EVENTS
             return summary
         locked = True
         connection.begin()
+        from database.ufw_analysis_history import protect_interval
+        protect_interval(connection, "analysis_ufw_ports", start_time, end_time)
         results = analyze_ports(connection, start_time, end_time, max_events=max_events)
         with connection.cursor() as cursor:
             cursor.execute("DELETE FROM analysis_ufw_ports WHERE period_start = %s AND period_end = %s",
@@ -209,6 +213,8 @@ def run_port_analysis(connection, start_time, end_time, *, max_events=MAX_EVENTS
                     f"INSERT INTO analysis_ufw_ports ({', '.join(fields)}) VALUES ({placeholders})",
                     [tuple(result[field] for field in fields) for result in results],
                 )
+        from ingestion.ufw_filters import coverage_notice
+        summary.update(coverage_notice(connection, start_time, end_time))
         connection.commit()
         committed = True
         summary.update(group_count=len(results), total_events=sum(item["total_events"] for item in results),

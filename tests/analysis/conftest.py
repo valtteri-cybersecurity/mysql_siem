@@ -32,7 +32,15 @@ def connection():
     connection._siem_identity_ready = False
     cursor = connection.cursor.return_value
     cursor.__enter__.return_value = cursor
-    cursor.fetchone.side_effect = [(1,), (1,)]
+    locks = iter([(1,), (1,)])
+    def fetchone():
+        query = cursor.execute.call_args.args[0]
+        if "table_name='ufw_filter_seen'" in query:
+            return None  # This fixture represents a legacy schema without optional filtering.
+        if "column_name='time_basis'" in query:
+            return None  # Explicitly model the legacy schema in these unit tests.
+        return next(locks)
+    cursor.fetchone.side_effect = fetchone
     return connection
 
 

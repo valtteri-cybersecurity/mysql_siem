@@ -22,10 +22,8 @@ verify_release_checkout() {
 bootstrap_latest_release() {
     local download checkout revision status required
     local -a operation_arguments=()
-    if [[ -z "${INSTALL_REVISION:-}" && -t 0 ]]; then
-        printf 'Approved official commit (full 40-character SHA): '
-        IFS= read -r INSTALL_REVISION || die "No approved commit supplied; no installation changes were made."
-        INSTALL_REVISION="${INSTALL_REVISION,,}"
+    if [[ -z "${INSTALL_REVISION:-}" ]]; then
+        die "Automatic upgrade is disabled until a trusted signing key and signed stable release channel are configured. No release was downloaded. Administrator-approved --revision remains available."
     fi
     [[ "${INSTALL_REVISION:-}" =~ ^[0-9a-f]{40}$ ]] ||
         die "An explicitly approved commit is required: use --revision with its full 40-character lowercase SHA. GitHub main is not an approved release."

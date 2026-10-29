@@ -15,23 +15,23 @@ def line(index=0):
     ).encode()
 
 def cursor_at(position=None):
-    cursor = MagicMock()
-    cursor.fetchone.return_value = None if position is None else (position,)
-    cursor.rowcount = 1
-    return cursor
+    from tests.analysis.test_ufw_continuity import cursor_for_files
+    return cursor_for_files()
 
 
 def saved_position(cursor):
-    writes = [call.args[1] for call in cursor.execute.call_args_list if "INSERT INTO ufw_state" in call.args[0]]
+    writes = []
+    for call in cursor.execute.call_args_list:
+        if call.args[0].startswith(('INSERT INTO ufw_file_checkpoints', 'UPDATE ufw_file_checkpoints SET filename')):
+            writes.append(call.args[1])
     return writes[-1][1]
 
 
 def connection_for_files():
     connection = MagicMock()
-    cursor = connection.cursor.return_value
-    cursor.rowcount = 1
-    # Only GET_LOCK and position reads call fetchone; RELEASE_LOCK has no read.
-    cursor.fetchone.side_effect = [(1,)] + [None] * 20
+    cursor = cursor_at()
+    connection.cursor.return_value = cursor
+    connection._siem_identity_ready = False
     return connection
 
 
@@ -51,7 +51,6 @@ def test_growing_log_stops_at_initial_size_and_resumes_next_pass(tmp_path, monke
     cursor = cursor_at()
     assert ufw.process_file(cursor, str(logfile)) == 1
     assert saved_position(cursor) == len(line())
-    cursor.fetchone.return_value = (saved_position(cursor),)
     assert ufw.process_file(cursor, str(logfile)) == 1
     assert saved_position(cursor) == len(line()) + len(line(1))
     assert seen == [line().decode(), line(1).decode()]
@@ -74,7 +73,6 @@ def test_newline_appended_during_pass_does_not_complete_snapshot_partial_line(tm
     cursor = cursor_at()
     assert ufw.process_file(cursor, str(logfile)) == 1
     assert saved_position(cursor) == len(line())
-    cursor.fetchone.return_value = (saved_position(cursor),)
     assert ufw.process_file(cursor, str(logfile)) == 1
     assert seen == [line().decode(), line(1).decode()]
 
@@ -94,7 +92,10 @@ def test_line_budget_counts_blank_and_duplicate_lines(tmp_path, monkeypatch):
     cursor = cursor_at()
     stats = {"lines_read": 0, "stop_reason": "snapshot_end"}
     assert ufw.process_file(cursor, str(logfile), stats=stats, max_lines=2) == 0
-    assert stats == {"lines_read": 2, "stop_reason": "line_limit"}
+    assert stats["lines_read"] == 2
+    assert stats["stop_reason"] == "line_limit"
+    assert stats["duplicates"] == 1
+    assert stats["non_ufw"] == 1
     assert saved_position(cursor) == 1 + len(line())
 
 
@@ -125,13 +126,14 @@ def test_line_limit_is_shared_across_all_files_and_commits_before_unlock(tmp_pat
     monkeypatch.setattr(ufw, "LOGFILE", str(logfile))
     connection = connection_for_files()
     result = ufw.process_log(connection, max_lines=3)
-    assert result == {"inserted": 3, "lines_read": 3, "stop_reason": "line_limit"}
+    assert result["inserted"] == result["lines_read"] == 3
+    assert result["stop_reason"] == "line_limit"
     writes = [call.args[1] for call in connection.cursor.return_value.execute.call_args_list
-              if "INSERT INTO ufw_state" in call.args[0]]
+              if "INSERT INTO ufw_file_checkpoints" in call.args[0]]
     assert [(row[0], row[1]) for row in writes] == [
-        (str(logfile) + ".1", len(line()) + len(line(1))), (str(logfile), len(line(2)))]
+        (str(logfile), len(line(2))), (str(logfile) + ".1", len(line()) + len(line(1)))]
     connection.begin.assert_called_once()
-    connection.commit.assert_called_once()
+    assert connection.commit.called
     assert not connection.rollback.called
     calls = connection.mock_calls
     commit = next(index for index, call in enumerate(calls) if call == ("commit", (), {}))
@@ -139,27 +141,29 @@ def test_line_limit_is_shared_across_all_files_and_commits_before_unlock(tmp_pat
     assert commit < release
 
 
-def test_time_limit_is_shared_and_commits_processed_lines(tmp_path, monkeypatch):
+def test_time_limit_commits_only_content_verified_lines(tmp_path, monkeypatch):
     logfile = tmp_path / "ufw.log"
-    logfile.write_bytes(line(2))
-    (tmp_path / "ufw.log.1").write_bytes(line() + line(1))
+    logfile.write_bytes(line(2) + line(3))
     monkeypatch.setattr(ufw, "LOGFILE", str(logfile))
     clock = [0.0]
     monkeypatch.setattr(ufw.time, "monotonic", lambda: clock[0])
     seen = []
 
-    def save(cursor, value, *, identity=None):
-        seen.append(value)
-        clock[0] = 2.0
-        return 1
+    from ingestion import ufw_records
+    original_line = ufw_records.process_line
+    def save(cursor, raw, *args, **kwargs):
+        seen.append(raw.decode())
+        clock[0] = 0.8
+        return original_line(cursor, raw, *args, **kwargs)
 
-    monkeypatch.setattr(ufw, "save_event", save)
+    monkeypatch.setattr(ufw_records, "process_line", save)
     connection = connection_for_files()
     result = ufw.process_log(connection, max_seconds=1)
-    assert result == {"inserted": 1, "lines_read": 1, "stop_reason": "time_limit"}
-    assert seen == [line().decode()]
+    assert result["inserted"] == result["lines_read"] == 1
+    assert result["stop_reason"] == "time_limit"
+    assert seen == [line(2).decode()]
     assert saved_position(connection.cursor.return_value) == len(line())
-    connection.commit.assert_called_once()
+    assert connection.commit.called
 
 
 def test_expired_budget_does_not_open_another_file(monkeypatch):
@@ -176,23 +180,26 @@ def test_deadline_during_read_keeps_the_unprocessed_line(tmp_path, monkeypatch):
     logfile = tmp_path / "ufw.log"
     logfile.write_bytes(line())
     # Before open and before read there is time; after read the budget expires.
-    clock = iter([0.0, 0.0, 2.0])
+    clock = iter([0.0, 0.0, 0.0, 0.0, 0.8, 0.8, 0.8, 0.8])
     monkeypatch.setattr(ufw.time, "monotonic", lambda: next(clock))
     cursor = cursor_at()
     stats = {"lines_read": 0, "stop_reason": "snapshot_end"}
     assert ufw.process_file(cursor, str(logfile), stats=stats, deadline=1.0) == 0
     assert saved_position(cursor) == 0
-    assert stats == {"lines_read": 0, "stop_reason": "time_limit"}
+    assert stats["lines_read"] == 0
+    assert stats["stop_reason"] == "time_limit"
 
 
-@pytest.mark.parametrize("failed_operation", ["INSERT INTO ufw_log", "INSERT INTO ufw_state", "commit"])
+@pytest.mark.parametrize("failed_operation", ["INSERT INTO ufw_log", "INSERT INTO ufw_file_checkpoints", "commit"])
 def test_database_failures_roll_back_and_release_writer_lock(tmp_path, monkeypatch, failed_operation):
     logfile = tmp_path / "ufw.log"
     logfile.write_bytes(line())
     monkeypatch.setattr(ufw, "LOGFILE", str(logfile))
     connection = connection_for_files()
 
-    def execute(query, values):
+    original_execute = connection.cursor.return_value.execute.side_effect
+    def execute(query, values=()):
+        original_execute(query, values)
         if failed_operation in query:
             raise pymysql.OperationalError(2013, "synthetic failure")
 
@@ -201,7 +208,7 @@ def test_database_failures_roll_back_and_release_writer_lock(tmp_path, monkeypat
         connection.commit.side_effect = pymysql.OperationalError(2013, "synthetic failure")
     with pytest.raises(pymysql.MySQLError):
         ufw.process_log(connection)
-    connection.rollback.assert_called_once()
+    assert connection.rollback.called
     assert "RELEASE_LOCK" in connection.cursor.return_value.execute.call_args.args[0]
     connection.cursor.return_value.close.assert_called_once()
 
@@ -216,7 +223,9 @@ def test_unavailable_lock_never_reads_files_or_releases_someone_elses_lock(monke
         ufw.process_log(connection)
     files.assert_not_called()
     connection.begin.assert_not_called()
-    connection.commit.assert_not_called()
+    # Diagnostics may commit after the event transaction rolls back.
+    for call in connection.cursor.return_value.execute.call_args_list:
+        assert not call.args[0].startswith("INSERT INTO ufw_file_checkpoints")
     assert len(connection.cursor.return_value.execute.call_args_list) == 1
 
 
@@ -235,18 +244,21 @@ def test_missing_active_log_rolls_back_progress(tmp_path, monkeypatch):
     connection = connection_for_files()
     with pytest.raises(FileNotFoundError):
         ufw.process_log(connection)
-    connection.rollback.assert_called_once()
-    connection.commit.assert_not_called()
+    assert connection.rollback.called
+    # Diagnostics may commit after the event transaction rolls back.
+    for call in connection.cursor.return_value.execute.call_args_list:
+        assert not call.args[0].startswith("INSERT INTO ufw_file_checkpoints")
 
 
-def test_disappearing_rotation_does_not_block_active_file(tmp_path, monkeypatch):
+def test_disappearing_rotation_reports_system_error_and_rolls_back(tmp_path, monkeypatch):
     logfile = tmp_path / "ufw.log"
     logfile.write_bytes(line())
     monkeypatch.setattr(ufw, "LOGFILE", str(logfile))
     monkeypatch.setattr(ufw, "get_logfiles", lambda: [str(logfile) + ".1", str(logfile)])
     connection = connection_for_files()
-    assert ufw.process_log(connection)["inserted"] == 1
-    connection.commit.assert_called_once()
+    with pytest.raises(FileNotFoundError):
+        ufw.process_log(connection)
+    assert connection.rollback.called
 
 
 def test_existing_cron_command_without_options_uses_bounded_defaults(monkeypatch):
@@ -305,18 +317,20 @@ def test_nul_prefix_recovery_preserves_event_hash_and_byte_position(tmp_path, ca
     b'\x00' + line().replace(b'host', b'\xffhost'),
     b'\x00' * 10 + b'\n',
 ])
-def test_unrecoverable_nul_event_rolls_back_entire_pass(tmp_path, monkeypatch, damaged):
+def test_unrecoverable_nul_quarantine_failure_rolls_back_entire_pass(tmp_path, monkeypatch, damaged):
     logfile = tmp_path / 'ufw.log'
     logfile.write_bytes(line() + damaged)
     monkeypatch.setattr(ufw, 'LOGFILE', str(logfile))
     connection = connection_for_files()
-    with pytest.raises(ValueError):
+    with pytest.raises(RuntimeError, match="QUARANTINE_NOT_VERIFIED"):
         ufw.process_log(connection)
-    connection.commit.assert_not_called()
-    connection.rollback.assert_called_once()
+    # Diagnostics may commit after the event transaction rolls back.
+    for call in connection.cursor.return_value.execute.call_args_list:
+        assert not call.args[0].startswith("INSERT INTO ufw_file_checkpoints")
+    assert connection.rollback.called
     cursor = connection.cursor.return_value
     for call in cursor.execute.call_args_list:
-        assert 'INSERT INTO ufw_state' not in call.args[0]
+        assert 'INSERT INTO ufw_file_checkpoints' not in call.args[0]
 
 
 def test_middle_nul_is_not_removed_from_ordinary_line():
@@ -341,5 +355,6 @@ def test_recovered_line_obeys_line_budget(tmp_path):
     cursor = cursor_at()
     stats = {'lines_read': 0, 'stop_reason': 'snapshot_end'}
     assert ufw.process_file(cursor, str(logfile), stats=stats, max_lines=1) == 1
-    assert stats == {'lines_read': 1, 'stop_reason': 'line_limit'}
+    assert stats['lines_read'] == 1
+    assert stats['stop_reason'] == 'line_limit'
     assert saved_position(cursor) == len(raw)

@@ -215,13 +215,24 @@ def preflight(connection):
                 verify_ssh_baseline(connection, saved[SSH_KEY])
             if KEY in saved:
                 check_baseline(connection, 'ufw_log', 'id,event_time,raw_line', saved[KEY])
-            for table in ANALYSIS_TABLES:
-                if saved.get(table, 0):
-                    raise MigrationError('Unisolated analysis history blocks upgrade.')
-    if not modern:
+    from database.ufw_analysis_history import KEY as ANALYSIS_KEY
+    from database.ufw_analysis_history import capture, verify
+    analysis_state = records.get('023', (None, None))[1]
+    if analysis_state not in (None, 'RUNNING', 'FAILED', 'APPLIED'):
+        raise MigrationError('Unknown analysis isolation state.')
+    if analysis_state is None:
+        has_analysis = False
         for table in ANALYSIS_TABLES:
             if current.get(table, 0):
-                raise MigrationError('Unisolated analysis history blocks upgrade.')
+                has_analysis = True
+        if has_analysis:
+            capture(connection)
+    else:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT row_counts FROM schema_migrations WHERE version='023'")
+            analysis_saved = json.loads(cursor.fetchone()[0])
+        check_counts(connection, analysis_saved, current)
+        verify(connection, analysis_saved[ANALYSIS_KEY], final=analysis_state == 'APPLIED')
     check_detection(connection, allow_port=modern)
     if modern:
         from database.migrate import ufw_timestamp_schema

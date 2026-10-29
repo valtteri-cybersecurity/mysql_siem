@@ -2,14 +2,15 @@ import argparse
 import glob
 import hashlib
 import os
+import stat
 import time
-from datetime import datetime, timezone
 
 import pymysql
 
 from database.connection import get_connection
 from database.identity import configured_identity, identity_schema_enabled
 from ingestion.splitter import parse_ufw_line
+from ingestion.ufw_validation import convert_port, convert_timestamp, validate_event
 
 LOGFILE = "/var/log/ufw.log"
 LOCK_NAME = "mysql_siem_ufw_ingestion"
@@ -18,48 +19,6 @@ MAX_LINES = 5000
 MAX_SECONDS = 20
 MAX_LINE_BYTES = 65536
 
-
-def convert_port(port_value):
-    if port_value:
-        try:
-            return int(port_value)
-        except ValueError:
-            return 0
-
-    return 0
-
-
-def convert_timestamp(timestamp):
-    """Convert a UFW timestamp to UTC for MySQL."""
-
-    if not isinstance(timestamp, str):
-        # Invalid log data is handled as a validation error.
-        raise ValueError("Invalid UFW timestamp.")  # noqa: TRY004
-
-    try:
-        event_time = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-
-    except ValueError:
-        raise ValueError("Invalid UFW timestamp.") from None
-
-    if event_time.tzinfo is None:
-        raise ValueError("UFW timestamp has no timezone.")
-
-    if event_time.utcoffset() is None:
-        raise ValueError("UFW timestamp has no timezone.")
-
-    try:
-        utc_time = event_time.astimezone(timezone.utc)
-    except (ValueError, OverflowError):
-        raise ValueError("UFW timestamp is outside the MySQL range.") from None
-    if utc_time.year < 1000:
-        raise ValueError("UFW timestamp is outside the MySQL range.")
-
-    # MySQL DATETIME does not store timezone information.
-    # The value has already been converted to UTC.
-    mysql_time = utc_time.replace(tzinfo=None)
-
-    return mysql_time
 
 
 def get_logfiles():
@@ -133,9 +92,11 @@ def save_event(cursor, line, *, identity=None):
     if clean_line == "":
         return 0
 
-    info_table = parse_ufw_line(line)
+    info_table = validate_event(line)
+    if info_table is None:
+        return 0
 
-    event_time = convert_timestamp(info_table.get("timestamp"))
+    event_time = info_table["event_time"]
 
     action = info_table.get("action")
     src_ip = info_table.get("src_ip")
@@ -210,6 +171,18 @@ def save_event(cursor, line, *, identity=None):
         if error.args[0] != 1062:
             raise
 
+        scoped = identity is not None or identity_schema_enabled(cursor.connection)
+        query = 'SELECT 1 FROM ufw_log WHERE event_hash=%s'
+        parameters = (event_hash,)
+        if scoped:
+            scope = 0
+            if identity is not None:
+                scope = identity.source_id
+            query += ' AND source_scope=%s'
+            parameters += (scope,)
+        cursor.execute(query, parameters)
+        if cursor.fetchone() != (1,):
+            raise
         return 0
 
     if cursor.rowcount == 1:
@@ -218,183 +191,74 @@ def save_event(cursor, line, *, identity=None):
     return 0
 
 
-def process_file(
-    cursor,
-    filename,
-    *,
-    stats=None,
-    max_lines=MAX_LINES,
-    deadline=None,
-    identity=None
-):
-    """Read complete UFW log lines and save the file position."""
+def process_file(cursor, filename, *, stats=None, max_lines=MAX_LINES, deadline=None, identity=None, batch=False, policy=None):
+    """Commit only complete lines from a content-verified file generation."""
+    from ingestion import ufw_continuity as continuity
+    from ingestion.ufw_records import process_line
 
-    if type(max_lines) is not int:
-        raise ValueError("--max-lines must be an integer.")
-
-    if max_lines < 1 or max_lines > 100000:
-        raise ValueError("--max-lines must be within 1..100000.")
-
+    validate_limits(max_lines, MAX_SECONDS)
     if stats is None:
-        stats = {
-            "lines_read": 0,
-            "stop_reason": "snapshot_end"
-        }
-
-    if stats["lines_read"] >= max_lines:
-        stats["stop_reason"] = "line_limit"
+        stats = {'lines_read': 0, 'stop_reason': 'snapshot_end'}
+    if stats['lines_read'] >= max_lines:
+        stats['stop_reason'] = 'line_limit'
         return 0
-
     if deadline is not None and time.monotonic() >= deadline:
-        stats["stop_reason"] = "time_limit"
+        stats['stop_reason'] = 'time_limit'
         return 0
-
-    inserted_rows = 0
-
+    scope = 0
+    if identity is not None:
+        scope = identity.source_id
+    inserted = 0
+    read_deadline = deadline
+    if deadline is not None:
+        now = time.monotonic()
+        read_deadline = now + max(0, deadline - now) * 0.7
+    checkpoint = None
+    writer = None
+    if batch:
+        from ingestion.ufw_batch import EventBatch
+        writer = EventBatch(cursor, identity, policy, stats)
     try:
-        # A rotated logfile may disappear before it can be opened.
-        infile = open(filename, "rb")  # noqa: SIM115
-
-    except FileNotFoundError:
-        if filename == LOGFILE:
-            raise
-
-        print(f"Rotated logfile disappeared: {filename}")
-        return 0
-
-    with infile:
-        file_info = os.fstat(infile.fileno())
-
-        file_device = file_info.st_dev
-        file_inode = file_info.st_ino
-        current_size = file_info.st_size
-
-        source_scope = 0
-
-        if identity is not None:
-            source_scope = identity.source_id
-
-        scoped = identity is not None
-
-        if not scoped:
-            scoped = identity_schema_enabled(cursor.connection)
-
-        scope_filter = ""
-
-        position_parameters = (
-            file_device,
-            file_inode
-        )
-
-        if scoped:
-            scope_filter = " AND source_scope = %s"
-            position_parameters += (source_scope,)
-
-        sql = (
-            "SELECT last_position "
-            "FROM ufw_state "
-            "WHERE file_device = %s "
-            "AND file_inode = %s "
-            f"{scope_filter}"
-        )
-
-        cursor.execute(sql, position_parameters)
-
-        result = cursor.fetchone()
-
-        if result is None:
-            last_position = 0
-        else:
-            last_position = result[0]
-
-        if current_size < last_position:
-            print(f"Logfile has become smaller: {filename}")
-            last_position = 0
-
-        infile.seek(last_position)
-
-        while infile.tell() < current_size:
-
-            if stats["lines_read"] >= max_lines:
-                stats["stop_reason"] = "line_limit"
-                break
-
-            if deadline is not None and time.monotonic() >= deadline:
-                stats["stop_reason"] = "time_limit"
-                break
-
-            line_start = infile.tell()
-
-            remaining_bytes = current_size - line_start
-            read_limit = min(remaining_bytes, MAX_LINE_BYTES + 1)
-
-            raw_line = infile.readline(read_limit)
-
-            if len(raw_line) > MAX_LINE_BYTES:
-                raise RuntimeError(
-                    "UFW log line exceeds the 64 KiB read limit; "
-                    "collection rolled back."
-                )
-
-            if not raw_line.endswith(b"\n"):
-                infile.seek(line_start)
-                break
-
-            if deadline is not None and time.monotonic() >= deadline:
-                infile.seek(line_start)
-                stats["stop_reason"] = "time_limit"
-                break
-
-            line = decode_log_line(raw_line, filename, line_start)
-
-            inserted_rows += save_event(
-                cursor,
-                line,
-                identity=identity
-            )
-
-            stats["lines_read"] += 1
-
-        new_position = infile.tell()
-
-        fields = (
-            "logfile",
-            "last_position",
-            "file_device",
-            "file_inode"
-        )
-
-        values = (
-            filename,
-            new_position,
-            file_device,
-            file_inode
-        )
-
-        if scoped:
-            fields += ("source_scope",)
-            values += (source_scope,)
-
-        placeholders_list = []
-
-        for _ in fields:
-            placeholders_list.append("%s")
-
-        placeholders = ", ".join(placeholders_list)
-        column_names = ", ".join(fields)
-
-        sql = (
-            f"INSERT INTO ufw_state ({column_names}) "
-            f"VALUES ({placeholders}) "
-            "ON DUPLICATE KEY UPDATE "
-            "logfile = %s, last_position = %s"
-        )
-
-        parameters = values + (filename, new_position)
-
-        cursor.execute(sql, parameters)
-
-    return inserted_rows
+        descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise OSError('UFW source must be a regular file.')
+            checkpoint, prefix, observed = continuity.start(cursor, source, filename, info, scope, deadline)
+            while source.tell() < info.st_size:
+                if stats['lines_read'] >= max_lines:
+                    stats['stop_reason'] = 'line_limit'
+                    break
+                if read_deadline is not None and time.monotonic() >= read_deadline:
+                    stats['stop_reason'] = 'time_limit'
+                    break
+                start = source.tell()
+                raw = source.readline(min(info.st_size - start, MAX_LINE_BYTES + 1))
+                if len(raw) > MAX_LINE_BYTES:
+                    raise RuntimeError('UFW log line exceeds the 64 KiB read limit; collection rolled back.')
+                if not raw.endswith(b'\n'):
+                    source.seek(start)
+                    stats['stop_reason'] = 'partial_line'
+                    break
+                if read_deadline is not None and time.monotonic() >= read_deadline:
+                    source.seek(start)
+                    stats['stop_reason'] = 'time_limit'
+                    break
+                stats['file'] = filename
+                stats['position'] = start
+                inserted += process_line(cursor, raw, filename, start, info.st_dev, info.st_ino, identity, stats, writer=writer)
+                prefix.update(raw)
+                stats['lines_read'] += 1
+            if writer is not None:
+                writer.flush()
+                inserted = writer.inserted
+            status = continuity.finish(cursor, source, filename, info, scope, checkpoint, prefix, observed, deadline)
+            stats['file_state'] = status
+    except OSError as error:
+        if not isinstance(error, TimeoutError):
+            stats['source_failure'] = (checkpoint or 0, filename)
+        raise
+    return inserted
 
 
 def process_log(
@@ -414,6 +278,10 @@ def process_log(
 
     cursor = None
     lock_acquired = False
+    committed = None
+    scope = 0
+    diagnostics_ready = False
+    from ingestion import ufw_continuity as continuity
 
     try:
         cursor = connection.cursor()
@@ -437,59 +305,189 @@ def process_log(
 
         lock_acquired = True
 
-        deadline = time.monotonic() + max_seconds
-
-        connection.begin()
-
+        overall_deadline = time.monotonic() + max_seconds
         identity = configured_identity(cursor, "ufw")
+        scope = 0
+        if identity is not None:
+            scope = identity.source_id
+        cursor.execute("SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() "
+                       "AND table_name='ufw_file_checkpoints'")
+        if cursor.fetchone() != (1,):
+            raise RuntimeError('UFW continuity migration 025 is required.')
+        diagnostics_ready = True
+        continuity.mark_running(connection, scope)
+        from ingestion.ufw_filters import load
+        policy = load(cursor, identity)
+        connection.__dict__['_siem_ufw_policy'] = policy
+        connection.begin()
+        has_archives = bool(glob.glob(glob.escape(LOGFILE) + '.*.gz'))
+        cursor.execute("SELECT 1 FROM information_schema.tables WHERE table_schema=DATABASE() "
+                       "AND table_name=%s", ("ufw_archives",))
+        if cursor.fetchone() == (1,):
+            cursor.execute("SELECT 1 FROM ufw_archives WHERE source_scope=%s AND status <> 'COMPLETE' LIMIT 1", (scope,))
+            pending = cursor.fetchone()
+            cursor.execute('SELECT 1 FROM ufw_archive_failures WHERE source_scope=%s LIMIT 1', (scope,))
+            failed = cursor.fetchone()
+            has_archives = has_archives or pending is not None or failed is not None
+        elif identity_schema_enabled(connection):
+            raise RuntimeError('UFW archive migration is missing or not visible.')
+        deadline = overall_deadline
+        raw_lines = max_lines
+        if has_archives:
+            deadline -= max_seconds / 4
+            raw_lines -= max(1, max_lines // 4)
+            raw_lines = max(1, raw_lines)
 
         inserted_rows = 0
 
         logfiles = get_logfiles()
 
+        if len(logfiles) > continuity.MAX_FILES:
+            raise RuntimeError("UFW_FILE_DISCOVERY_LIMIT")
+        if LOGFILE in logfiles:
+            logfiles.remove(LOGFILE)
+            logfiles.insert(0, LOGFILE)
+        skip_active = False
+        if max_lines == 1 and (has_archives or len(logfiles) > 1):
+            cursor.execute('SELECT pass_number FROM ufw_collection_health WHERE source_scope=%s', (scope,))
+            turn = cursor.fetchone()[0] % 3
+            if has_archives and turn == 0:
+                raw_lines = 0
+            if len(logfiles) > 1 and turn == 2:
+                skip_active = True
+        active_limit = raw_lines
+        active_deadline = deadline
+        if len(logfiles) > 1:
+            active_limit = raw_lines // 2
+            if raw_lines == 1:
+                active_limit = 1
+            active_deadline = time.monotonic() + max(0, deadline - time.monotonic()) / 2
+        processed_files = 0
+        verification_failed = False
         for filename in logfiles:
-
-            if stats["lines_read"] >= max_lines:
-                stats["stop_reason"] = "line_limit"
+            if filename == LOGFILE and skip_active:
+                stats['active_state'] = 'BACKLOG'
+                continue
+            file_limit = raw_lines
+            file_deadline = deadline
+            if filename == LOGFILE:
+                file_limit = active_limit
+                file_deadline = active_deadline
+            if stats['lines_read'] >= file_limit or time.monotonic() >= file_deadline:
+                stats['stop_reason'] = 'budget_limit'
                 break
+            before = stats['lines_read']
+            previous_stats = stats.copy()
+            cursor.execute('SAVEPOINT ufw_file')
+            try:
+                inserted_rows += process_file(cursor, filename, stats=stats, max_lines=file_limit,
+                                              deadline=file_deadline, identity=identity, batch=True, policy=policy)
+            except TimeoutError:
+                cursor.execute('ROLLBACK TO SAVEPOINT ufw_file')
+                stats.clear()
+                stats.update(previous_stats)
+                stats['stop_reason'] = 'verification_time_limit'
+                stats['active_state'] = 'UNKNOWN'
+                verification_failed = True
+                continue
+            finally:
+                cursor.execute('RELEASE SAVEPOINT ufw_file')
+            processed_files += 1
+            if filename == LOGFILE:
+                stats['active_lines'] = stats['lines_read'] - before
+                stats['active_state'] = 'HEALTHY'
+                if stats.get('file_state') != 'CAUGHT_UP':
+                    stats['active_state'] = 'BACKLOG'
 
-            if time.monotonic() >= deadline:
-                stats["stop_reason"] = "time_limit"
-                break
-
-            inserted_rows += process_file(
-                cursor,
-                filename,
-                stats=stats,
-                max_lines=max_lines,
-                deadline=deadline,
-                identity=identity
-            )
-
-        if stats["lines_read"] >= max_lines:
+        stats['plain_backlog'] = processed_files < len(logfiles)
+        if stats["lines_read"] >= raw_lines:
             stats["stop_reason"] = "line_limit"
 
         elif time.monotonic() >= deadline:
             stats["stop_reason"] = "time_limit"
 
         connection.commit()
+        committed = (inserted_rows, stats.get('quarantined', 0))
 
         print(
-            f"Done. New UFW rows inserted: {inserted_rows}; "
+            f"UFW active pass: COMMITTED; inserted: {inserted_rows}; "
             f"lines read: {stats['lines_read']}; "
-            f"stop: {stats['stop_reason']}"
+            f"stop: {stats['stop_reason']}; "
+            f"duplicates: {stats.get('duplicates', 0)}; quarantined: {stats.get('quarantined', 0)}; "
+            f"non-UFW: {stats.get('non_ufw', 0)}"
         )
 
-        return {
-            "inserted": inserted_rows,
-            **stats
-        }
+        result = {"inserted": inserted_rows, **stats}
+        result.pop("file", None)
+        result.pop("position", None)
+        result.pop("file_state", None)
+        if has_archives:
+            from ingestion.ufw_archives import process_archives
+            try:
+                archives = {}
+                process_archives(connection, LOGFILE, max_lines=max_lines - stats['lines_read'],
+                                 deadline=overall_deadline, totals=archives)
+            except (OSError, ValueError, RuntimeError, pymysql.MySQLError) as error:
+                connection.rollback()
+                committed = (inserted_rows + archives.get('inserted', 0),
+                             stats.get('quarantined', 0) + archives.get('quarantined', 0))
+                print(f"UFW collection: FAILED class={type(error).__name__} stage=archives "
+                      f"committed_counts={committed}")
+                raise
+            result['archive_lines'] = archives['lines_read']
+            for key, value in archives.items():
+                result[key] = result.get(key, 0) + value
+            print(f"UFW archives: pending={archives['archives_pending']} errors={archives['archive_errors']} "
+                  f"inserted={archives['inserted']} quarantined={archives['quarantined']}")
+            if archives['archive_errors']:
+                result['status'] = 'FAILED'
+                print(f"UFW collection: FAILED; committed_inserted={result['inserted']}; "
+                      f"quarantined={result.get('quarantined', 0)}")
+                continuity.save_health(connection, scope, result, error='ArchiveError')
+                result['collection_state'] = continuity.read_health(connection, scope)['state']
+                return result
+        if not continuity.reconcile(cursor, scope, logfiles, overall_deadline):
+            result['active_state'] = 'UNKNOWN'
+        if result.get('archives_unscanned'):
+            result['active_state'] = 'UNKNOWN'
+        # Raw rotations also contribute available backlog, independently of active progress.
+        cursor.execute("SELECT 1 FROM ufw_file_checkpoints WHERE source_scope=%s AND status='READING' LIMIT 1", (scope,))
+        if cursor.fetchone() is not None:
+            result['plain_backlog'] = True
+        if verification_failed:
+            result['status'] = 'FAILED'
+            result['active_state'] = 'UNKNOWN'
+            result['stop_reason'] = 'verification_time_limit'
+            continuity.save_health(connection, scope, result, error='CheckpointVerificationTimeout')
+            result['collection_state'] = continuity.read_health(connection, scope)['state']
+            return result
+        continuity.save_health(connection, scope, result)
+        result['collection_state'] = continuity.read_health(connection, scope)['state']
+        result['status'] = 'SUCCESS'
+        print(f"UFW collection: SUCCESS; lines_read={result['lines_read']}; inserted={result['inserted']}; "
+              f"duplicates={result.get('duplicates', 0)}; quarantined={result.get('quarantined', 0)}; "
+              f"non_ufw={result.get('non_ufw', 0)}; stop={result['stop_reason']}")
+        return result
 
-    except Exception:
+    except BaseException as error:
         connection.rollback()
+        if lock_acquired and diagnostics_ready:
+            try:
+                failed_source = stats.get('source_failure')
+                if failed_source is not None:
+                    checkpoint, filename = failed_source
+                    continuity.gap(cursor, scope, checkpoint, 'SOURCE_UNAVAILABLE', filename)
+                continuity.save_health(connection, scope, stats, error=type(error).__name__)
+            except (OSError, RuntimeError, pymysql.MySQLError):
+                connection.rollback()
+                print('UFW diagnostics: persistence failed; collection state is unconfirmed.')
+        print(f"UFW collection: FAILED class={type(error).__name__} stage=collection "
+              f"file={stats.get('file')!r} position={stats.get('position')} "
+              f"committed_counts={committed or (0, 0)} lines_read={stats['lines_read']}")
         raise
 
     finally:
+        connection.__dict__.pop('_siem_ufw_policy', None)
         if cursor is not None:
             try:
                 if lock_acquired:
@@ -520,6 +518,7 @@ def main(argv=None):
         help="Cooperative processing budget; default: 20, maximum: 50 seconds."
     )
 
+    parser.add_argument("--status", action="store_true", help="Read UTC continuity diagnostics without changing checkpoints.")
     args = parser.parse_args(argv)
 
     try:
@@ -538,24 +537,34 @@ def main(argv=None):
 
         if not connection:
             print("Database connection failed.")
-            return
+            return 1
 
-        process_log(
+        if args.status:
+            from ingestion.ufw_continuity import read_health
+            with connection.cursor() as cursor:
+                identity = configured_identity(cursor, 'ufw')
+            scope = 0
+            if identity is not None:
+                scope = identity.source_id
+            print(read_health(connection, scope))
+            return 0
+        result = process_log(
             connection,
             max_lines=args.max_lines,
             max_seconds=args.max_seconds
         )
+        if result.get('status') == 'FAILED':
+            return 1
 
     except (pymysql.MySQLError, OSError, ValueError, RuntimeError):
-        print(
-            "UFW collection failed. "
-            "Check schema, source access and identity configuration."
-        )
+        print("UFW collection: FAILED stage=main; check safe collection diagnostics.")
+        return 1
 
     finally:
         if connection:
             connection.close()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

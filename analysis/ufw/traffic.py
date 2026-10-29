@@ -94,6 +94,8 @@ def save_traffic(connection, start_time, end_time, *, daily, now, host_id=None):
             table = "analysis_ufw_traffic"
             fields = ("period_start", "period_end") + METRICS + ("first_seen", "last_seen")
             values = (start_time, end_time) + tuple(result[name] for name in METRICS) + (result["first_seen"], result["last_seen"])
+        from database.ufw_analysis_history import protect_interval
+        protect_interval(connection, table, start_time, end_time)
         fields += ("period_status", "coverage_status")
         values += ("OPEN" if now < end_time else "CLOSED", "UNKNOWN")
         if identity_schema_enabled(connection):
@@ -162,6 +164,8 @@ def run_traffic_analysis(connection, start_time, end_time, *, now=None, previous
             for host_id in host_ids:
                 save_traffic(connection, start, start + timedelta(days=1), daily=True, now=now, host_id=host_id)
             summary["day_count"] += 1
+        from ingestion.ufw_filters import coverage_notice
+        summary.update(coverage_notice(connection, start_time, end_time))
         summary["status"] = "SUCCESS"
         return summary
     finally:
@@ -196,6 +200,8 @@ def validate_traffic_schema(connection):
             if scoped:
                 expected["host_id"] = ("bigint unsigned", "YES", "")
                 expected["host_scope"] = ("bigint unsigned", "NO", "")
+            if "time_basis" in actual:
+                expected["time_basis"] = ("varchar(24)", "NO", "")
             if actual != expected:
                 raise TrafficAnalysisError(f"{table}: incompatible columns; inspect database/schema.sql.")
             cursor.execute("""SELECT index_name, non_unique, column_name, sub_part, is_visible

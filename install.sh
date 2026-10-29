@@ -701,6 +701,17 @@ for path in \
     detection/port_scan/main.py \
     ingestion/dns/main.py \
     ingestion/ufw_to_mysql.py \
+    ingestion/ufw_archives.py \
+    ingestion/ufw_records.py \
+    ingestion/ufw_validation.py \
+    ingestion/ufw_continuity.py \
+    ingestion/ufw_batch.py \
+    ingestion/ufw_filters.py \
+    config/ufw_filters.py \
+    database/migrations/026_ufw_filtering.sql \
+    database/migrations/025_ufw_continuity.sql \
+    database/migrations/024_ufw_quarantine_archives.sql \
+    database/ufw_collection_schema.py \
     metrics/system/main.py \
     metrics/filesystem/main.py \
     metrics/security/main.py \
@@ -942,6 +953,18 @@ grants = {
     "analysis_ufw_traffic_daily": "SELECT, INSERT, UPDATE",
     "ufw_log": "SELECT, INSERT",
     "ufw_state": "SELECT, INSERT, UPDATE",
+    'ufw_quarantine': 'SELECT, INSERT',
+    'ufw_quarantine_origins': 'SELECT, INSERT',
+    'ufw_archives': 'SELECT, INSERT, UPDATE',
+    'ufw_archive_failures': 'SELECT, INSERT',
+    'ufw_file_checkpoints': 'SELECT, INSERT, UPDATE',
+    'ufw_collection_gaps': 'SELECT, INSERT, UPDATE',
+    'ufw_archive_proofs': 'SELECT, INSERT',
+    'ufw_collection_health': 'SELECT, INSERT, UPDATE',
+    'ufw_filter_rules': 'SELECT',
+    'ufw_filter_audit': 'SELECT',
+    'ufw_filter_seen': 'SELECT, INSERT',
+    'ufw_filter_stats': 'SELECT, INSERT, UPDATE',
 }
 
 conn = pymysql.connect(unix_socket="/run/mysqld/mysqld.sock", user="root")

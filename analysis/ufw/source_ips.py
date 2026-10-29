@@ -150,6 +150,8 @@ def run_source_ip_analysis(connection, start_time, end_time, *, max_events=MAX_E
             return summary
         locked = True
         connection.begin()
+        from database.ufw_analysis_history import protect_interval
+        protect_interval(connection, "analysis_source_ips", start_time, end_time)
         results = analyze_source_ips(connection, start_time, end_time, max_events=max_events)
         with connection.cursor() as cursor:
             # Exact replacement also removes stale IPs after a corrected source
@@ -167,6 +169,8 @@ def run_source_ip_analysis(connection, start_time, end_time, *, max_events=MAX_E
                     f"INSERT INTO analysis_source_ips ({', '.join(fields)}) VALUES ({placeholders})",
                     [tuple(result[field] for field in fields) for result in results],
                 )
+        from ingestion.ufw_filters import coverage_notice
+        summary.update(coverage_notice(connection, start_time, end_time))
         connection.commit()
         committed = True
         summary.update(source_count=len(results), total_events=sum(item["total_events"] for item in results),

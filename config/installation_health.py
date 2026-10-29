@@ -39,6 +39,8 @@ def verify_schema(connection):
         if records.get(version, (None, None))[1] != 'APPLIED':
             raise HealthError('Database migrations are incomplete; keep collection paused.')
     migrate.check_ufw_utc_readiness(connection)
+    from database.ufw_collection_schema import verify
+    verify(connection, continuity=True, filtering=True)
     with connection.cursor() as cursor:
         cursor.execute('SELECT auth_method, source_port FROM auth_events LIMIT 0')
         cursor.execute("SELECT is_nullable FROM information_schema.columns "

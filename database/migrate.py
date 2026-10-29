@@ -44,6 +44,10 @@ MIGRATIONS = (
     ("020", "audit", ROOT / "migrations/020_audit.sql"),
     ("021", "auth_logins", ROOT / "migrations/021_auth_logins.sql"),
     ("022", "ufw_history_isolation", ROOT / "migrations/022_ufw_history_isolation.sql"),
+    ("023", "ufw_analysis_history", ROOT / "migrations/023_ufw_analysis_history.sql"),
+    ("024", "ufw_quarantine_archives", ROOT / "migrations/024_ufw_quarantine_archives.sql"),
+    ("025", "ufw_continuity", ROOT / "migrations/025_ufw_continuity.sql"),
+    ("026", "ufw_filtering", ROOT / "migrations/026_ufw_filtering.sql"),
 )
 
 
@@ -60,7 +64,9 @@ HISTORY_TABLES = EVENT_TABLES + ANALYSIS_TABLES + (
     "detection_alerts",
     "alert_evidence",
     "detection_state",
-    "ufw_state",
+    "ufw_state", "ufw_archive_failures", "ufw_quarantine", "ufw_quarantine_origins", "ufw_archives",
+    "ufw_file_checkpoints", "ufw_collection_gaps", "ufw_archive_proofs", "ufw_collection_health",
+    "ufw_filter_rules", "ufw_filter_audit", "ufw_filter_seen", "ufw_filter_stats",
     "auth_ingestion_state",
     "process_events", "process_state", "service_events", "service_state", "collector_snapshots",
     "audit_events", "audit_checkpoints", "audit_targets",
@@ -519,6 +525,30 @@ def apply_one(connection, version):
         from database.audit_migrations import upgrade_audit
         upgrade_audit(connection, ROOT / "migrations/020_audit.sql")
 
+    elif version == "026":
+        path = ROOT / "migrations/026_ufw_filtering.sql"
+        tables, _rules = read_schema(path)
+        ensure_tables(connection, tuple(tables), schema_file=path)
+        from database.ufw_collection_schema import verify
+        verify(connection, continuity=True, filtering=True)
+
+    elif version == "025":
+        path = ROOT / "migrations/025_ufw_continuity.sql"
+        tables, _rules = read_schema(path)
+        ensure_tables(connection, tuple(tables), schema_file=path)
+        from database.ufw_collection_schema import verify
+        verify(connection, continuity=True)
+
+    elif version == "024":
+        tables, _rules = read_schema(ROOT / 'migrations/024_ufw_quarantine_archives.sql')
+        ensure_tables(connection, tuple(tables), schema_file=ROOT / 'migrations/024_ufw_quarantine_archives.sql')
+        from database.ufw_collection_schema import verify
+        verify(connection)
+
+    elif version == "023":
+        from database.ufw_analysis_history import upgrade
+        upgrade(connection)
+
     elif version == "022":
         from database.ufw_history import isolate
         isolate(connection)
@@ -634,6 +664,9 @@ def migrate(connection):
                     counts[KEY] = baseline
                     counts[SSH_KEY] = ssh_baseline(connection)
 
+                if version == "023" and "_analysis_baseline" not in counts:
+                    from database.ufw_analysis_history import capture
+                    counts["_analysis_baseline"] = capture(connection)
                 cursor.execute(
                     """
                     INSERT INTO schema_migrations
@@ -660,7 +693,7 @@ def migrate(connection):
                 actual_counts = history_counts(connection)
 
                 for table in counts:
-                    if table in ("_ufw_compatibility", "_ssh_baseline", UFW_UTC_PROOF):
+                    if table in ("_ufw_compatibility", "_ssh_baseline", "_analysis_baseline", UFW_UTC_PROOF):
                         continue
                     original_count = counts[table]
                     current_count = actual_counts.get(table)

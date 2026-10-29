@@ -69,7 +69,7 @@ def collection_command(command):
     if settings_source:
         known_path = re.search(re.escape(settings_source) + r'(?:[/\s\"\']|$)', command) is not None
     component = False
-    for signature in ('ingestion/ufw_to_mysql.py', 'ingestion/auth/', 'ingestion/dns/',
+    for signature in ('ingestion/ufw_to_mysql.py', 'ingestion/ufw_archives.py', 'ingestion/auth/', 'ingestion/dns/',
                       'metrics/system/', 'metrics/filesystem/', 'metrics/security/',
                       'metrics/processes/', 'metrics/services/', 'ingestion/audit/', 'config/audit_launcher.py',
                       'analysis/ufw/', 'analysis/daily_counts/', 'detection/port_scan/',
@@ -231,6 +231,18 @@ RUNTIME_TABLE_PRIVILEGES = {
     'analysis_ufw_traffic_daily': 'SELECT, INSERT, UPDATE',
     'ufw_log': 'SELECT, INSERT',
     'ufw_state': 'SELECT, INSERT, UPDATE',
+    'ufw_quarantine': 'SELECT, INSERT',
+    'ufw_quarantine_origins': 'SELECT, INSERT',
+    'ufw_archives': 'SELECT, INSERT, UPDATE',
+    'ufw_archive_failures': 'SELECT, INSERT',
+    'ufw_file_checkpoints': 'SELECT, INSERT, UPDATE',
+    'ufw_collection_gaps': 'SELECT, INSERT, UPDATE',
+    'ufw_archive_proofs': 'SELECT, INSERT',
+    'ufw_collection_health': 'SELECT, INSERT, UPDATE',
+    'ufw_filter_rules': 'SELECT',
+    'ufw_filter_audit': 'SELECT',
+    'ufw_filter_seen': 'SELECT, INSERT',
+    'ufw_filter_stats': 'SELECT, INSERT, UPDATE',
     'schema_migrations': 'SELECT',
     'hosts': 'SELECT',
     'host_groups': 'SELECT',

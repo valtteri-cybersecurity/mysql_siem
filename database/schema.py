@@ -101,6 +101,8 @@ def validate_source_ips_schema(connection):
         if scoped:
             expected["host_id"] = ("bigint unsigned", "YES", None, None, "")
             expected["host_scope"] = ("bigint unsigned", "NO", None, "0", "")
+        if "time_basis" in actual:
+            expected["time_basis"] = ("varchar(24)", "NO", "ascii_bin", "utc_verified", "")
         if actual != expected:
             raise SchemaError("analysis_source_ips: incompatible columns; inspect database/schema.sql.")
         cursor.execute("""SELECT index_name, non_unique, column_name, sub_part, is_visible
