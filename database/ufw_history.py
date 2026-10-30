@@ -23,10 +23,31 @@ def fingerprint(connection, table, fields, upper=None):
     """Stream fixed repository identifiers; bind every range/limit value."""
     from database.migrate import MigrationError
 
+    queries = {
+        ('ufw_log', 'id,event_time,raw_line'): (
+            'SELECT COALESCE(MAX(id),0) FROM ufw_log',
+            ('SELECT /*+ MAX_EXECUTION_TIME(5000) */ id,event_time,raw_line FROM ufw_log '
+             'WHERE id > %s AND id <= %s ORDER BY id LIMIT %s'),
+        ),
+        ('detection_alerts', 'id,rule_id,UNIX_TIMESTAMP(detected_at)'): (
+            'SELECT COALESCE(MAX(id),0) FROM detection_alerts',
+            ('SELECT /*+ MAX_EXECUTION_TIME(5000) */ id,rule_id,UNIX_TIMESTAMP(detected_at) FROM detection_alerts '
+             'WHERE id > %s AND id <= %s ORDER BY id LIMIT %s'),
+        ),
+        ('alert_evidence', 'id,alert_id,event_type,event_id'): (
+            'SELECT COALESCE(MAX(id),0) FROM alert_evidence',
+            ('SELECT /*+ MAX_EXECUTION_TIME(5000) */ id,alert_id,event_type,event_id FROM alert_evidence '
+             'WHERE id > %s AND id <= %s ORDER BY id LIMIT %s'),
+        ),
+    }
+    selected = queries.get((table, fields))
+    if selected is None:
+        raise MigrationError('Unknown history fingerprint table or fields.')
+    maximum_query, rows_query = selected
     deadline = time.monotonic() + 120
     if upper is None:
         with connection.cursor() as cursor:
-            cursor.execute('SELECT COALESCE(MAX(id),0) FROM ' + table)
+            cursor.execute(maximum_query)
             upper = int(cursor.fetchone()[0])
     last = count = 0
     digest = hashlib.sha256()
@@ -34,8 +55,7 @@ def fingerprint(connection, table, fields, upper=None):
         if time.monotonic() >= deadline:
             raise MigrationError('History baseline verification exceeded its time budget.')
         with connection.cursor() as cursor:
-            cursor.execute('SELECT /*+ MAX_EXECUTION_TIME(5000) */ ' + fields + ' FROM ' + table
-                           + ' WHERE id > %s AND id <= %s ORDER BY id LIMIT %s', (last, upper, 256))
+            cursor.execute(rows_query, (last, upper, 256))
             rows = cursor.fetchall()
         if not rows:
             break
@@ -90,6 +110,34 @@ def check_counts(connection, saved, current):
             raise MigrationError('Historical row counts decreased: ' + table)
 
 
+def check_legacy_port_state(connection):
+    """Accept only a drained checkpoint at the UFW tail before 022 completes."""
+    from database.migrate import MigrationError, migration_status
+
+    status = migration_status(connection).get('022', (None, None))[1]
+    if status not in (None, 'RUNNING', 'FAILED'):
+        raise MigrationError('Legacy port scan compatibility requires incomplete migration 022.')
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT s.last_event_id,s.state_data,(SELECT COALESCE(MAX(id),0) FROM ufw_log) "
+                       "FROM detection_state s JOIN detection_rules r ON r.id=s.rule_id "
+                       "WHERE r.rule_key='PORT_SCAN_001'")
+        row = cursor.fetchone()
+    if row is None:
+        raise MigrationError('Legacy port scan state disappeared.')
+    last_id, raw, maximum = row
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        raise MigrationError('Invalid legacy port scan state.') from None
+    if (not isinstance(data, dict) or type(data.get('version')) is not int
+            or data['version'] != 1 or not isinstance(data.get('events'), list)):
+        raise MigrationError('Invalid legacy port scan state.')
+    if data['events']:
+        raise MigrationError('Legacy port scan buffer must be empty before isolation.')
+    if type(last_id) is not int or not 0 <= last_id < 2**64 or last_id != maximum:
+        raise MigrationError('Legacy port scan checkpoint must match the UFW tail.')
+
+
 def check_detection(connection, *, allow_port=False):
     from database.migrate import MigrationError
     from detection.ssh_brute_force.state import load_state
@@ -98,10 +146,17 @@ def check_detection(connection, *, allow_port=False):
     if allow_port:
         allowed.append('PORT_SCAN_001')
     with connection.cursor() as cursor:
-        for table in ('detection_state', 'detection_alerts'):
-            cursor.execute('SELECT DISTINCT r.rule_key FROM ' + table
-                           + ' s LEFT JOIN detection_rules r ON r.id=s.rule_id')
+        for table, query in (
+            ('detection_state', ('SELECT DISTINCT r.rule_key FROM detection_state '
+             's LEFT JOIN detection_rules r ON r.id=s.rule_id')),
+            ('detection_alerts', ('SELECT DISTINCT r.rule_key FROM detection_alerts '
+             's LEFT JOIN detection_rules r ON r.id=s.rule_id')),
+        ):
+            cursor.execute(query)
             for row in cursor.fetchall():
+                if not allow_port and table == 'detection_state' and row[0] == 'PORT_SCAN_001':
+                    check_legacy_port_state(connection)
+                    continue
                 if row[0] not in allowed:
                     raise MigrationError('Unisolated UFW or unknown detection history blocks upgrade.')
         cursor.execute("SELECT COUNT(*) FROM alert_evidence e LEFT JOIN detection_alerts a ON a.id=e.alert_id "
@@ -192,10 +247,14 @@ def preflight(connection):
             if version == '022' and (KEY not in saved or SSH_KEY not in saved):
                 raise MigrationError('Isolation baseline evidence is missing.')
             if version == '017' and KEY not in saved and saved.get('_ufw_utc_proof') is None:
-                for table, field in (('ufw_log', 'created_at'), ('detection_alerts', 'detected_at')):
+                for table, query in (
+                    ('ufw_log', ("SELECT COUNT(*) FROM ufw_log WHERE created_at "
+                     "<= (SELECT started_at FROM schema_migrations WHERE version='017')")),
+                    ('detection_alerts', ("SELECT COUNT(*) FROM detection_alerts WHERE detected_at "
+                     "<= (SELECT started_at FROM schema_migrations WHERE version='017')")),
+                ):
                     if saved.get(table, 0):
-                        cursor.execute('SELECT COUNT(*) FROM ' + table + ' WHERE ' + field
-                                       + " <= (SELECT started_at FROM schema_migrations WHERE version='017')")
+                        cursor.execute(query)
                         if cursor.fetchone()[0] < saved[table]:
                             raise MigrationError('Historical rows may have disappeared: ' + table)
                 if saved.get('alert_evidence', 0):
