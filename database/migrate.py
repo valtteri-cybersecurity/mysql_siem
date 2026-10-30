@@ -647,6 +647,7 @@ def migrate(connection):
                 from database.ufw_history import (
                     KEY,
                     SSH_KEY,
+                    check_baseline,
                     raw_baseline,
                     ssh_baseline,
                 )
@@ -661,14 +662,18 @@ def migrate(connection):
                 if version == "022" and KEY not in counts:
                     cursor.execute("SELECT row_counts FROM schema_migrations WHERE version='017'")
                     original = json.loads(cursor.fetchone()[0])
-                    baseline = original.get(KEY)
-                    if baseline is None:
-                        baseline = raw_baseline(connection)
+                    old_proof = original.get(KEY)
+                    if old_proof is not None:
+                        check_baseline(connection, 'ufw_log', 'id,event_time,raw_line', old_proof)
+                    else:
                         old_proof = original.get(UFW_UTC_PROOF)
                         if old_proof is not None:
                             check_ufw_raw_history(connection, original['ufw_log'], saved=original)
-                            baseline['previous_max_id'] = old_proof['max_id']
-                            baseline['previous_precision'] = old_proof['precision']
+                    # Capture the entire pre-022 backlog, retaining proven pre-017 precision.
+                    baseline = raw_baseline(connection)
+                    if old_proof is not None:
+                        baseline['previous_max_id'] = old_proof['max_id']
+                        baseline['previous_precision'] = old_proof['precision']
                     counts[KEY] = baseline
                     counts[SSH_KEY] = ssh_baseline(connection)
 

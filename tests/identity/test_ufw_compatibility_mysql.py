@@ -1,9 +1,11 @@
 """P1 compatibility proofs run only on the private MySQL fixture."""
 
+import hashlib
 import json
 from datetime import datetime, timedelta
 from unittest.mock import Mock
 
+import pymysql
 import pytest
 
 from analysis.ufw.ports import analyze_ports
@@ -94,6 +96,8 @@ def test_mixed_gapped_history_ssh_growth_and_preservation(legacy, tmp_path):
 @pytest.mark.parametrize('fault', ['after_ddl', 'during_rows', 'after_default'])
 def test_interrupted_isolation_is_resumable_without_duplicate_events(request, monkeypatch, tmp_path, history, fault):
     connection = request.getfixturevalue(history)
+    if history == 'legacy_port':
+        add_port_backlog(connection, 100, mixed=True, gaps=True)
     before = backup.snapshot_rows(connection, tmp_path)
     original = ufw_history.isolate
     if fault == 'after_default':
@@ -137,6 +141,8 @@ def test_interrupted_isolation_is_resumable_without_duplicate_events(request, mo
         expected = ((1,), (4,), (9,), (15,))
         if history == 'legacy_port':
             expected += ((25000,),)
+            for index in range(100):
+                expected += ((25001 + 2 * index,),)
         assert cursor.fetchall() == expected
         cursor.execute('SELECT last_position FROM ufw_state')
         assert cursor.fetchone() == (12345,)
@@ -208,6 +214,8 @@ def test_unsafe_history_stops_before_backup_or_ddl_and_preserves_maintenance(leg
 @pytest.mark.parametrize('history', ['legacy', 'legacy_port'])
 def test_process_exit_keeps_running_ledger_and_can_resume(request, monkeypatch, tmp_path, history):
     connection = request.getfixturevalue(history)
+    if history == 'legacy_port':
+        add_port_backlog(connection, 100, mixed=True, gaps=True)
     before = backup.snapshot_rows(connection, tmp_path)
     original = ufw_history.isolate
 
@@ -354,16 +362,16 @@ def test_malformed_legacy_port_json_blocks_upgrade(legacy_port):
     assert ufw_history.active_filter(connection) == ''
 
 
-@pytest.mark.parametrize('checkpoint', [0, 24999, 25001])
+@pytest.mark.parametrize('checkpoint', [25001, 2**64 - 1])
 def test_conflicting_legacy_port_checkpoint_blocks_upgrade(legacy_port, checkpoint):
     connection = legacy_port
     with connection.cursor() as cursor:
         cursor.execute("UPDATE detection_state s JOIN detection_rules r ON r.id=s.rule_id "
                        "SET s.last_event_id=%s WHERE r.rule_key='PORT_SCAN_001'", (checkpoint,))
     connection.commit()
-    with pytest.raises(reset.ResetError, match='checkpoint must match'):
+    with pytest.raises(reset.ResetError, match='checkpoint exceeds'):
         reset.check_ufw_before_upgrade(connection)
-    with pytest.raises(migrate.MigrationError, match='checkpoint must match'):
+    with pytest.raises(migrate.MigrationError, match='checkpoint exceeds'):
         migrate.migrate(connection)
     assert ufw_history.active_filter(connection) == ''
 
@@ -438,3 +446,255 @@ def test_022_rechecks_legacy_port_state_under_migration_lock(legacy_port, monkey
         migrate.migrate(connection)
     assert migrate.migration_status(connection)['022'][1] == 'FAILED'
     assert ufw_history.active_filter(connection) == ''
+
+
+def add_port_backlog(connection, count, mixed=False, gaps=False):
+    rows = []
+    eligible = []
+    isolated = []
+    start = datetime(2026, 1, 2, 12, 0, 0, 123456)
+    for index in range(count):
+        event_id = 25001 + index
+        if gaps:
+            event_id += index
+        stored = start + timedelta(seconds=index)
+        timestamp = stored.isoformat() + 'Z'
+        basis = 'UTC_VERIFIED'
+        if mixed and index % 3 == 1:
+            timestamp = stored.isoformat() + '+02:00'
+            basis = 'LOCAL_TIME_VERIFIED'
+        elif mixed and index % 3 == 2:
+            stored = stored.replace(microsecond=0)
+            basis = 'UNVERIFIED'
+        protocol = 'ICMP'
+        port = 22
+        if basis == 'UTC_VERIFIED':
+            eligible.append(event_id)
+            if len(eligible) <= 10:
+                protocol = 'TCP'
+                port = 1999 + len(eligible)
+        else:
+            isolated.append((event_id, basis))
+        raw = timestamp + ' host [UFW BLOCK] UID=' + str(index)
+        rows.append((event_id, stored, raw, hashlib.sha256(raw.encode()).hexdigest(), protocol, port))
+    with connection.cursor() as cursor:
+        cursor.executemany("INSERT INTO ufw_log (id,event_time,raw_line,event_hash,action,src_ip,dst_ip,protocol,dst_port) "
+                           "VALUES (%s,%s,%s,%s,'BLOCK','192.0.2.55','198.51.100.1',%s,%s)", rows)
+    connection.commit()
+    return eligible, isolated
+
+
+@pytest.mark.parametrize('lag,mixed,gaps,proof', [
+    (0, False, False, False), (100, False, False, False),
+    (800, True, True, False), (10000, True, False, True),
+])
+def test_lagging_port_upgrade_and_bounded_utc_replay(legacy_port, tmp_path, lag, mixed, gaps, proof):
+    from database.identity import (
+        approve_collector_source,
+        register_collector,
+        register_host,
+        register_source,
+    )
+    from detection.port_scan.runner import run_automatic
+
+    connection = legacy_port
+    add_ssh(connection, 7)
+    with connection.cursor() as cursor:
+        host = register_host(cursor, 'legacy-backlog-host')
+        collector = register_collector(cursor, 'legacy-backlog-collector', enabled=True)
+        source = register_source(cursor, host, 'legacy-backlog-ufw', 'ufw', enabled=True)
+        approve_collector_source(cursor, collector, source)
+        cursor.execute('UPDATE ufw_log SET host_id=%s,source_id=%s,collector_id=%s,source_scope=%s WHERE id=1',
+                       (host, source, collector, source))
+    connection.commit()
+    if proof:
+        original = ufw_history.raw_baseline(connection)
+        original['precision'] = 0
+        with connection.cursor() as cursor:
+            cursor.execute("UPDATE schema_migrations SET row_counts=JSON_SET(row_counts,%s,CAST(%s AS JSON)) "
+                           "WHERE version='017'", ('$.' + ufw_history.KEY, json.dumps(original)))
+        connection.commit()
+    eligible, isolated = add_port_backlog(connection, lag, mixed, gaps)
+    before = backup.snapshot_rows(connection, tmp_path)
+    connection.commit()
+    with connection.cursor() as cursor:
+        cursor.execute('START TRANSACTION READ ONLY')
+    reset.check_ufw_before_upgrade(connection)
+    connection.commit()
+    applied = migrate.migrate(connection)
+    assert applied[-6:] == ['022', '023', '024', '025', '026', '027']
+    backup.verify_rows(connection, tmp_path, before)
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT last_event_id FROM detection_state s JOIN detection_rules r ON r.id=s.rule_id "
+                       "WHERE r.rule_key='PORT_SCAN_001'")
+        assert cursor.fetchone() == (25000,)
+        for event_id, expected_basis in isolated:
+            cursor.execute('SELECT time_basis FROM ufw_log WHERE id=%s', (event_id,))
+            assert cursor.fetchone() == (expected_basis,)
+        cursor.execute("SELECT row_counts FROM schema_migrations WHERE version='022'")
+        saved = json.loads(cursor.fetchone()[0])
+        maximum = 25000
+        if lag:
+            maximum = 25000 + lag
+            if gaps:
+                maximum += lag - 1
+        assert saved[ufw_history.KEY]['max_id'] == maximum
+    migrate.check_ufw_utc_readiness(connection)
+    assert migrate.migrate(connection) == []
+    backup.verify_rows(connection, tmp_path, before)
+    config = {'batch_size': 257, 'max_buffer_events': 10000, 'late_seconds': 600}
+    fetched = 0
+    rounds = 0
+    now = datetime(2026, 1, 3)
+    while True:
+        result = run_automatic(connection, config, now=now)
+        assert result['status'] == 'SUCCESS'
+        assert result['new_events_fetched'] <= 257
+        fetched += result['new_events_fetched']
+        rounds += 1
+        if result['new_events_fetched'] == 0:
+            break
+        assert rounds <= lag + 1
+    assert fetched == len(eligible)
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT last_event_id FROM detection_state s JOIN detection_rules r ON r.id=s.rule_id "
+                       "WHERE r.rule_key='PORT_SCAN_001'")
+        expected_checkpoint = 25000
+        if eligible:
+            expected_checkpoint = eligible[-1]
+        assert cursor.fetchone() == (expected_checkpoint,)
+        cursor.execute("SELECT e.event_id,u.time_basis FROM alert_evidence e JOIN ufw_log u ON u.id=e.event_id "
+                       "WHERE e.event_type='UFW' ORDER BY e.event_id")
+        evidence = cursor.fetchall()
+        expected_evidence = []
+        for event_id in eligible[:10]:
+            expected_evidence.append((event_id, 'UTC_VERIFIED'))
+        assert evidence == tuple(expected_evidence)
+        cursor.execute("SELECT COUNT(*) FROM detection_alerts a JOIN detection_rules r ON r.id=a.rule_id "
+                       "WHERE r.rule_key='PORT_SCAN_001'")
+        expected_alerts = 0
+        if lag:
+            expected_alerts = 1
+        assert cursor.fetchone() == (expected_alerts,)
+    assert run_automatic(connection, config, now=now)['new_alerts_saved'] == 0
+    from ingestion.ufw_to_mysql import save_event
+    with connection.cursor() as cursor:
+        assert save_event(cursor, '2026-01-03T12:00:00Z host [UFW BLOCK] SRC=192.0.2.200 '
+                          'DST=198.51.100.1 PROTO=TCP DPT=443') == 1
+        new_id = cursor.lastrowid
+        assert new_id > maximum
+        cursor.execute('SELECT time_basis FROM ufw_log WHERE id=%s', (new_id,))
+        assert cursor.fetchone() == ('UTC_VERIFIED',)
+    connection.commit()
+    assert run_automatic(connection, config, now=now)['new_events_fetched'] == 1
+    backup.verify_rows(connection, tmp_path, {'ufw_log': before['ufw_log'], 'auth_events': before['auth_events'],
+                                           'hosts': before['hosts'], 'alert_evidence': before['alert_evidence']})
+
+
+@pytest.mark.parametrize('committed', [False, True])
+def test_backlog_connection_loss_retries_without_losing_or_duplicating_events(legacy_port, monkeypatch, committed):
+    from detection.port_scan import runner
+
+    connection = legacy_port
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT DATABASE()')
+        schema = cursor.fetchone()[0]
+    eligible, _isolated = add_port_backlog(connection, 10)
+    migrate.migrate(connection)
+    save = runner.save_state
+    def disconnect(connection, rule_id, last_id, records):
+        save(connection, rule_id, last_id, records)
+        if committed:
+            connection.commit()
+        connection.close()
+        raise pymysql.OperationalError(2013, 'synthetic lost connection')
+    config = {'batch_size': 100, 'max_buffer_events': 100, 'late_seconds': 600}
+    with monkeypatch.context() as injected:
+        injected.setattr(runner, 'save_state', disconnect)
+        with pytest.raises(pymysql.MySQLError):
+            runner.run_automatic(connection, config, now=datetime(2026, 1, 3))
+    connection.connect()
+    connection.select_db(schema)
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT last_event_id FROM detection_state s JOIN detection_rules r ON r.id=s.rule_id "
+                       "WHERE r.rule_key='PORT_SCAN_001'")
+        expected = 25000
+        if committed:
+            expected = eligible[-1]
+        assert cursor.fetchone() == (expected,)
+        cursor.execute('SELECT COUNT(*) FROM alert_evidence')
+        expected_evidence = 0
+        if committed:
+            expected_evidence = 10
+        assert cursor.fetchone() == (expected_evidence,)
+    result = runner.run_automatic(connection, config, now=datetime(2026, 1, 3))
+    assert result['status'] == 'SUCCESS'
+    assert runner.run_automatic(connection, config, now=datetime(2026, 1, 3))['new_alerts_saved'] == 0
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT COUNT(*) FROM detection_alerts')
+        assert cursor.fetchone() == (1,)
+        cursor.execute('SELECT COUNT(*) FROM alert_evidence')
+        assert cursor.fetchone() == (10,)
+
+
+@pytest.mark.parametrize('fault', ['new_event', 'checkpoint', 'buffer'])
+def test_mutation_during_isolation_blocks_completion(legacy_port, monkeypatch, fault):
+    from database import ufw_time_basis
+
+    connection = legacy_port
+    add_port_backlog(connection, 100)
+    classify = ufw_time_basis.classify_event_time
+    mutated = [False]
+    def change_during_rows(raw, stored, precision):
+        if not mutated[0]:
+            mutated[0] = True
+            with connection.cursor() as cursor:
+                if fault == 'new_event':
+                    cursor.execute("INSERT INTO ufw_log (event_time,raw_line,event_hash) "
+                                   "VALUES ('2026-01-01','Jan 1 00:00:00',%s)", ('e' * 64,))
+                elif fault == 'checkpoint':
+                    cursor.execute("UPDATE detection_state s JOIN detection_rules r ON r.id=s.rule_id "
+                                   "SET s.last_event_id=25001 WHERE r.rule_key='PORT_SCAN_001'")
+                else:
+                    cursor.execute("UPDATE detection_state s JOIN detection_rules r ON r.id=s.rule_id "
+                                   "SET s.state_data=%s WHERE r.rule_key='PORT_SCAN_001'",
+                                   (json.dumps({'version': 1, 'events': [{}]}),))
+            connection.commit()
+        return classify(raw, stored, precision)
+    isolate = ufw_history.isolate
+    def inject(connection):
+        with monkeypatch.context() as during:
+            during.setattr(ufw_time_basis, 'classify_event_time', change_during_rows)
+            isolate(connection)
+    monkeypatch.setattr(ufw_history, 'isolate', inject)
+    with pytest.raises(migrate.MigrationError, match='changed during isolation|buffer must be empty'):
+        migrate.migrate(connection)
+    assert mutated[0]
+    assert migrate.migration_status(connection)['022'][1] == 'FAILED'
+
+
+def test_concurrent_insert_during_verification_is_seen_before_completion(legacy_port, monkeypatch):
+    connection = legacy_port
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT DATABASE()')
+        schema = cursor.fetchone()[0]
+    add_port_backlog(connection, 100)
+    verify = ufw_history.verify_isolation
+    inserted = [False]
+    def concurrent_insert(connection, *, saved=None):
+        verify(connection, saved=saved)
+        if saved is not None and not inserted[0]:
+            other = pymysql.connect(unix_socket=connection.unix_socket, user='root', database=schema,
+                                    autocommit=True, init_command="SET time_zone='+00:00'")
+            try:
+                with other.cursor() as cursor:
+                    cursor.execute("INSERT INTO ufw_log (event_time,raw_line,event_hash) "
+                                   "VALUES ('2026-01-01','Jan 1 00:00:00',%s)", ('d' * 64,))
+                inserted[0] = True
+            finally:
+                other.close()
+    monkeypatch.setattr(ufw_history, 'verify_isolation', concurrent_insert)
+    with pytest.raises(migrate.MigrationError, match='UFW tail changed during isolation'):
+        migrate.migrate(connection)
+    assert inserted[0]
+    assert migrate.migration_status(connection)['022'][1] == 'FAILED'

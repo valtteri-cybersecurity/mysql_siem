@@ -111,7 +111,7 @@ def check_counts(connection, saved, current):
 
 
 def check_legacy_port_state(connection):
-    """Accept only a drained checkpoint at the UFW tail before 022 completes."""
+    """Accept a drained checkpoint no later than the UFW tail before 022 completes."""
     from database.migrate import MigrationError, migration_status
 
     status = migration_status(connection).get('022', (None, None))[1]
@@ -134,8 +134,8 @@ def check_legacy_port_state(connection):
         raise MigrationError('Invalid legacy port scan state.')
     if data['events']:
         raise MigrationError('Legacy port scan buffer must be empty before isolation.')
-    if type(last_id) is not int or not 0 <= last_id < 2**64 or last_id != maximum:
-        raise MigrationError('Legacy port scan checkpoint must match the UFW tail.')
+    if type(last_id) is not int or not 0 <= last_id < 2**64 or last_id > maximum:
+        raise MigrationError('Legacy port scan checkpoint exceeds the UFW tail or is invalid.')
 
 
 def check_detection(connection, *, allow_port=False):
@@ -327,6 +327,22 @@ def verify_ssh_baseline(connection, baseline):
                 raise MigrationError('An original detection checkpoint disappeared or moved backwards.')
 
 
+def check_isolation_snapshot(connection, saved):
+    """Maintenance must keep the captured tail and detection checkpoints stable."""
+    from database.migrate import MigrationError
+
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT COALESCE(MAX(id),0) FROM ufw_log')
+        if cursor.fetchone() != (saved[KEY]['max_id'],):
+            raise MigrationError('UFW tail changed during isolation; keep maintenance active.')
+        cursor.execute('SELECT rule_id,last_event_id FROM detection_state ORDER BY rule_id')
+        states = []
+        for row in cursor.fetchall():
+            states.append(list(row))
+    if states != saved[SSH_KEY]['states']:
+        raise MigrationError('Detection checkpoints changed during isolation; keep maintenance active.')
+
+
 def isolate(connection):
     from database.migrate import ROOT, MigrationError
     from database.ufw_time_basis import classify_event_time
@@ -338,6 +354,7 @@ def isolate(connection):
     baseline = saved[KEY]
     check_baseline(connection, 'ufw_log', 'id,event_time,raw_line', baseline)
     verify_ssh_baseline(connection, saved[SSH_KEY])
+    check_isolation_snapshot(connection, saved)
     if not active_filter(connection):
         with connection.cursor() as cursor:
             cursor.execute((ROOT / 'migrations/022_ufw_history_isolation.sql').read_text().strip())
@@ -362,6 +379,10 @@ def isolate(connection):
                 last = event_id
         connection.commit()
     verify_isolation(connection, saved=saved)
+    # End the verification read snapshot before the final maintenance checks.
+    connection.commit()
+    preflight(connection)
+    check_isolation_snapshot(connection, saved)
     with connection.cursor() as cursor:
         cursor.execute("ALTER TABLE ufw_log ALTER COLUMN time_basis SET DEFAULT 'UTC_VERIFIED'")
 
