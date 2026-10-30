@@ -389,18 +389,28 @@ def restore_check(dump, tables, *, restore_parent=RESTORE_PARENT, objects_sha256
     """Restore only into our own socket-only child, never the application server."""
     trusted_restore_parent(restore_parent)
     workspace = Path(tempfile.mkdtemp(prefix='.mysql_siem-restore-', dir=restore_parent))
-    user_options = []
+    process_options = {}
+
     if os.geteuid() == 0:
         account = pwd.getpwnam('mysql')
+
         if account.pw_uid == 0:
-            raise BackupError('Isolated restore needs a non-root MySQL account.')
+            raise BackupError(
+                'Isolated restore needs a non-root MySQL account.'
+            )
+
         os.chown(workspace, account.pw_uid, account.pw_gid)
-        user_options = ['--user=mysql']
+
+        process_options = {
+            'user': account.pw_uid,
+            'group': account.pw_gid,
+            'extra_groups': [],
+        }
     process = connection = None
     try:
         data = workspace / 'data'
         socket = workspace / 'restore.sock'
-        command = [binary('mysqld'), '--no-defaults', *user_options, f'--datadir={data}',
+        command = [binary('mysqld'), '--no-defaults', f'--datadir={data}',
                    f'--log-error={workspace / "server.log"}', '--performance-schema=OFF',
                    '--innodb-buffer-pool-size=32M', '--innodb-redo-log-capacity=64M',
                    '--max-connections=5', '--table-open-cache=64', '--table-definition-cache=400']
@@ -410,11 +420,13 @@ def restore_check(dump, tables, *, restore_parent=RESTORE_PARENT, objects_sha256
             timeout=60,
             phase='MYSQL_INITIALIZE',
             diagnostic=dump.parent / 'mysql-initialize.stderr',
+            **process_options,
         )
         process = subprocess.Popen(command + [f'--socket={socket}', f'--pid-file={workspace / "server.pid"}',
                                               '--skip-networking', '--mysqlx=OFF', '--event-scheduler=OFF',
                                               '--local-infile=OFF', '--secure-file-priv=NULL'],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=private_environment())
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   env=private_environment(), **process_options)
         deadline = time.monotonic() + 40
         while time.monotonic() < deadline and process.poll() is None:
             try:

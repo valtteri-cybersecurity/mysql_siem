@@ -353,3 +353,59 @@ def test_mysql_restore_path_must_be_private_and_mysql_owned(
         match='secure mysql-owned',
     ):
         backup.trusted_restore_parent(parent)
+
+
+def test_isolated_restore_runs_with_mysql_identity(tmp_path, monkeypatch):
+    """Initialization and startup must run as mysql, not root."""
+    import os
+
+    user_id = 1234
+    group_id = 1234
+    calls = []
+
+    monkeypatch.setattr(
+        backup, 'trusted_restore_parent', lambda path: None
+    )
+    monkeypatch.setattr(
+        backup.os, 'geteuid', lambda: 0
+    )
+    monkeypatch.setattr(
+        backup.os, 'chown', lambda path, uid, gid: None
+    )
+    monkeypatch.setattr(
+        backup.pwd, 'getpwnam',
+        lambda name: SimpleNamespace(
+            pw_uid=user_id,
+            pw_gid=group_id,
+        ),
+    )
+    monkeypatch.setattr(
+        backup, 'binary', lambda name: name
+    )
+
+    def fake_run(arguments, **options):
+        calls.append((arguments, options))
+
+    def fake_popen(arguments, **options):
+        calls.append((arguments, options))
+        raise OSError('Synthetic startup failure')
+
+    monkeypatch.setattr(backup, 'run', fake_run)
+    monkeypatch.setattr(
+        backup.subprocess, 'Popen', fake_popen
+    )
+
+    with pytest.raises(OSError, match='Synthetic startup'):
+        backup.restore_check(
+            tmp_path / 'database.sql',
+            {},
+            restore_parent=tmp_path,
+        )
+
+    assert len(calls) == 2
+
+    for arguments, options in calls:
+        assert '--user=mysql' not in arguments
+        assert options['user'] == user_id
+        assert options['group'] == group_id
+        assert options['extra_groups'] == []
