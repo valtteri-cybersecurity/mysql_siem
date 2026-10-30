@@ -19,7 +19,7 @@ from config.service_installation import trusted_directory
 
 DATABASE = 'mysql_siem'
 BACKUPS = Path('/var/backups/mysql_siem')
-RESTORE_PARENT = Path('/var/lib')
+RESTORE_PARENT = Path('/var/lib/mysql')
 TIMEOUT = 1800
 MIN_FREE = 512 * 1024 * 1024
 
@@ -255,12 +255,99 @@ def binary(name):
     return executable
 
 
-def run(arguments, *, timeout=TIMEOUT, **options):
-    result = subprocess.run(arguments, stderr=subprocess.DEVNULL, env=private_environment(),
-                            timeout=timeout, check=False, **options)
-    if result.returncode:
-        raise BackupError('Backup or isolated restore command failed; no migration is allowed.')
-    return result
+def private_diagnostic(path, content):
+    """Keep bounded diagnostics private; never print SQL details."""
+    with path.open('xb') as output:
+        os.fchmod(output.fileno(), 0o600)
+        output.write(content[-65536:])
+        output.flush()
+        os.fsync(output.fileno())
+
+
+def trusted_restore_parent(path):
+    """Validate the MySQL-owned restore directory."""
+    path = Path(path)
+
+    if path != RESTORE_PARENT:
+        trusted_directory(path)
+        return
+
+    trusted_directory(path.parent)
+
+    account = pwd.getpwnam('mysql')
+    info = path.lstat()
+    mode = stat.S_IMODE(info.st_mode)
+
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != account.pw_uid
+        or info.st_gid != account.pw_gid
+        or mode & 0o022
+    ):
+        raise BackupError(
+            'MySQL restore parent must be a secure mysql-owned directory.'
+        )
+
+
+def run(arguments, *, timeout=TIMEOUT, phase='MYSQL_COMMAND',
+        diagnostic=None, **options):
+    """Run commands without leaking stderr into installation output."""
+
+    with tempfile.TemporaryFile() as errors:
+        try:
+            result = subprocess.run(
+                arguments,
+                stderr=errors,
+                env=private_environment(),
+                timeout=timeout,
+                check=False,
+                **options,
+            )
+
+        except subprocess.TimeoutExpired:
+            if diagnostic is not None:
+                errors.seek(0)
+                private_diagnostic(
+                    diagnostic,
+                    errors.read(65536),
+                )
+
+            raise BackupError(
+                phase + ' timed out; no migration is allowed.'
+            ) from None
+
+        except OSError:
+            if diagnostic is not None:
+                errors.seek(0)
+                private_diagnostic(
+                    diagnostic,
+                    errors.read(65536),
+                )
+
+            raise BackupError(
+                phase + ' could not start; no migration is allowed.'
+            ) from None
+
+        if result.returncode != 0:
+            if diagnostic is not None:
+                errors.seek(0, os.SEEK_END)
+                size = errors.tell()
+
+                errors.seek(max(0, size - 65536))
+
+                private_diagnostic(
+                    diagnostic,
+                    errors.read(65536),
+                )
+
+            raise BackupError(
+                phase
+                + ' failed with exit code '
+                + str(result.returncode)
+                + '; no migration is allowed.'
+            )
+
+        return result
 
 
 def check_prerequisites(connection, *, backup_root=BACKUPS, restore_parent=RESTORE_PARENT):
@@ -288,7 +375,11 @@ def check_prerequisites(connection, *, backup_root=BACKUPS, restore_parent=RESTO
         existing = path
         while not existing.exists() and not existing.is_symlink():
             existing = existing.parent
-        trusted_directory(existing)
+        if path == RESTORE_PARENT and path.exists():
+            trusted_restore_parent(path)
+        else:
+            trusted_directory(existing)
+
         if shutil.disk_usage(existing).free < max(MIN_FREE, estimated * 6):
             raise BackupError('Insufficient disk space for the dump, fingerprints and isolated restore.')
     return {'database': database, 'server': server, 'mysql_version': version}
@@ -296,7 +387,7 @@ def check_prerequisites(connection, *, backup_root=BACKUPS, restore_parent=RESTO
 
 def restore_check(dump, tables, *, restore_parent=RESTORE_PARENT, objects_sha256=None):
     """Restore only into our own socket-only child, never the application server."""
-    trusted_directory(restore_parent)
+    trusted_restore_parent(restore_parent)
     workspace = Path(tempfile.mkdtemp(prefix='.mysql_siem-restore-', dir=restore_parent))
     user_options = []
     if os.geteuid() == 0:
@@ -313,7 +404,13 @@ def restore_check(dump, tables, *, restore_parent=RESTORE_PARENT, objects_sha256
                    f'--log-error={workspace / "server.log"}', '--performance-schema=OFF',
                    '--innodb-buffer-pool-size=32M', '--innodb-redo-log-capacity=64M',
                    '--max-connections=5', '--table-open-cache=64', '--table-definition-cache=400']
-        run(command + ['--initialize-insecure'], stdout=subprocess.DEVNULL, timeout=60)
+        run(
+            command + ['--initialize-insecure'],
+            stdout=subprocess.DEVNULL,
+            timeout=60,
+            phase='MYSQL_INITIALIZE',
+            diagnostic=dump.parent / 'mysql-initialize.stderr',
+        )
         process = subprocess.Popen(command + [f'--socket={socket}', f'--pid-file={workspace / "server.pid"}',
                                               '--skip-networking', '--mysqlx=OFF', '--event-scheduler=OFF',
                                               '--local-infile=OFF', '--secure-file-priv=NULL'],
@@ -337,7 +434,9 @@ def restore_check(dump, tables, *, restore_parent=RESTORE_PARENT, objects_sha256
         with dump.open('rb') as source:
             run([binary('mysql'), '--no-defaults', '--protocol=socket', f'--socket={socket}', '--user=root',
                  '--binary-mode=1', '--local-infile=0', '--connect-timeout=5'],
-                stdin=source, stdout=subprocess.DEVNULL)
+                stdin=source, stdout=subprocess.DEVNULL,
+                phase='SQL_RESTORE',
+                diagnostic=dump.parent / 'mysql-restore.stderr')
         connection.select_db(DATABASE)
         if objects_sha256 is not None and global_objects_digest(connection) != objects_sha256:
             raise BackupError('Restored routines or scheduled events differ from the original.')
@@ -348,6 +447,25 @@ def restore_check(dump, tables, *, restore_parent=RESTORE_PARENT, objects_sha256
             if restored[name]['ddl_sha256'] != layout['ddl_sha256']:
                 raise BackupError('Restored database table definitions differ from the original.')
         verify_rows(connection, dump.parent, tables, exact=True)
+
+    except BaseException:
+        server_log = workspace / 'server.log'
+        diagnostic = dump.parent / 'mysql-restore-server.log'
+
+        if server_log.is_file() and not diagnostic.exists():
+            with server_log.open('rb') as error_file:
+                error_file.seek(0, os.SEEK_END)
+                size = error_file.tell()
+
+                error_file.seek(max(0, size - 65536))
+
+                private_diagnostic(
+                    diagnostic,
+                    error_file.read(65536),
+                )
+
+        raise
+
     finally:
         if connection is not None:
             try:

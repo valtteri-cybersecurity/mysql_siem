@@ -34,7 +34,15 @@ def test_dump_restore_and_additive_upgrade_preserve_identifiers_and_settings(ide
         connection.select_db('mysql_siem')
         # A real pre-021 installation, without modifying any migration source.
         with monkeypatch.context() as before_upgrade:
-            before_upgrade.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-2])
+            old_migrations = []
+
+            for migration in migrate.MIGRATIONS:
+                if int(migration[0]) <= 20:
+                    old_migrations.append(migration)
+
+            before_upgrade.setattr(
+                migrate, 'MIGRATIONS', old_migrations
+            )
             migrate.migrate(connection)
         with connection.cursor() as cursor:
             cursor.execute("CREATE USER 'pythonuser'@'localhost' IDENTIFIED BY 'synthetic-private-test'")
@@ -85,7 +93,14 @@ def test_dump_restore_and_additive_upgrade_preserve_identifiers_and_settings(ide
             assert manifest['phase'] == 'VERIFIED'
             assert manifest['tables']['auth_events']['count'] == 1
             assert json.loads(journal.read_file(state / 'upgrade-backup.json'))['folder'] == str(folder)
-            assert migrate.migration_status(connection)['021'][1] == 'APPLIED'
+            statuses = migrate.migration_status(connection)
+
+            for version in (
+                '021', '022', '023', '024',
+                '025', '026', '027'
+            ):
+                assert statuses[version][1] == 'APPLIED'
+
             assert migrate.migrate(connection) == []
             with connection.cursor() as cursor:
                 cursor.execute('SELECT id,username,auth_method,source_port FROM auth_events')

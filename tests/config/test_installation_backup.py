@@ -267,3 +267,89 @@ def test_sigterm_leaves_upgrade_unfinished_and_restores_handler(monkeypatch, tmp
     assert 'interrupted' in capsys.readouterr().err
     assert signal.getsignal(signal.SIGTERM) == previous
     connection.close.assert_called_once()
+
+
+
+def test_failed_mysql_command_reports_phase_and_saves_private_error(
+    tmp_path, monkeypatch
+):
+    def failed_command(arguments, **options):
+        options['stderr'].write(
+            b'Simulated MySQL permission denied'
+        )
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(
+        backup.subprocess, 'run', failed_command
+    )
+
+    path = tmp_path / 'mysql-initialize.stderr'
+
+    with pytest.raises(
+        backup.BackupError,
+        match='MYSQL_INITIALIZE failed with exit code 1',
+    ):
+        backup.run(
+            ['mysqld', '--initialize-insecure'],
+            phase='MYSQL_INITIALIZE',
+            diagnostic=path,
+        )
+
+    assert path.stat().st_mode & 0o777 == 0o600
+    assert b'permission denied' in path.read_bytes()
+
+
+def test_successful_mysql_command_leaves_no_diagnostics(
+    tmp_path, monkeypatch
+):
+    def successful_command(arguments, **options):
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(
+        backup.subprocess, 'run', successful_command
+    )
+
+    path = tmp_path / 'mysql-restore.stderr'
+
+    backup.run(
+        ['mysql'],
+        phase='SQL_RESTORE',
+        diagnostic=path,
+    )
+
+    assert not path.exists()
+
+
+def test_mysql_restore_path_must_be_private_and_mysql_owned(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace as Namespace
+    import os
+
+    parent = tmp_path / 'mysql'
+    parent.mkdir(mode=0o700)
+
+    monkeypatch.setattr(
+        backup, 'RESTORE_PARENT', parent
+    )
+    monkeypatch.setattr(
+        backup, 'trusted_directory', lambda path: None
+    )
+    monkeypatch.setattr(
+        backup.pwd,
+        'getpwnam',
+        lambda name: Namespace(
+            pw_uid=os.getuid(),
+            pw_gid=os.getgid(),
+        ),
+    )
+
+    backup.trusted_restore_parent(parent)
+
+    parent.chmod(0o777)
+
+    with pytest.raises(
+        backup.BackupError,
+        match='secure mysql-owned',
+    ):
+        backup.trusted_restore_parent(parent)
