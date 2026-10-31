@@ -343,48 +343,188 @@ def check_isolation_snapshot(connection, saved):
         raise MigrationError('Detection checkpoints changed during isolation; keep maintenance active.')
 
 
-def isolate(connection):
-    from database.migrate import ROOT, MigrationError
+def _isolation_progress(connection, baseline):
+    """Read only a checkpoint written with a committed classification batch."""
+    from database.migrate import MigrationError
+
+    maximum = baseline["max_id"]
+    progress = baseline.get("last_classified_id", 0)
+
+    if (
+        type(progress) is not int
+        or type(maximum) is not int
+        or progress < 0
+        or progress > maximum
+    ):
+        raise MigrationError("022: invalid UFW isolation checkpoint.")
+
+    if progress:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT 1 FROM ufw_log WHERE id = %s",
+                (progress,),
+            )
+            if cursor.fetchone() != (1,):
+                raise MigrationError(
+                    "022: saved isolation checkpoint has no source row."
+                )
+
+    return progress
+
+
+def _write_isolation_batch(connection, rows, baseline):
+    """Update one batch and its checkpoint in the same transaction.
+
+    The caller alone commits. A failed SQL operation, interruption, or
+    connection loss must not advance the checkpoint independently.
+    """
+    from database.migrate import MigrationError
     from database.ufw_time_basis import classify_event_time
 
-    preflight(connection)
+    if not rows or len(rows) > 256:
+        raise MigrationError("022: invalid UFW isolation batch size.")
+
+    clauses = []
+    parameters = []
+    identifiers = []
+    previous_id = 0
+
+    for event_id, stored, raw in rows:
+        if type(event_id) is not int or event_id <= previous_id:
+            raise MigrationError("022: UFW isolation batch is not ordered.")
+
+        precision = baseline["precision"]
+
+        if event_id <= baseline.get("previous_max_id", 0):
+            precision = baseline["previous_precision"]
+
+        basis = classify_event_time(raw, stored, precision)
+
+        clauses.append("WHEN %s THEN %s")
+        parameters.extend((event_id, basis))
+        identifiers.append(event_id)
+        previous_id = event_id
+
+    placeholders = ",".join(["%s"] * len(identifiers))
+
+    statement = (
+        "UPDATE ufw_log SET time_basis = CASE id "
+        + " ".join(clauses)
+        + " ELSE time_basis END "
+        + "WHERE id IN ("
+        + placeholders
+        + ")"
+    )
+
+    parameters.extend(identifiers)
+
     with connection.cursor() as cursor:
-        cursor.execute("SELECT row_counts FROM schema_migrations WHERE version='022'")
-        saved = json.loads(cursor.fetchone()[0])
+        cursor.execute(statement, tuple(parameters))
+
+        cursor.execute(
+            "UPDATE schema_migrations "
+            "SET row_counts = JSON_SET("
+            "row_counts, "
+            "'$._ufw_compatibility.last_classified_id', %s"
+            ") "
+            "WHERE version = '022' AND status = 'RUNNING'",
+            (identifiers[-1],),
+        )
+
+        if cursor.rowcount != 1:
+            raise MigrationError(
+                "022: isolation checkpoint could not be committed."
+            )
+
+    return identifiers[-1]
+
+
+def isolate(connection):
+    """Resume historical UFW classification with atomic batch checkpoints."""
+    from database.migrate import ROOT, MigrationError
+
+    preflight(connection)
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT row_counts FROM schema_migrations "
+            "WHERE version = '022' AND status = 'RUNNING'"
+        )
+        row = cursor.fetchone()
+
+    if row is None:
+        raise MigrationError("022: running migration ledger is missing.")
+
+    saved = json.loads(row[0])
     baseline = saved[KEY]
-    check_baseline(connection, 'ufw_log', 'id,event_time,raw_line', baseline)
+
+    # Check the original immutable history before accepting any checkpoint.
+    check_baseline(
+        connection,
+        "ufw_log",
+        "id,event_time,raw_line",
+        baseline,
+    )
     verify_ssh_baseline(connection, saved[SSH_KEY])
     check_isolation_snapshot(connection, saved)
+
+    last = _isolation_progress(connection, baseline)
+
+    # Existing partially completed upgrades already have this column.
+    # Never rerun an ALTER TABLE that has committed successfully.
     if not active_filter(connection):
         with connection.cursor() as cursor:
-            cursor.execute((ROOT / 'migrations/022_ufw_history_isolation.sql').read_text().strip())
+            cursor.execute(
+                (
+                    ROOT / "migrations/022_ufw_history_isolation.sql"
+                ).read_text().strip()
+            )
+
     deadline = time.monotonic() + 120
-    last = 0
-    while last < baseline['max_id']:
+
+    while last < baseline["max_id"]:
         if time.monotonic() >= deadline:
-            raise MigrationError('UFW isolation exceeded its time budget; keep maintenance.')
+            raise MigrationError(
+                "022: UFW isolation time budget exceeded; "
+                "committed checkpoint is preserved."
+            )
+
         with connection.cursor() as cursor:
-            cursor.execute('SELECT /*+ MAX_EXECUTION_TIME(5000) */ id,event_time,raw_line FROM ufw_log '
-                           'WHERE id>%s AND id<=%s ORDER BY id LIMIT %s', (last, baseline['max_id'], 256))
+            cursor.execute(
+                "SELECT /*+ MAX_EXECUTION_TIME(5000) */ "
+                "id,event_time,raw_line FROM ufw_log "
+                "WHERE id > %s AND id <= %s "
+                "ORDER BY id LIMIT %s",
+                (last, baseline["max_id"], 256),
+            )
             rows = cursor.fetchall()
+
         if not rows:
-            raise MigrationError('UFW baseline rows disappeared.')
-        with connection.cursor() as cursor:
-            for event_id, stored, raw in rows:
-                precision = baseline['precision']
-                if event_id <= baseline.get('previous_max_id', 0):
-                    precision = baseline['previous_precision']
-                basis = classify_event_time(raw, stored, precision)
-                cursor.execute('UPDATE ufw_log SET time_basis=%s WHERE id=%s', (basis, event_id))
-                last = event_id
+            raise MigrationError(
+                "022: UFW baseline rows disappeared during isolation."
+            )
+
+        # Both UPDATE statements belong to the same InnoDB transaction.
+        # The checkpoint is not published until this commit succeeds.
+        next_id = _write_isolation_batch(connection, rows, baseline)
         connection.commit()
+        last = next_id
+
+    # Never mark the migration successful based only on its checkpoint.
+    # Recompute the classification from the original event timestamps.
     verify_isolation(connection, saved=saved)
-    # End the verification read snapshot before the final maintenance checks.
+
     connection.commit()
+
+    # Final maintenance and historical-integrity checks.
     preflight(connection)
     check_isolation_snapshot(connection, saved)
+
     with connection.cursor() as cursor:
-        cursor.execute("ALTER TABLE ufw_log ALTER COLUMN time_basis SET DEFAULT 'UTC_VERIFIED'")
+        cursor.execute(
+            "ALTER TABLE ufw_log "
+            "ALTER COLUMN time_basis SET DEFAULT 'UTC_VERIFIED'"
+        )
 
 
 def verify_isolation(connection, *, saved=None):

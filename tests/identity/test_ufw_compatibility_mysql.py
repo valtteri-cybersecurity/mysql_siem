@@ -698,3 +698,176 @@ def test_concurrent_insert_during_verification_is_seen_before_completion(legacy_
         migrate.migrate(connection)
     assert inserted[0]
     assert migrate.migration_status(connection)['022'][1] == 'FAILED'
+
+
+def test_022_checkpoint_resume_after_committed_batch(
+    legacy_port, monkeypatch, tmp_path
+):
+    """A committed batch must not be repeated after a failed upgrade."""
+    connection = legacy_port
+    add_port_backlog(connection, 620, mixed=True, gaps=True)
+
+    original_rows = backup.snapshot_rows(connection, tmp_path)
+    original = ufw_history._write_isolation_batch
+    completed = []
+    attempts = [0]
+
+    def interrupted(conn, rows, baseline):
+        attempts[0] += 1
+
+        if attempts[0] == 2:
+            raise RuntimeError("synthetic interruption after checkpoint")
+
+        result = original(conn, rows, baseline)
+        completed.append(result)
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ufw_history, "_write_isolation_batch", interrupted
+        )
+
+        with pytest.raises(
+            RuntimeError, match="synthetic interruption"
+        ):
+            migrate.migrate(connection)
+
+    assert migrate.migration_status(connection)["022"][1] == "FAILED"
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT row_counts FROM schema_migrations "
+            "WHERE version = '022'"
+        )
+        saved = json.loads(cursor.fetchone()[0])
+
+    progress = saved[ufw_history.KEY]["last_classified_id"]
+    assert progress == completed[0]
+
+    resumed_first_ids = []
+
+    def record_resume(conn, rows, baseline):
+        resumed_first_ids.append(rows[0][0])
+        return original(conn, rows, baseline)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ufw_history, "_write_isolation_batch", record_resume
+        )
+        migrate.migrate(connection)
+
+    assert resumed_first_ids
+    assert resumed_first_ids[0] > progress
+    assert migrate.migration_status(connection)["022"][1] == "APPLIED"
+
+    ufw_history.verify_isolation(connection)
+    backup.verify_rows(connection, tmp_path, original_rows)
+
+
+def test_022_checkpoint_and_rows_roll_back_together(
+    legacy_port, monkeypatch
+):
+    """An exception before commit must roll back both writes."""
+    connection = legacy_port
+    add_port_backlog(connection, 320, mixed=True)
+
+    original = ufw_history._write_isolation_batch
+
+    def fail_before_commit(conn, rows, baseline):
+        original(conn, rows, baseline)
+        raise RuntimeError("synthetic failure before commit")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ufw_history, "_write_isolation_batch", fail_before_commit
+        )
+
+        with pytest.raises(
+            RuntimeError, match="synthetic failure before commit"
+        ):
+            migrate.migrate(connection)
+
+    assert migrate.migration_status(connection)["022"][1] == "FAILED"
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT row_counts FROM schema_migrations "
+            "WHERE version = '022'"
+        )
+        saved = json.loads(cursor.fetchone()[0])
+
+        cursor.execute(
+            "SELECT time_basis FROM ufw_log WHERE id = 1"
+        )
+        first_row = cursor.fetchone()
+
+    assert "last_classified_id" not in saved[ufw_history.KEY]
+    assert first_row == ("UNVERIFIED",)
+
+    migrate.migrate(connection)
+    assert migrate.migration_status(connection)["022"][1] == "APPLIED"
+
+
+def test_022_old_partial_upgrade_without_checkpoint(
+    legacy_port, monkeypatch, tmp_path
+):
+    """Previously committed rows without a checkpoint are replayed safely."""
+    connection = legacy_port
+    add_port_backlog(connection, 530, mixed=True, gaps=True)
+
+    original_rows = backup.snapshot_rows(connection, tmp_path)
+    original = ufw_history._write_isolation_batch
+    completed = []
+    attempts = [0]
+
+    def interrupted(conn, rows, baseline):
+        attempts[0] += 1
+
+        if attempts[0] == 2:
+            raise RuntimeError("synthetic old partial upgrade")
+
+        result = original(conn, rows, baseline)
+        completed.append(result)
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ufw_history, "_write_isolation_batch", interrupted
+        )
+
+        with pytest.raises(
+            RuntimeError, match="synthetic old partial upgrade"
+        ):
+            migrate.migrate(connection)
+
+    # Simulate an old installer that committed classification rows
+    # without recording a durable progress checkpoint.
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "UPDATE schema_migrations SET "
+            "row_counts = JSON_REMOVE("
+            "row_counts, "
+            "'$._ufw_compatibility.last_classified_id'"
+            ") WHERE version = '022'"
+        )
+
+    connection.commit()
+
+    replayed_first_ids = []
+
+    def record_replay(conn, rows, baseline):
+        replayed_first_ids.append(rows[0][0])
+        return original(conn, rows, baseline)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            ufw_history, "_write_isolation_batch", record_replay
+        )
+        migrate.migrate(connection)
+
+    assert replayed_first_ids
+    assert replayed_first_ids[0] <= completed[0]
+    assert migrate.migration_status(connection)["022"][1] == "APPLIED"
+
+    ufw_history.verify_isolation(connection)
+    backup.verify_rows(connection, tmp_path, original_rows)
