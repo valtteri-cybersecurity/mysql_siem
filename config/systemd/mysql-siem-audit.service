@@ -16,6 +16,7 @@ TimeoutStartSec=55
 SuccessExitStatus=75
 NoNewPrivileges=true
 CapabilityBoundingSet=CAP_AUDIT_CONTROL CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_SETUID
 ProtectSystem=strict
 # Audit input stays read-only; only the application log is writable.
 ReadWritePaths=/var/log/mysql_siem/audit
