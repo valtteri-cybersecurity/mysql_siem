@@ -98,7 +98,12 @@ def check_baseline(connection, table, fields, baseline):
 
 def check_counts(connection, saved, current):
     """Counts can prove a deficit, never original event identities."""
-    from database.migrate import HISTORY_TABLES, MigrationError
+    from database.migrate import (
+        HISTORY_TABLES,
+        SNAPSHOT_STATE_TABLES,
+        MigrationError,
+        requires_monotonic_history_count,
+    )
 
     if not isinstance(saved, dict):
         raise MigrationError('Migration history counts are invalid.')
@@ -106,8 +111,22 @@ def check_counts(connection, saved, current):
         expected = saved.get(table, 0)
         if type(expected) is not int or expected < 0:
             raise MigrationError('Migration history counts are invalid.')
-        if current.get(table, 0) < expected:
-            raise MigrationError('Historical row counts decreased: ' + table)
+        if (
+            table in SNAPSHOT_STATE_TABLES
+            and table in saved
+            and table not in current
+        ):
+            raise MigrationError(
+                'Snapshot state table disappeared: ' + table
+            )
+
+        if (
+            requires_monotonic_history_count(table)
+            and current.get(table, 0) < expected
+        ):
+            raise MigrationError(
+                'Historical row counts decreased: ' + table
+            )
 
 
 def check_legacy_port_state(connection):

@@ -74,6 +74,19 @@ HISTORY_TABLES = EVENT_TABLES + ANALYSIS_TABLES + (
 )
 
 
+# These tables contain the latest observation, not immutable history.
+# The snapshot collector replaces their rows transactionally.
+SNAPSHOT_STATE_TABLES = frozenset((
+    "process_state",
+    "service_state",
+))
+
+
+def requires_monotonic_history_count(table):
+    """Require nondecreasing counts for historical tables."""
+    return table not in SNAPSHOT_STATE_TABLES
+
+
 def history_counts(connection):
     """Record table row counts during the maintenance window."""
 
@@ -717,7 +730,10 @@ def migrate(connection):
                     original_count = counts[table]
                     current_count = actual_counts.get(table)
 
-                    if current_count is None or current_count < original_count:
+                    if current_count is None or (
+                        requires_monotonic_history_count(table)
+                        and current_count < original_count
+                    ):
                         raise MigrationError(
                             "Historical row counts decreased; "
                             "inspect the database before resuming jobs."
