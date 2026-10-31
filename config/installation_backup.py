@@ -81,7 +81,7 @@ def schema_digest(cursor, name):
         'JOIN information_schema.check_constraints c ON c.constraint_schema=t.constraint_schema '
         'AND c.constraint_name=t.constraint_name WHERE t.table_schema=DATABASE() AND t.table_name=%s '
         'ORDER BY t.constraint_name'),
-        ('SELECT engine,table_collation,row_format,create_options,COALESCE(auto_increment,1) FROM information_schema.tables '
+        ('SELECT engine,table_collation,row_format,create_options FROM information_schema.tables '
         'WHERE table_schema=DATABASE() AND table_name=%s'),
         ('SELECT trigger_name,action_timing,event_manipulation,action_statement,definer,sql_mode '
         'FROM information_schema.triggers WHERE trigger_schema=DATABASE() AND event_object_table=%s '
@@ -140,7 +140,29 @@ def table_layout(connection):
             if not primary:
                 raise BackupError('Upgrade backup requires stable table primary keys; review this schema offline.')
             ddl = schema_digest(cursor, name)
-            result[name] = {'columns': columns, 'primary': primary, 'ddl_sha256': ddl}
+            cursor.execute(
+                'SELECT auto_increment FROM information_schema.tables '
+                'WHERE table_schema=DATABASE() AND table_name=%s',
+                (name,),
+            )
+            sequence = cursor.fetchone()
+            if sequence is None:
+                raise BackupError(
+                    'Cannot inspect AUTO_INCREMENT metadata: ' + name
+                )
+            next_id = sequence[0]
+            if next_id is not None and (
+                type(next_id) is not int or next_id < 1
+            ):
+                raise BackupError(
+                    'Invalid AUTO_INCREMENT metadata: ' + name
+                )
+            result[name] = {
+                'columns': columns,
+                'primary': primary,
+                'ddl_sha256': ddl,
+                'auto_increment_next': next_id,
+            }
     if not result:
         raise BackupError('Application database is empty or cannot be inspected.')
     return result
@@ -497,6 +519,26 @@ def check_prerequisites(connection, *, backup_root=BACKUPS, restore_parent=RESTO
     return {'database': database, 'server': server, 'mysql_version': version}
 
 
+def verify_restored_auto_increment(name, original, restored):
+    """Reject a restored sequence that could reuse an earlier ID."""
+    if original is None:
+        if restored is not None:
+            raise BackupError(
+                'Restored unexpected AUTO_INCREMENT: ' + name
+            )
+        return
+
+    if type(original) is not int or original < 1:
+        raise BackupError(
+            'Invalid original AUTO_INCREMENT: ' + name
+        )
+
+    if type(restored) is not int or restored < original:
+        raise BackupError(
+            'Restored AUTO_INCREMENT is below original: ' + name
+        )
+
+
 def restore_check(dump, tables, *, restore_parent=RESTORE_PARENT, objects_sha256=None):
     """Restore only into our own socket-only child, never the application server."""
     trusted_restore_parent(restore_parent)
@@ -569,7 +611,21 @@ def restore_check(dump, tables, *, restore_parent=RESTORE_PARENT, objects_sha256
             raise BackupError('Restored database table inventory differs from the backup.')
         for name, layout in tables.items():
             if restored[name]['ddl_sha256'] != layout['ddl_sha256']:
-                raise BackupError('Restored database table definitions differ from the original.')
+                raise BackupError(
+                    'Restored database table definitions differ '
+                    'from the original: ' + name
+                )
+
+            if 'auto_increment_next' not in layout:
+                raise BackupError(
+                    'Original AUTO_INCREMENT metadata missing: ' + name
+                )
+
+            verify_restored_auto_increment(
+                name,
+                layout['auto_increment_next'],
+                restored[name]['auto_increment_next'],
+            )
         verify_rows(connection, dump.parent, tables, exact=True)
 
     except BaseException:
