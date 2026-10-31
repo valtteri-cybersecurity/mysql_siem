@@ -409,3 +409,126 @@ def test_isolated_restore_runs_with_mysql_identity(tmp_path, monkeypatch):
         assert options['user'] == user_id
         assert options['group'] == group_id
         assert options['extra_groups'] == []
+
+
+from datetime import datetime as _dt_022
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [None, "action", "time", "strict", "no_proof"],
+)
+def test_partial_022_backup_classification(
+    tmp_path, monkeypatch, fault
+):
+    original = (
+        1,
+        _dt_022(2026, 10, 30, 12, 0, 0),
+        "2026-10-30T12:00:00Z host [UFW BLOCK] SRC=192.0.2.1",
+        "UNVERIFIED",
+        "BLOCK",
+    )
+
+    values = [original]
+
+    layout = {
+        "ufw_log": {
+            "columns": [
+                "id", "event_time", "raw_line",
+                "time_basis", "action",
+            ],
+            "primary": ["id"],
+            "ddl_sha256": "synthetic",
+        }
+    }
+
+    monkeypatch.setattr(
+        backup,
+        "table_layout",
+        lambda connection: copy.deepcopy(layout),
+    )
+
+    def select_rows(*args):
+        cursor = MagicMock()
+        cursor.__enter__.return_value = cursor
+        cursor.fetchone.side_effect = values + [None]
+        return cursor
+
+    monkeypatch.setattr(backup, "select_rows", select_rows)
+
+    tables = backup.snapshot_rows(MagicMock(), tmp_path)
+
+    updated = list(original)
+    updated[3] = "UTC_VERIFIED"
+
+    if fault == "action":
+        updated[4] = "ALLOW"
+
+    elif fault == "time":
+        updated[1] = _dt_022(2026, 10, 30, 12, 0, 1)
+
+    values[0] = tuple(updated)
+
+    def baseline(*args, **kwargs):
+        if fault == "no_proof":
+            return None
+
+        return {"precision": 6}
+
+    monkeypatch.setattr(
+        backup, "_verified_022_baseline", baseline
+    )
+
+    if fault is None:
+        backup.verify_rows(MagicMock(), tmp_path, tables)
+
+    else:
+        with pytest.raises(
+            backup.BackupError, match="values changed"
+        ):
+            backup.verify_rows(
+                MagicMock(),
+                tmp_path,
+                tables,
+                exact=fault == "strict",
+            )
+
+
+def test_partial_022_proof_requires_verified_ledger(monkeypatch):
+    from database import ufw_history
+
+    cursor = MagicMock()
+    cursor.__enter__.return_value = cursor
+    cursor.fetchone.return_value = (
+        "APPLIED",
+        json.dumps({
+            "_ufw_compatibility": {"precision": 6}
+        }),
+    )
+
+    connection = MagicMock()
+    connection.cursor.return_value = cursor
+
+    preflight = Mock()
+    monkeypatch.setattr(ufw_history, "preflight", preflight)
+
+    tables = {
+        "ufw_log": {
+            "columns": ["id", "time_basis"]
+        }
+    }
+
+    result = backup._verified_022_baseline(
+        connection, tables, exact=False
+    )
+
+    assert result == {"precision": 6}
+    preflight.assert_called_once_with(connection)
+
+    preflight.reset_mock()
+
+    assert backup._verified_022_baseline(
+        connection, tables, exact=True
+    ) is None
+
+    preflight.assert_not_called()

@@ -194,8 +194,111 @@ def snapshot_rows(connection, folder):
     return tables
 
 
+def _verified_022_baseline(connection, tables, *, exact):
+    """Read-only proof for a partial UFW migration snapshot."""
+    layout = tables.get("ufw_log")
+
+    if exact or layout is None:
+        return None
+
+    if "time_basis" not in layout["columns"]:
+        return None
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT status,row_counts FROM schema_migrations "
+            "WHERE version='022'"
+        )
+        record = cursor.fetchone()
+
+    if record is None:
+        return None
+
+    if record[0] not in ("RUNNING", "FAILED", "APPLIED"):
+        return None
+
+    from database.ufw_history import KEY, preflight
+
+    # Verify historical evidence before allowing any exception.
+    preflight(connection)
+
+    try:
+        saved = json.loads(record[1])
+        baseline = saved[KEY]
+
+        if not isinstance(baseline, dict):
+            raise ValueError
+
+        precision = baseline.get("precision")
+
+        if type(precision) is not int or not 0 <= precision <= 6:
+            raise ValueError
+
+    except (KeyError, TypeError, ValueError):
+        raise BackupError(
+            "022: original classification proof is invalid."
+        ) from None
+
+    return baseline
+
+
+def _allowed_022_classification_change(
+    row, layout, original_digest, baseline
+):
+    """Accept only a cryptographically proven time_basis transition."""
+    if baseline is None:
+        return False
+
+    columns = layout["columns"]
+
+    required = ("id", "event_time", "raw_line", "time_basis")
+
+    for name in required:
+        if name not in columns:
+            return False
+
+    basis_index = columns.index("time_basis")
+    current_basis = row[basis_index]
+
+    if current_basis not in (
+        "UTC_VERIFIED",
+        "LOCAL_TIME_VERIFIED",
+    ):
+        return False
+
+    # Reconstruct the exact original row, changing only time_basis.
+    previous = list(row)
+    previous[basis_index] = "UNVERIFIED"
+
+    reconstructed_digest = hashlib.sha256(
+        encode_row(tuple(previous)).encode("ascii")
+    ).hexdigest()
+
+    if reconstructed_digest != original_digest:
+        return False
+
+    event_id = row[columns.index("id")]
+    precision = baseline["precision"]
+
+    if event_id <= baseline.get("previous_max_id", 0):
+        precision = baseline["previous_precision"]
+
+    from database.ufw_time_basis import classify_event_time
+
+    expected_basis = classify_event_time(
+        row[columns.index("raw_line")],
+        row[columns.index("event_time")],
+        precision,
+    )
+
+    return current_basis == expected_basis
+
+
 def verify_rows(connection, folder, tables, *, exact=False):
-    """Preserve every original PK/value; additive migrations may insert new rows."""
+    """Preserve original rows; permit only proven 022 reclassification."""
+    baseline_022 = _verified_022_baseline(
+        connection, tables, exact=exact
+    )
     deadline = time.monotonic() + TIMEOUT
     for name, layout in tables.items():
         if not exact and name == 'schema_migrations':
@@ -229,7 +332,16 @@ def verify_rows(connection, folder, tables, *, exact=False):
                         continue
                     digest = hashlib.sha256(encode_row(row).encode('ascii')).hexdigest()
                     if digest != expected[1]:
-                        raise BackupError('Historical database values changed; keep collection paused.')
+                        if (
+                            exact
+                            or name != "ufw_log"
+                            or not _allowed_022_classification_change(
+                                row, layout, expected[1], baseline_022
+                            )
+                        ):
+                            raise BackupError(
+                                'Historical database values changed; keep collection paused.'
+                            )
                     matched += 1
                     line = original.readline()
                     expected = None
