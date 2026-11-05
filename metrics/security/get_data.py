@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from database.identity import configured_identity, identity_schema_enabled
+from database.ufw_history import active_filter
 
 
 def get_timestamp():
@@ -15,12 +16,17 @@ def utc_day_bounds(observed_at):
     return start, start + timedelta(days=1)
 
 
-def count_today(connection, sql_message, observed_at):
+def count_today(connection, sql_message, observed_at, *, ufw_events=False):
     if observed_at is None:
         observed_at = get_timestamp()
     start, end = utc_day_bounds(observed_at)
     # MySQL DATETIME parameters are UTC-naive only at this database boundary.
     parameters = (start.replace(tzinfo=None), end.replace(tzinfo=None))
+    if ufw_events:
+        utc_filter = active_filter(connection)
+        if not utc_filter:
+            raise ValueError("UFW UTC isolation migration is required for security metrics.")
+        sql_message += utc_filter
     cursor = connection.cursor()
     try:
         identity = configured_identity(cursor, "security")
@@ -48,7 +54,7 @@ def get_blocks_today(connection, observed_at=None):
     SELECT COUNT(*) AS block_count_today FROM ufw_log
     WHERE action = 'BLOCK' AND event_time >= %s AND event_time < %s
     """
-    return count_today(connection, sql_message, observed_at)
+    return count_today(connection, sql_message, observed_at, ufw_events=True)
 
 
 def get_unique_ips_today(connection, observed_at=None):
@@ -56,7 +62,7 @@ def get_unique_ips_today(connection, observed_at=None):
     SELECT COUNT(DISTINCT src_ip) AS unique_ips_today FROM ufw_log
     WHERE action = 'BLOCK' AND event_time >= %s AND event_time < %s
     """
-    return count_today(connection, sql_message, observed_at)
+    return count_today(connection, sql_message, observed_at, ufw_events=True)
 
 
 def get_uptime():

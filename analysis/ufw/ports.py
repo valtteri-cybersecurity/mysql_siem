@@ -78,6 +78,8 @@ def validate_ports_schema(connection, *, parallel=None):
             parallel = applied(connection)
         if parallel:
             expected_indexes['uq_ufw_ports_period'][1].append('time_basis')
+        if 'idx_analysis_time_basis' in indexes:
+            expected_indexes['idx_analysis_time_basis'] = (1, ['time_basis'])
         if indexes != expected_indexes:
             raise PortAnalysisError("analysis_ufw_ports: index mismatch; inspect database/schema.sql.")
         cursor.execute("""SELECT tc.constraint_name, tc.constraint_type, tc.enforced, cc.check_clause

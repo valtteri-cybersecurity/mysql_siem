@@ -123,6 +123,8 @@ def validate_source_ips_schema(connection, *, parallel=None):
             parallel = applied(connection)
         if parallel:
             expected_indexes['PRIMARY'][1].append('time_basis')
+        if 'idx_analysis_time_basis' in indexes:
+            expected_indexes['idx_analysis_time_basis'] = (1, ['time_basis'])
         if indexes != expected_indexes:
             raise SchemaError("analysis_source_ips: incompatible keys; inspect database/schema.sql.")
 

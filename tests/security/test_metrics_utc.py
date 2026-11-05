@@ -13,6 +13,14 @@ import pytest
 from metrics.security import database, get_data
 
 
+@pytest.fixture(autouse=True)
+def verified_ufw_schema(monkeypatch):
+    # Clock/SQL unit tests use the modern UFW schema; MySQL tests use the real helper.
+    policy = MagicMock(return_value=" AND time_basis = 'UTC_VERIFIED'")
+    monkeypatch.setattr(get_data, "active_filter", policy)
+    return policy
+
+
 @pytest.fixture
 def host_timezone(request):
     try:
@@ -303,3 +311,41 @@ def test_new_auth_types_and_publickey_keep_daily_ssh_failure_semantics(legacy_id
         assert get_data.get_failed_logins(connection, datetime(2026, 10, 22, 12, tzinfo=timezone.utc)) == 2
         cursor.close.assert_called_once()
         assert source.execute("SELECT COUNT(*) FROM auth_events").fetchone()[0] == 7
+
+
+@pytest.mark.parametrize("function", [get_data.get_blocks_today, get_data.get_unique_ips_today])
+def test_ufw_metrics_require_shared_utc_filter(function, legacy_identity, verified_ufw_schema):
+    connection = MagicMock()
+    connection.cursor.return_value.fetchone.return_value = (1,)
+    instant = datetime(2026, 11, 5, 12, tzinfo=timezone.utc)
+    assert function(connection, instant) == 1
+    verified_ufw_schema.assert_called_once_with(connection)
+    sql = connection.cursor.return_value.execute.call_args.args[0]
+    assert "AND time_basis = 'UTC_VERIFIED'" in sql
+    connection.commit.assert_not_called()
+
+
+@pytest.mark.parametrize("function", [get_data.get_blocks_today, get_data.get_unique_ips_today])
+def test_missing_ufw_isolation_blocks_counting(function, verified_ufw_schema):
+    verified_ufw_schema.return_value = ""
+    connection = MagicMock()
+    with pytest.raises(ValueError, match="UTC isolation migration"):
+        function(connection, datetime(2026, 11, 5, tzinfo=timezone.utc))
+    connection.cursor.assert_not_called()
+    connection.commit.assert_not_called()
+
+
+def test_ssh_metrics_do_not_use_ufw_filter(legacy_identity, verified_ufw_schema):
+    connection = MagicMock()
+    connection.cursor.return_value.fetchone.return_value = (2,)
+    assert get_data.get_failed_logins(connection, datetime(2026, 11, 5, tzinfo=timezone.utc)) == 2
+    verified_ufw_schema.assert_not_called()
+    assert "time_basis" not in connection.cursor.return_value.execute.call_args.args[0]
+
+
+def test_ufw_filter_database_error_does_not_return_zero(verified_ufw_schema):
+    verified_ufw_schema.side_effect = pymysql.OperationalError(2013, "synthetic failure")
+    connection = MagicMock()
+    with pytest.raises(pymysql.OperationalError):
+        get_data.get_blocks_today(connection, datetime(2026, 11, 5, tzinfo=timezone.utc))
+    connection.cursor.assert_not_called()

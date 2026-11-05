@@ -150,7 +150,7 @@ def test_parallel_history_full_preservation_recompute_empty_and_rollback(old_dat
     for table in migrate.HISTORY_TABLES:
         if table not in history.TABLES:
             protected[table] = all_rows(connection, table)
-    assert migrate.migrate(connection) == ['027']
+    assert migrate.migrate(connection) == ['027', '028']
     assert historical(connection) == before
     for table in history.TABLES:
         assert before[table]['count'] == 6
@@ -254,7 +254,7 @@ def test_interrupted_ddl_resumes_with_original_snapshots(old_database, monkeypat
             migrate.migrate(connection)
     assert historical(connection) == before
     assert migrate.migration_status(connection)['027'][1] == 'FAILED'
-    assert migrate.migrate(connection) == ['027']
+    assert migrate.migrate(connection) == ['027', '028']
     assert historical(connection) == before
     assert migrate.migrate(connection) == []
     health.verify_schema(connection)
@@ -269,6 +269,9 @@ def test_invalid_schema_or_proof_stops_without_data_changes(old_database, monkey
         if fault == 'wrong_unique':
             cursor.execute('ALTER TABLE analysis_ufw_ports DROP INDEX uq_ufw_ports_period, ADD UNIQUE KEY uq_ufw_ports_period (id,host_scope)')
         elif fault == 'missing_primary':
+            cursor.execute('SELECT * FROM analysis_source_ips '
+                           'ORDER BY period_start,period_end,source_ip,host_scope,time_basis')
+            original_source_rows = cursor.fetchall()
             cursor.execute('ALTER TABLE analysis_source_ips DROP PRIMARY KEY')
         elif fault == 'invalid_basis':
             cursor.execute("UPDATE analysis_ufw_ports SET time_basis='UNVERIFIED' LIMIT 1")
@@ -285,8 +288,9 @@ def test_invalid_schema_or_proof_stops_without_data_changes(old_database, monkey
         assert historical(connection) == before
     if fault == 'missing_primary':
         with connection.cursor() as cursor:
-            cursor.execute('SELECT COUNT(*) FROM analysis_source_ips')
-            assert cursor.fetchone() == (6,)
+            cursor.execute('SELECT * FROM analysis_source_ips '
+                           'ORDER BY period_start,period_end,source_ip,host_scope,time_basis')
+            assert cursor.fetchall() == original_source_rows
     assert migrate.migration_status(connection).get('027', (None, None))[1] != 'APPLIED'
 
 
@@ -333,3 +337,59 @@ def test_unrecorded_partial_key_is_not_accepted_as_original_history(old_database
     with pytest.raises(migrate.MigrationError, match='no original migration snapshot'):
         migrate.migrate(connection)
     assert historical(connection) == before
+
+
+def test_time_basis_indexes_resume_preserve_rows_and_use_range_access(old_database, monkeypatch):
+    connection, _, _ = old_database
+    assert through(connection, monkeypatch, '027') == ['027']
+    rows = []
+    for number in range(2000):
+        start = START + timedelta(days=30, hours=number)
+        rows.append((start, start + timedelta(hours=1)))
+    with connection.cursor() as cursor:
+        cursor.executemany('INSERT INTO analysis_ufw_traffic (period_start,period_end,'
+                           + ','.join(traffic.METRICS) + ',period_status) '
+                           "VALUES (%s,%s,0,0,0,0,0,0,0,0,0,0,'CLOSED')", rows)
+    connection.commit()
+    original = {}
+    for table in history.TABLES:
+        original[table] = all_rows(connection, table)
+    validate = keys.validate_table
+    completed = set()
+    def interrupt(connection, table, parallel):
+        validate(connection, table, parallel)
+        if keys.time_basis_index(connection, table):
+            completed.add(table)
+            if len(completed) == 2:
+                raise RuntimeError('synthetic index DDL interruption')
+    with monkeypatch.context() as stopped:
+        stopped.setattr(keys, 'validate_table', interrupt)
+        with pytest.raises(RuntimeError, match='synthetic index'):
+            migrate.migrate(connection)
+    assert migrate.migration_status(connection)['028'][1] == 'FAILED'
+    assert migrate.migrate(connection) == ['028']
+    assert migrate.migrate(connection) == []
+    for table in history.TABLES:
+        assert all_rows(connection, table) == original[table]
+        with connection.cursor() as cursor:
+            cursor.execute('EXPLAIN SELECT 1 FROM `' + table + '` FORCE INDEX (idx_analysis_time_basis) '
+                           "WHERE time_basis NOT IN ('HISTORICAL','UTC_VERIFIED') LIMIT 1")
+            names = []
+            for field in cursor.description:
+                names.append(field[0])
+            plan = dict(zip(names, cursor.fetchone()))
+            assert plan['key'] == 'idx_analysis_time_basis'
+            assert plan['type'] == 'range'
+            print('028_PLAN', table, plan['type'], plan['rows'], flush=True)
+            cursor.execute('UPDATE `' + table + "` SET time_basis='UNVERIFIED' LIMIT 1")
+        with pytest.raises(migrate.MigrationError, match='unknown analysis time_basis'):
+            keys.require_ready(connection, table)
+        connection.rollback()
+    run_all(connection)
+    with connection.cursor() as cursor:
+        cursor.execute('ALTER TABLE analysis_ufw_traffic DROP INDEX idx_analysis_time_basis')
+    with pytest.raises(migrate.MigrationError, match='index is missing'):
+        keys.require_ready(connection, 'analysis_ufw_traffic')
+    with connection.cursor() as cursor:
+        cursor.execute('ALTER TABLE analysis_ufw_traffic ADD INDEX idx_analysis_time_basis (time_basis)')
+    health.verify_schema(connection)

@@ -49,6 +49,7 @@ MIGRATIONS = (
     ("025", "ufw_continuity", ROOT / "migrations/025_ufw_continuity.sql"),
     ("026", "ufw_filtering", ROOT / "migrations/026_ufw_filtering.sql"),
     ("027", "ufw_analysis_parallel_time_basis", ROOT / "migrations/027_ufw_analysis_parallel_time_basis.sql"),
+    ("028", "ufw_analysis_time_basis_indexes", ROOT / "migrations/028_ufw_analysis_time_basis_indexes.sql"),
 )
 
 
@@ -82,8 +83,19 @@ SNAPSHOT_STATE_TABLES = frozenset((
 ))
 
 
-def requires_monotonic_history_count(table):
-    """Require nondecreasing counts for historical tables."""
+# Operators may remove these rules through the supported DNS APIs.
+# This exception applies only to old ledger counts, never to an active migration
+# or the verified backup captured for the current upgrade.
+DNS_CONFIGURATION_TABLES = frozenset((
+    "dns_client_filters",
+    "dns_domain_filters",
+))
+
+
+def requires_monotonic_history_count(table, *, across_upgrades=False):
+    """Distinguish old configuration counts from current migration invariants."""
+    if across_upgrades and table in DNS_CONFIGURATION_TABLES:
+        return False
     return table not in SNAPSHOT_STATE_TABLES
 
 
@@ -541,6 +553,10 @@ def apply_one(connection, version):
     elif version == "020":
         from database.audit_migrations import upgrade_audit
         upgrade_audit(connection, ROOT / "migrations/020_audit.sql")
+
+    elif version == "028":
+        from database.ufw_analysis_keys import upgrade_time_basis_indexes
+        upgrade_time_basis_indexes(connection)
 
     elif version == "027":
         from database.ufw_analysis_keys import upgrade

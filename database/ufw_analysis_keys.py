@@ -43,6 +43,40 @@ def key_state(connection, table):
     raise MigrationError('027: incompatible or missing analysis key: ' + table + '.' + name)
 
 
+def time_basis_index(connection, table):
+    """Recognize only the complete, visible index used by migration 028."""
+    from database.migrate import MigrationError
+    if table not in KEYS:
+        raise ValueError('Unknown analysis table.')
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT column_name,non_unique,sub_part,is_visible,index_type '
+                       'FROM information_schema.statistics WHERE table_schema=DATABASE() '
+                       "AND table_name=%s AND index_name='idx_analysis_time_basis' ORDER BY seq_in_index", (table,))
+        rows = cursor.fetchall()
+    if not rows:
+        return False
+    if rows != (('time_basis', 1, None, 'YES', 'BTREE'),):
+        raise MigrationError('028: incompatible time_basis index: ' + table)
+    return True
+
+
+def upgrade_time_basis_indexes(connection):
+    """Resume additive index DDL without changing any historical rows."""
+    from database.migrate import ROOT, MigrationError
+    if not applied(connection):
+        raise MigrationError('028 requires completed migration 027.')
+    dependencies(connection)
+    for table in history.TABLES:
+        validate_table(connection, table, True)
+    statements = (ROOT / 'migrations/028_ufw_analysis_time_basis_indexes.sql').read_text().split(';')
+    for table, statement in zip(history.TABLES, statements):
+        if not time_basis_index(connection, table):
+            with connection.cursor() as cursor:
+                cursor.execute(statement.strip())
+        validate_table(connection, table, True)
+    dependencies(connection)
+
+
 def validate_table(connection, table, parallel):
     from analysis.ufw.ports import validate_ports_schema
     from analysis.ufw.traffic import validate_traffic_schema
@@ -54,8 +88,17 @@ def validate_table(connection, table, parallel):
         validate_ports_schema(connection, parallel=parallel)
     else:
         validate_traffic_schema(connection, parallel=parallel, only_table=table)
+    index_hint = ''
+    if time_basis_index(connection, table):
+        index_hint = ' FORCE INDEX (idx_analysis_time_basis)'
+    else:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT status FROM schema_migrations WHERE version='028'")
+            if cursor.fetchone() == ('APPLIED',):
+                raise MigrationError('028: applied time_basis index is missing: ' + table)
     with connection.cursor() as cursor:
-        cursor.execute('SELECT /*+ MAX_EXECUTION_TIME(5000) */ 1 FROM `' + table + "` WHERE time_basis NOT IN ('HISTORICAL','UTC_VERIFIED') LIMIT 1")
+        cursor.execute('SELECT /*+ MAX_EXECUTION_TIME(5000) */ 1 FROM `' + table + '`' + index_hint
+                       + " WHERE time_basis NOT IN ('HISTORICAL','UTC_VERIFIED') LIMIT 1")
         if cursor.fetchone() is not None:
             raise MigrationError('027: unknown analysis time_basis: ' + table)
         cursor.execute('SELECT referenced_table_name,referenced_column_name FROM information_schema.key_column_usage '

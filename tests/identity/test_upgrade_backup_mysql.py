@@ -21,6 +21,26 @@ from database.identity import (
 )
 
 
+def test_empty_table_sequence_metadata_is_read_live(empty_mysql):
+    with empty_mysql.cursor() as cursor:
+        cursor.execute('CREATE TABLE fresh_ids (id BIGINT UNSIGNED NOT NULL '
+                       'AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB')
+        cursor.execute('CREATE TABLE reserved_ids (id BIGINT UNSIGNED NOT NULL '
+                       'AUTO_INCREMENT PRIMARY KEY) ENGINE=InnoDB AUTO_INCREMENT=25001')
+        cursor.execute('CREATE TABLE fixed_ids (id BIGINT UNSIGNED NOT NULL PRIMARY KEY) ENGINE=InnoDB')
+        cursor.execute('SELECT SUM(data_length + index_length) FROM information_schema.tables '
+                       'WHERE table_schema=DATABASE()')
+        cursor.fetchone()
+    layout = backup.table_layout(empty_mysql)
+    assert layout['fresh_ids']['auto_increment_next'] == 1
+    assert layout['reserved_ids']['auto_increment_next'] == 25001
+    assert layout['fixed_ids']['auto_increment_next'] is None
+    with empty_mysql.cursor() as cursor:
+        for table in ('fresh_ids', 'reserved_ids', 'fixed_ids'):
+            cursor.execute('SELECT COUNT(*) FROM ' + table)
+            assert cursor.fetchone() == (0,)
+
+
 def test_dump_restore_and_additive_upgrade_preserve_identifiers_and_settings(identity_server, tmp_path, monkeypatch):
     connection = pymysql.connect(unix_socket=identity_server, user='root', autocommit=True,
                                  charset='utf8mb4', read_timeout=30, write_timeout=30,
@@ -97,7 +117,7 @@ def test_dump_restore_and_additive_upgrade_preserve_identifiers_and_settings(ide
 
             for version in (
                 '021', '022', '023', '024',
-                '025', '026', '027'
+                '025', '026', '027', '028'
             ):
                 assert statuses[version][1] == 'APPLIED'
 

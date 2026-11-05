@@ -94,3 +94,27 @@ def test_raw_isolation_mismatch_cannot_authorize_utc_writes(monkeypatch, column)
         keys.require_ready(connection, 'analysis_source_ips')
     for call in cursor.execute.call_args_list:
         assert call.args[0].startswith('SELECT ')
+
+
+@pytest.mark.parametrize('rows,expected', [
+    ((), False),
+    ((('time_basis', 1, None, 'YES', 'BTREE'),), True),
+])
+def test_time_basis_index_requires_exact_definition(rows, expected):
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchall.return_value = rows
+    assert keys.time_basis_index(connection, 'analysis_ufw_traffic') is expected
+
+
+@pytest.mark.parametrize('row', [
+    ('host_scope', 1, None, 'YES', 'BTREE'),
+    ('time_basis', 0, None, 'YES', 'BTREE'),
+    ('time_basis', 1, 5, 'YES', 'BTREE'),
+    ('time_basis', 1, None, 'NO', 'BTREE'),
+])
+def test_incompatible_time_basis_index_is_rejected(row):
+    connection = MagicMock()
+    connection.cursor.return_value.__enter__.return_value.fetchall.return_value = (row,)
+    with pytest.raises(MigrationError, match='028'):
+        keys.time_basis_index(connection, 'analysis_ufw_traffic')

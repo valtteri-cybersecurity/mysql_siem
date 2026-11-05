@@ -96,9 +96,10 @@ def check_baseline(connection, table, fields, baseline):
             raise MigrationError('Current upgrade baseline changed or rows disappeared: ' + table)
 
 
-def check_counts(connection, saved, current):
+def check_counts(connection, saved, current, *, across_upgrades=True):
     """Counts can prove a deficit, never original event identities."""
     from database.migrate import (
+        DNS_CONFIGURATION_TABLES,
         HISTORY_TABLES,
         SNAPSHOT_STATE_TABLES,
         MigrationError,
@@ -120,8 +121,11 @@ def check_counts(connection, saved, current):
                 'Snapshot state table disappeared: ' + table
             )
 
+        if table in DNS_CONFIGURATION_TABLES and table in saved and table not in current:
+            raise MigrationError('DNS configuration table disappeared: ' + table)
+
         if (
-            requires_monotonic_history_count(table)
+            requires_monotonic_history_count(table, across_upgrades=across_upgrades)
             and current.get(table, 0) < expected
         ):
             raise MigrationError(
@@ -258,7 +262,7 @@ def preflight(connection):
                 saved = json.loads(row[0])
             except (ValueError, TypeError):
                 raise MigrationError('Migration history counts are invalid.') from None
-            check_counts(connection, saved, current)
+            check_counts(connection, saved, current, across_upgrades=state == 'APPLIED')
             required = ('ufw_log',) + ANALYSIS_TABLES + ('detection_state', 'detection_alerts', 'alert_evidence')
             for table in required:
                 if table not in saved:
@@ -309,7 +313,7 @@ def preflight(connection):
         with connection.cursor() as cursor:
             cursor.execute("SELECT row_counts FROM schema_migrations WHERE version='023'")
             analysis_saved = json.loads(cursor.fetchone()[0])
-        check_counts(connection, analysis_saved, current)
+        check_counts(connection, analysis_saved, current, across_upgrades=analysis_state == 'APPLIED')
         verify(connection, analysis_saved[ANALYSIS_KEY], final=analysis_state == 'APPLIED')
     from database.ufw_analysis_keys import preflight as parallel_preflight
     parallel_preflight(connection)

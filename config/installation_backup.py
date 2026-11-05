@@ -117,6 +117,8 @@ def global_objects_digest(connection):
 def table_layout(connection):
     result = {}
     with connection.cursor() as cursor:
+        # Sequence preservation must use live engine metadata, not cached stats.
+        cursor.execute('SET SESSION information_schema_stats_expiry=0')
         cursor.execute('SELECT table_name, engine, table_type FROM information_schema.tables '
                        'WHERE table_schema = DATABASE() ORDER BY table_name')
         tables = cursor.fetchall()
@@ -140,6 +142,10 @@ def table_layout(connection):
             if not primary:
                 raise BackupError('Upgrade backup requires stable table primary keys; review this schema offline.')
             ddl = schema_digest(cursor, name)
+            # Opening the definition initializes an empty InnoDB table's lazy
+            # sequence metadata; otherwise its next ID can incorrectly be NULL.
+            cursor.execute('SHOW CREATE TABLE ' + identifier(name))
+            cursor.fetchone()
             cursor.execute(
                 'SELECT auto_increment FROM information_schema.tables '
                 'WHERE table_schema=DATABASE() AND table_name=%s',

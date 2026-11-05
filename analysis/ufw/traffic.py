@@ -226,5 +226,7 @@ def validate_traffic_schema(connection, *, parallel=None, only_table=None):
                 parallel = applied(connection)
             if parallel:
                 expected_indexes['uq_traffic_period'][1].append('time_basis')
+            if 'idx_analysis_time_basis' in indexes:
+                expected_indexes['idx_analysis_time_basis'] = (1, ['time_basis'])
             if indexes != expected_indexes:
                 raise TrafficAnalysisError(f"{table}: incompatible period keys; inspect database/schema.sql.")

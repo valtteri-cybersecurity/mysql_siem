@@ -57,7 +57,10 @@ def ufw_line(index=0):
 
 
 def test_empty_database_and_repeat_run(empty_mysql):
-    assert migrations.migrate(empty_mysql) == ["013", "014", "015", "016", "017", "018", "019", "020", "021", "022"]
+    assert migrations.migrate(empty_mysql) == [
+        "013", "014", "015", "016", "017", "018", "019", "020",
+        "021", "022", "023", "024", "025", "026", "027", "028",
+    ]
     assert migrations.migrate(empty_mysql) == []
     assert {state for _, state in migrations.migration_status(empty_mysql).values()} == {"APPLIED"}
 
@@ -69,7 +72,12 @@ def snapshot(connection, table, fields):
 
 
 def test_all_legacy_rows_ids_timestamps_hashes_and_counts_survive(empty_mysql, monkeypatch):
-    monkeypatch.setattr(migrations, "MIGRATIONS", migrations.MIGRATIONS[:-1])
+    # This fixture tests the original identity chain, before UFW isolation.
+    identity_migrations = []
+    for migration in migrations.MIGRATIONS:
+        if migration[0] <= "021":
+            identity_migrations.append(migration)
+    monkeypatch.setattr(migrations, "MIGRATIONS", tuple(identity_migrations))
     connection = empty_mysql
     tables, rules = read_schema()
     ensure_tables(connection, tuple(tables), rule_keys=tuple(rules))
