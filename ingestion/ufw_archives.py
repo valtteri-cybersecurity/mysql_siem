@@ -152,8 +152,41 @@ def discover(logfile):
     return result
 
 
+def valid_digest(value):
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    for character in value:
+        if character not in '0123456789abcdef':
+            return False
+    return True
+
+
+def discard_partial(folder, digest):
+    """Remove only a private, singly linked collector temporary; never follow links."""
+    if not valid_digest(digest):
+        raise ValueError('INVALID_ARCHIVE_ID')
+    path = folder / (digest + '.part')
+    try:
+        fd = private_file(path)
+    except FileNotFoundError:
+        return
+    try:
+        opened = os.fstat(fd)
+        try:
+            named = path.lstat()
+        except FileNotFoundError:
+            return
+        if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+            raise OSError('UNSAFE_ARCHIVE_CACHE_FILE')
+        path.unlink()
+    finally:
+        os.close(fd)
+
+
 def worker(filename, folder, digest):
     """No database credentials or external commands; nothing is ingestible before EOF CRC."""
+    if not valid_digest(digest):
+        raise ValueError('INVALID_ARCHIVE_ID')
     folder = Path(folder)
     manifest = folder / (digest + '.json')
     data = folder / (digest + '.data')
@@ -164,17 +197,17 @@ def worker(filename, folder, digest):
         if actual != digest:
             raise OSError('ARCHIVE_CHANGED')
         used = 0
+        # The inherited single-worker lock excludes another active extraction.
+        # Reclaim crashed/failed extractions before reserving space for new data.
         for path in folder.iterdir():
+            if path.suffix == '.part' and valid_digest(path.stem):
+                discard_partial(folder, path.stem)
+                continue
             info = path.lstat()
             if stat.S_ISREG(info.st_mode):
                 used += info.st_size
         if used + MAX_EXPANDED > MAX_CACHE or shutil.disk_usage(folder).free < MAX_EXPANDED + RESERVE_FREE:
             raise OSError('ARCHIVE_DISK_LIMIT')
-        # A crashed extraction has never published READY or ingestion offsets.
-        if temporary.exists():
-            fd = private_file(temporary)
-            os.close(fd)
-            temporary.unlink()
         count = 0
         expanded_hash = hashlib.sha256()
         with os.fdopen(regular(filename), 'rb') as source:
@@ -216,17 +249,19 @@ def worker(filename, folder, digest):
                                              'ARCHIVE_DECOMPRESSION_TIME_LIMIT', 'ARCHIVE_HASH_TIME_LIMIT',
                                              'ARCHIVE_COMPRESSED_LIMIT', 'ARCHIVE_WALL_TIME_LIMIT'):
             reason = error.args[0]
-        write_manifest(manifest, {'status': 'ERROR', 'class': type(error).__name__, 'reason': reason})
+        record = {'status': 'ERROR', 'class': type(error).__name__, 'reason': reason}
+        try:
+            discard_partial(folder, digest)
+        except OSError as cleanup_error:
+            record['cleanup_error'] = type(cleanup_error).__name__
+        write_manifest(manifest, record)
         return 1
     return 0
 
 
 def prepare(filename, digest):
-    if len(digest) != 64:
+    if not valid_digest(digest):
         raise ValueError('INVALID_ARCHIVE_ID')
-    for character in digest:
-        if character not in '0123456789abcdef':
-            raise ValueError('INVALID_ARCHIVE_ID')
     folder = cache_directory()
     manifest = folder / (digest + '.json')
     record = read_manifest(manifest)
@@ -260,8 +295,9 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
     import pymysql
 
     from database.identity import configured_identity
-    from ingestion.ufw_batch import EventBatch
-    from ingestion.ufw_continuity import gap, prove_archive
+    from ingestion.ufw_batch import EventBatch, OccurrenceConflict
+    from ingestion.ufw_continuity import gap, prove_archive, record_proof
+    from ingestion.ufw_lineage import archive_binding, output_job, verify_binding
     from ingestion.ufw_records import process_line
     from ingestion.ufw_to_mysql import MAX_LINE_BYTES
 
@@ -278,13 +314,31 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
     candidates = discover(logfile)
     for index, (_number, filename) in enumerate(candidates):
         if time.monotonic() >= deadline:
-            totals['archives_unscanned'] = len(candidates) - index
+            totals['archives_unscanned'] += len(candidates) - index
             break
+        job = None
         try:
+            with os.fdopen(regular(filename), 'rb') as candidate:
+                candidate_info = os.fstat(candidate.fileno())
+            with connection.cursor() as cursor:
+                job = output_job(cursor, scope, candidate_info)
+            if candidate_info.st_size == 0 or (job is not None and job[0] != 'READY'):
+                totals['archives_unscanned'] += 1
+                continue
             digest, info = identify_archive(filename, deadline)
+            with connection.cursor() as cursor:
+                binding = archive_binding(cursor, scope, digest)
+            if job is not None and job[1:] != (digest, info[2]):
+                raise OccurrenceConflict('UFW_MANAGED_ARCHIVE_CHANGED')
+            if binding is not None and binding[4] != info[2]:
+                raise OccurrenceConflict('UFW_ARCHIVE_LINEAGE_CONTENT_CHANGED')
         except OSError as error:
+            if job is not None and job[0] == 'READY' and error.args == ('ARCHIVE_CHANGED',):
+                # Logrotate may still be applying owner/mode/times after compression.
+                totals['archives_unscanned'] += 1
+                continue
             if error.args and error.args[0] == 'ARCHIVE_HASH_TIME_LIMIT':
-                totals['archives_unscanned'] = len(candidates) - index
+                totals['archives_unscanned'] += len(candidates) - index
                 break
             failure_key = hashlib.sha256(os.fsencode(filename)).hexdigest()
             with connection.cursor() as cursor:
@@ -299,10 +353,25 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
             print(f'UFW archive: FAILED class={type(error).__name__} stage=discovery file={filename!r}')
             continue
         with connection.cursor() as cursor:
-            cursor.execute('SELECT status FROM ufw_archives WHERE source_scope=%s AND archive_sha=%s', (scope, digest))
-            if cursor.fetchone() is None:
-                cursor.execute('INSERT INTO ufw_archives (source_scope,archive_sha,filename,file_device,file_inode) '
-                               'VALUES (%s,%s,%s,%s,%s)', (scope, digest, filename, info[0], info[1]))
+            cursor.execute('SELECT status,file_device,file_inode,file_mtime_ns FROM ufw_archives WHERE source_scope=%s AND archive_sha=%s', (scope, digest))
+            existing = cursor.fetchone()
+            if existing is not None and binding is not None:
+                # An exact copy of a producer-recorded artifact is a proven replay.
+                cursor.execute('UPDATE ufw_archives SET filename=%s,file_device=%s,file_inode=%s,file_mtime_ns=%s '
+                               'WHERE source_scope=%s AND archive_sha=%s',
+                               (filename, info[0], info[1], info[3], scope, digest))
+            elif existing is not None:
+                if existing[1:3] != (info[0], info[1]):
+                    gap(cursor, scope, 0, 'AMBIGUOUS_SOURCE', filename)
+                    connection.commit()
+                    raise OccurrenceConflict('UFW_AMBIGUOUS_ARCHIVE_COPY')
+                if existing[3] is not None and existing[3] != info[3]:
+                    gap(cursor, scope, 0, 'AMBIGUOUS_SOURCE', filename)
+                    connection.commit()
+                    raise OccurrenceConflict('UFW_AMBIGUOUS_ARCHIVE_GENERATION')
+            if existing is None:
+                cursor.execute('INSERT INTO ufw_archives (source_scope,archive_sha,filename,file_device,file_inode,file_mtime_ns) '
+                               'VALUES (%s,%s,%s,%s,%s,%s)', (scope, digest, filename, info[0], info[1], info[3]))
         connection.commit()
     with connection.cursor() as cursor:
         cursor.execute("SELECT COUNT(*) FROM ufw_archives WHERE source_scope=%s AND status <> 'COMPLETE'", (scope,))
@@ -336,7 +405,13 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
                     raise OSError('ARCHIVE_SPOOL_CHANGED')
                 connection.begin()
                 with connection.cursor() as cursor:
-                    writer = EventBatch(cursor, identity, connection.__dict__.get('_siem_ufw_policy'), part)
+                    binding = archive_binding(cursor, scope, digest)
+                    verify_binding(binding, record)
+                    generation = bytes.fromhex(digest)
+                    if binding is not None:
+                        generation = binding[1]
+                    writer = EventBatch(cursor, identity, connection.__dict__.get('_siem_ufw_policy'), part,
+                                        generation=generation)
                     prove_archive(cursor, source, scope, digest, record['signature'][2], deadline)
                     source.seek(position)
                     while part['lines_read'] < min(1000, max_lines - totals['lines_read']):
@@ -360,9 +435,7 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
                         new_status = 'COMPLETE'
                     if signature(os.fstat(source.fileno())) != record['signature']:
                         raise OSError('ARCHIVE_SPOOL_CHANGED')
-                    cursor.execute('INSERT INTO ufw_archive_proofs (source_scope,archive_sha,expanded_size,expanded_sha) '
-                                   'VALUES (%s,%s,%s,%s) ON DUPLICATE KEY UPDATE archive_sha=VALUES(archive_sha)',
-                                   (scope, digest, record['signature'][2], record['expanded_sha256']))
+                    record_proof(cursor, scope, digest, record['signature'][2], record['expanded_sha256'])
                     cursor.execute('UPDATE ufw_archives SET logical_position=%s,status=%s,checked_at=CURRENT_TIMESTAMP(6) '
                                    'WHERE source_scope=%s AND archive_sha=%s', (position, new_status, scope, digest))
                 connection.commit()
@@ -375,6 +448,8 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
             connection.rollback()
             if isinstance(error, pymysql.MySQLError):
                 totals['archive_errors'] += 1
+            if isinstance(error, OccurrenceConflict):
+                print('UFW archive stopped: ' + str(error))
             print(f'UFW archive: FAILED class={type(error).__name__} stage=archive file={filename!r} position={position}')
             # Checkpoints and previously committed events are preserved on every failure.
             if not isinstance(error, pymysql.MySQLError):

@@ -50,6 +50,8 @@ MIGRATIONS = (
     ("026", "ufw_filtering", ROOT / "migrations/026_ufw_filtering.sql"),
     ("027", "ufw_analysis_parallel_time_basis", ROOT / "migrations/027_ufw_analysis_parallel_time_basis.sql"),
     ("028", "ufw_analysis_time_basis_indexes", ROOT / "migrations/028_ufw_analysis_time_basis_indexes.sql"),
+    ("029", "ufw_occurrences", ROOT / "ufw_occurrence_schema.py"),
+    ("030", "ufw_archive_lineage", ROOT / "ufw_archive_lineage_schema.py"),
 )
 
 
@@ -66,6 +68,7 @@ HISTORY_TABLES = EVENT_TABLES + ANALYSIS_TABLES + (
     "detection_alerts",
     "alert_evidence",
     "detection_state",
+    "ufw_compression_jobs", "ufw_archive_lineage",
     "ufw_state", "ufw_archive_failures", "ufw_quarantine", "ufw_quarantine_origins", "ufw_archives",
     "ufw_file_checkpoints", "ufw_collection_gaps", "ufw_archive_proofs", "ufw_collection_health",
     "ufw_filter_rules", "ufw_filter_audit", "ufw_filter_seen", "ufw_filter_stats",
@@ -195,6 +198,12 @@ def check_migration_history(connection):
     if records.get('027', (None, None))[1] == 'APPLIED':
         from database.ufw_analysis_keys import preflight
         preflight(connection)
+    if records.get('029', (None, None))[1] == 'APPLIED':
+        from database.ufw_occurrence_schema import verify
+        verify(connection)
+    if records.get('030', (None, None))[1] == 'APPLIED':
+        from database.ufw_archive_lineage_schema import verify
+        verify(connection)
     return records
 
 
@@ -553,6 +562,14 @@ def apply_one(connection, version):
     elif version == "020":
         from database.audit_migrations import upgrade_audit
         upgrade_audit(connection, ROOT / "migrations/020_audit.sql")
+
+    elif version == "030":
+        from database.ufw_archive_lineage_schema import upgrade
+        upgrade(connection)
+
+    elif version == "029":
+        from database.ufw_occurrence_schema import upgrade
+        upgrade(connection)
 
     elif version == "028":
         from database.ufw_analysis_keys import upgrade_time_basis_indexes

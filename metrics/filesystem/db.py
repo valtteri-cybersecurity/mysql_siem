@@ -1,7 +1,5 @@
 from datetime import datetime
 
-import pymysql
-
 from database.connection import get_connection
 from database.identity import configured_identity, identity_schema_enabled
 
@@ -11,7 +9,7 @@ def save_metrics(modified_last_day, total_files):
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     if connection is None:
-        return
+        raise ValueError("Database connection failed.")
 
     cursor = None
 
@@ -45,13 +43,14 @@ def save_metrics(modified_last_day, total_files):
 
         print(f"{timestamp}:   Data written successfully")
 
-    except pymysql.DatabaseError:
-        print(f"{timestamp}:   Error writing into database")
+    except BaseException:
         connection.rollback()
+        raise
 
     finally:
-        if cursor:
-            cursor.close()
-
-        connection.close()
+        try:
+            if cursor:
+                cursor.close()
+        finally:
+            connection.close()
         print(f"{timestamp}:   Database connection closed")

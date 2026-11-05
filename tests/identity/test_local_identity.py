@@ -161,7 +161,7 @@ def test_required_identity_cannot_fall_back_to_inherited_values(tmp_path):
 
 
 @pytest.mark.parametrize('operation', ['reset', 'upgrade'])
-@pytest.mark.parametrize('failure', [None, 'prepare', 'verify', 'published-verify', 'audit-activate', 'health'])
+@pytest.mark.parametrize('failure', [None, 'prepare', 'verify', 'published-verify', 'audit-activate', 'rotation-apply', 'health', 'rotation-commit'])
 def test_installer_verifies_identity_before_publication_and_cron(operation, failure):
     lines = (Path(__file__).resolve().parents[2] / 'install.sh').read_text().splitlines()
     commands = (
@@ -170,6 +170,7 @@ def test_installer_verifies_identity_before_publication_and_cron(operation, fail
         'audit_installation prepare', 'activate_service_installation',
         'local_identity_setup schedule --cron-file "$CRON_TMP"',
         'crontab -u "$INSTALL_USER" "$CRON_TMP"', 'audit_installation activate', 'verify_installation_health', 'local_identity_setup finish',
+        'UFW_ROTATION_STARTED="$(ufw_rotation apply)"', 'ufw_rotation commit',
     )
     positions = {}
     for number, line in enumerate(lines):
@@ -188,7 +189,9 @@ def test_installer_verifies_identity_before_publication_and_cron(operation, fail
     finish = positions['local_identity_setup finish'][0]
     activation = positions['audit_installation activate'][0]
     health = positions['verify_installation_health'][0]
-    assert begin < reset_begin < prepare < verify < publish < published_verify < schedule < cron < activation < health < finish
+    rotation_apply = positions['UFW_ROTATION_STARTED="$(ufw_rotation apply)"'][0]
+    rotation_commit = positions['ufw_rotation commit'][0]
+    assert begin < reset_begin < prepare < verify < publish < published_verify < schedule < cron < activation < rotation_apply < health < rotation_commit < finish
     condition = 'if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then'
     assert lines[begin - 1].strip() == condition
     assert lines[reset_begin + 1].strip() == 'fi'
@@ -220,6 +223,10 @@ audit_installation() {
     printf 'audit:%s\n' "$*"
     if [[ "$1" == activate && "$FAILURE" == audit-activate ]]; then return 23; fi
 }
+ufw_rotation() {
+    [[ "$FAILURE" != "rotation-$1" ]] || return 23
+    if [[ "$1" == apply ]]; then printf 0; fi
+}
 verify_installation_health() { printf 'health\n'; [[ "$FAILURE" != health ]] || return 23; }
 crontab() { printf 'cron\n'; }
 '''
@@ -237,9 +244,9 @@ crontab() { printf 'cron\n'; }
         expected = expected[:3]
     elif failure == 'published-verify':
         expected = expected[:6]
-    elif failure == 'audit-activate':
+    elif failure in ('audit-activate', 'rotation-apply'):
         expected = expected[:9]
-    elif failure == 'health':
+    elif failure in ('health', 'rotation-commit'):
         expected = expected[:10]
     assert result.returncode == (23 if failure else 0), result.stderr
     assert result.stdout.splitlines() == expected

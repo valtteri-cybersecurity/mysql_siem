@@ -79,16 +79,21 @@ def _find_scan_windows(events):
     """Find qualifying windows and merge those sharing at least one event."""
     scan_windows = []
     window_start = 0
+    port_counts = {}
 
     for window_end, event in enumerate(events):
+        # Each sorted event enters and leaves the window at most once.
         while event["event_time"] - events[window_start]["event_time"] > WINDOW:
+            old_port = events[window_start]["dst_port"]
+            port_counts[old_port] -= 1
+            if port_counts[old_port] == 0:
+                del port_counts[old_port]
             window_start += 1
 
-        ports = set()
-        for window_event in events[window_start:window_end + 1]:
-            ports.add(window_event["dst_port"])
+        port = event["dst_port"]
+        port_counts[port] = port_counts.get(port, 0) + 1
 
-        if len(ports) < MIN_DISTINCT_PORTS:
+        if len(port_counts) < MIN_DISTINCT_PORTS:
             continue
 
         if scan_windows and window_start <= scan_windows[-1][1]:

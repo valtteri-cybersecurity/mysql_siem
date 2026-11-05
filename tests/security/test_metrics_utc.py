@@ -197,8 +197,9 @@ def test_failed_query_closes_cursor_and_does_not_return_a_false_zero(legacy_iden
 def test_writer_rolls_back_on_driver_failure(legacy_identity):
     connection = MagicMock()
     connection.cursor.return_value.execute.side_effect = pymysql.OperationalError(2013, "lost")
-    database.save_metrics_db(connection, {"uptime": 1, "blocks": 2, "failed_logins": 3,
-                                         "unique_ips": 4, "date": datetime(2026, 10, 23, tzinfo=timezone.utc)})
+    with pytest.raises(pymysql.OperationalError):
+        database.save_metrics_db(connection, {"uptime": 1, "blocks": 2, "failed_logins": 3,
+                                             "unique_ips": 4, "date": datetime(2026, 10, 23, tzinfo=timezone.utc)})
     connection.rollback.assert_called_once()
     connection.commit.assert_not_called()
     connection.cursor.return_value.close.assert_called_once()
@@ -213,7 +214,7 @@ def test_missing_auth_events_is_reported_by_existing_entry_point(monkeypatch, ca
     save = MagicMock()
     monkeypatch.setattr(main, "get_data", collect)
     monkeypatch.setattr(main, "save_metrics_db", save)
-    main.main()
+    assert main.main() == 1
     save.assert_not_called()
     connection.close.assert_called_once()
     assert "Security metric collection failed." in capsys.readouterr().out

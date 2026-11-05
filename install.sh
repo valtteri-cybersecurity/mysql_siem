@@ -210,7 +210,19 @@ activate_service_installation() {
     cd -- "$PROJECT_DIR"
 }
 
+ufw_rotation() {
+    /usr/bin/python3 -I -B - "$SOURCE_DIR" "$@" <<'PY_UFW_ROTATION'
+import sys
+sys.path.insert(0, sys.argv[1])
+from config.ufw_rotation import main
+raise SystemExit(main(sys.argv[2:]))
+PY_UFW_ROTATION
+}
+
 cleanup_prepared_installation() {
+    if [[ "${UFW_ROTATION_STARTED:-0}" == 1 ]]; then
+        ufw_rotation rollback || warn "UFW rotation configuration requires recovery review; original configuration receipt was retained."
+    fi
     if [[ "${RESET_RECOVERY_CHECK_ACTIVE:-0}" == 1 && "${SERVICE_PUBLISHED:-0}" != 1 ]]; then
         warn "RESET recovery could not be verified; staged settings and recovery journal were retained. No destructive fallback was attempted."
         return
@@ -307,7 +319,7 @@ select_mysql_package() {
 install_dependencies() {
     local packages=(
         python3 python3-venv
-        rsyslog cron ca-certificates openssl coreutils
+        rsyslog cron logrotate ca-certificates openssl coreutils
     )
     if [[ -n "$MYSQL_PACKAGE" ]]; then
         packages+=("$MYSQL_PACKAGE")
@@ -702,6 +714,11 @@ for path in \
     ingestion/dns/main.py \
     ingestion/ufw_to_mysql.py \
     ingestion/ufw_archives.py \
+    ingestion/ufw_compress.py \
+    ingestion/ufw_lineage.py \
+    database/ufw_archive_lineage_schema.py \
+    config/ufw_rotation.py \
+    config/ufw-compress.sh \
     ingestion/ufw_records.py \
     ingestion/ufw_validation.py \
     ingestion/ufw_continuity.py \
@@ -822,6 +839,7 @@ if [[ "$INSTALL_OPERATION" == reset ]]; then
     [[ "$RESET_RECOVERY" == 0 || "$RESET_RECOVERY" == 1 ]] || die "Unexpected RESET recovery result; database was preserved."
     RESET_RECOVERY_CHECK_ACTIVE=0
 fi
+ufw_rotation check
 service_installation snapshot-logs-check "$INSTALL_USER"
 audit_installation permissions --operation "$INSTALL_OPERATION"
 audit_installation check --operation "$INSTALL_OPERATION"
@@ -959,6 +977,8 @@ grants = {
     'ufw_quarantine': 'SELECT, INSERT',
     'ufw_quarantine_origins': 'SELECT, INSERT',
     'ufw_archives': 'SELECT, INSERT, UPDATE',
+    'ufw_compression_jobs': 'SELECT, INSERT, UPDATE',
+    'ufw_archive_lineage': 'SELECT, INSERT',
     'ufw_archive_failures': 'SELECT, INSERT',
     'ufw_file_checkpoints': 'SELECT, INSERT, UPDATE',
     'ufw_collection_gaps': 'SELECT, INSERT, UPDATE',
@@ -1198,7 +1218,9 @@ crontab -u "$INSTALL_USER" "$CRON_TMP"
 # Audit uses a fixed status preflight then permanently drops root. The service
 # account receives no sudo/capabilities and all DB work uses run_with_env.sh.
 audit_installation activate
+UFW_ROTATION_STARTED="$(ufw_rotation apply)"
 verify_installation_health
+ufw_rotation commit
 local_identity_setup finish
 unset SIEM_INSTALL_MAINTENANCE
 rm -f "$CRON_TMP"

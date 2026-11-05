@@ -14,7 +14,7 @@ def main():
 
         if not connection:
             print(f"{timestamp}:   Connection to the database failed.")
-            return
+            return 1
 
         data = get_data()
 
@@ -22,9 +22,13 @@ def main():
             save_metrics_db(connection, data)
         else:
             print(f"{timestamp}:   No measurement data received.")
+            return 1
+
+        return 0
 
     except (OSError, ValueError, pymysql.MySQLError):
         print(f"{timestamp}:   System metric collection failed.")
+        return 1
 
     finally:
         if connection:
@@ -33,4 +37,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

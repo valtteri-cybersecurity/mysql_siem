@@ -142,6 +142,7 @@ def test_role_cron_selection_and_repeatable_managed_block(tmp_path, role):
 verify_installation_health() { :; }
 local_identity_setup() { :; }
 audit_installation() { :; }
+ufw_rotation() { if [[ "$1" == apply ]]; then printf 0; fi; }
 crontab() {
     if [[ "$*" == *" -l" ]]; then cat "$PROJECT_DIR/crontab"; else cp "${@: -1}" "$PROJECT_DIR/crontab"; fi
 }

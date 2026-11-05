@@ -13,13 +13,15 @@ def main():
 
         if not connection:
             print("Database connection failed.")
-            return
+            return 1
 
         data = get_data(connection)
         save_metrics_db(connection, data)
+        return 0
 
     except (OSError, ValueError, pymysql.MySQLError):
         print("Security metric collection failed.")
+        return 1
 
     finally:
         if connection:
@@ -27,4 +29,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,6 +1,7 @@
 """Content-verified file generations and UTC diagnostics; no legacy state resets."""
 import hashlib
 import os
+import secrets
 import stat
 import time
 
@@ -8,19 +9,29 @@ CHUNK = 65536
 MAX_FILES = 256
 
 
-def digest_prefix(source, size, deadline):
+def digest_prefixes(source, sizes, deadline):
+    """Hash several prefix boundaries in one bounded-memory forward pass."""
     source.seek(0)
     digest = hashlib.sha256()
-    remaining = size
-    while remaining:
-        if deadline is not None and time.monotonic() >= deadline:
-            raise TimeoutError('CHECKPOINT_VERIFY_TIME_LIMIT')
-        block = source.read(min(CHUNK, remaining))
-        if not block:
-            raise OSError('SOURCE_CHANGED')
-        digest.update(block)
-        remaining -= len(block)
-    return digest
+    prefixes = {}
+    position = 0
+    for size in sorted(set(sizes)):
+        if size < 0:
+            raise ValueError('Negative UFW prefix size.')
+        while position < size:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError('CHECKPOINT_VERIFY_TIME_LIMIT')
+            block = source.read(min(CHUNK, size - position))
+            if not block:
+                raise OSError('SOURCE_CHANGED')
+            digest.update(block)
+            position += len(block)
+        prefixes[size] = digest.copy()
+    return prefixes
+
+
+def digest_prefix(source, size, deadline):
+    return digest_prefixes(source, (size,), deadline)[size]
 
 
 def gap(cursor, scope, checkpoint, reason, filename):
@@ -32,52 +43,87 @@ def gap(cursor, scope, checkpoint, reason, filename):
 
 def start(cursor, source, filename, info, scope, deadline):
     """Verify the entire observed snapshot and the committed prefix before seeking."""
-    observed = digest_prefix(source, info.st_size, deadline).hexdigest()
-    cursor.execute('SELECT id,byte_position,prefix_sha,observed_size,observed_sha,status '
+    cursor.execute('SELECT id,byte_position,prefix_sha,observed_size,observed_sha,status,generation_key,file_mtime_ns '
                    'FROM ufw_file_checkpoints WHERE source_scope=%s AND file_device=%s AND file_inode=%s '
                    'ORDER BY id DESC LIMIT 1', (scope, info.st_dev, info.st_ino))
     row = cursor.fetchone()
+    sizes = [0, info.st_size]
+    if row is not None:
+        saved_position = row[1]
+        saved_size = row[3]
+        if saved_position <= info.st_size and saved_size <= info.st_size:
+            sizes.extend((saved_position, saved_size))
+    prefixes = digest_prefixes(source, sizes, deadline)
+    observed = prefixes[info.st_size].hexdigest()
     checkpoint = None
     position = 0
+    generation = None
     if row is not None:
-        checkpoint, position, prefix, old_size, old_sha, status = row
+        checkpoint, position, prefix, old_size, old_sha, status, generation, old_mtime = row
+        if generation is None:
+            cursor.execute("SELECT 1 FROM ufw_collection_gaps WHERE source_scope=%s AND checkpoint_id=%s "
+                           "AND reason='MISSING_SOURCE' AND resolved=FALSE LIMIT 1", (scope, checkpoint))
+            if cursor.fetchone() == (1,):
+                from ingestion.ufw_batch import OccurrenceConflict
+                raise OccurrenceConflict('UFW_UNVERIFIED_RECOVERY_GENERATION')
         same = status not in ('SUPERSEDED', 'RECOVERED') and position <= info.st_size
         if same:
             same = old_size <= info.st_size
         if same:
-            same = digest_prefix(source, old_size, deadline).hexdigest() == old_sha
+            same = prefixes[old_size].hexdigest() == old_sha
         if same:
-            same = digest_prefix(source, position, deadline).hexdigest() == prefix
+            same = prefixes[position].hexdigest() == prefix
+        if same and info.st_size == old_size and old_mtime is not None and info.st_mtime_ns != old_mtime:
+            from ingestion.ufw_batch import OccurrenceConflict
+            raise OccurrenceConflict('UFW_AMBIGUOUS_FILE_GENERATION')
         if not same:
             gap(cursor, scope, checkpoint, 'CONTENT_CHANGED', filename)
             cursor.execute("UPDATE ufw_file_checkpoints SET status='SUPERSEDED' WHERE id=%s AND source_scope=%s",
                            (checkpoint, scope))
             checkpoint = None
             position = 0
+            generation = None
     else:
         cursor.execute('SELECT last_position FROM ufw_state WHERE source_scope=%s AND file_device=%s AND file_inode=%s',
                        (scope, info.st_dev, info.st_ino))
         if cursor.fetchone() is not None:
             # No content proof existed. Replay the retained source, preserving the old row.
             gap(cursor, scope, 0, 'LEGACY_UNVERIFIED', filename)
-    prefix_hash = digest_prefix(source, position, deadline)
+    prefix_hash = prefixes[position]
     source.seek(position)
-    return checkpoint, prefix_hash, observed
+    if generation is None:
+        generation = secrets.token_bytes(32)
+    return checkpoint, prefix_hash, observed, generation
 
 
-def finish(cursor, source, filename, info, scope, checkpoint, prefix_hash, observed, deadline):
+def verify_snapshot(source, position, size, prefix_hash, observed, deadline):
+    """Verify only the original ranges, never a concurrently appended tail."""
+    prefixes = digest_prefixes(source, (position, size), deadline)
+    if prefixes[position].hexdigest() != prefix_hash.hexdigest():
+        raise OSError('SOURCE_CHANGED')
+    if prefixes[size].hexdigest() != observed:
+        raise OSError('SOURCE_CHANGED')
+
+
+def finish(cursor, source, filename, info, scope, checkpoint, prefix_hash, observed, deadline, *, generation=None):
     position = source.tell()
     # Appends are allowed; replacement or changes to any observed byte are not.
     before = os.fstat(source.fileno())
-    if digest_prefix(source, position, deadline).hexdigest() != prefix_hash.hexdigest():
-        raise OSError('SOURCE_CHANGED')
-    if digest_prefix(source, info.st_size, deadline).hexdigest() != observed:
-        raise OSError('SOURCE_CHANGED')
+    verify_snapshot(source, position, info.st_size, prefix_hash, observed, deadline)
     current = os.fstat(source.fileno())
     if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (current.st_size, current.st_mtime_ns, current.st_ctime_ns):
-        if current.st_size > before.st_size:
-            raise TimeoutError('SOURCE_UNSTABLE_DURING_VERIFICATION')
-        raise OSError('SOURCE_CHANGED')
+        if current.st_size <= before.st_size:
+            raise OSError('SOURCE_CHANGED')
+        # Growth may coincide with a rewrite behind the first read cursor.
+        # Recheck once, under the original time budget. This final read must be
+        # stable: growth alone cannot prove that earlier bytes were unchanged.
+        before = current
+        verify_snapshot(source, position, info.st_size, prefix_hash, observed, deadline)
+        current = os.fstat(source.fileno())
+        if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (current.st_size, current.st_mtime_ns, current.st_ctime_ns):
+            if current.st_size > before.st_size:
+                raise TimeoutError('SOURCE_UNSTABLE_DURING_VERIFICATION')
+            raise OSError('SOURCE_CHANGED')
     try:
         named = os.stat(filename, follow_symlinks=False)
     except FileNotFoundError:
@@ -106,22 +152,48 @@ def finish(cursor, source, filename, info, scope, checkpoint, prefix_hash, obser
     status = 'READING'
     if position == current.st_size:
         status = 'CAUGHT_UP'
+    verified_generation = False
+    if checkpoint is not None and generation is not None and status == 'CAUGHT_UP':
+        cursor.execute('SELECT generation_key FROM ufw_file_checkpoints WHERE id=%s AND source_scope=%s',
+                       (checkpoint, scope))
+        verified_generation = cursor.fetchone() == (generation,)
     values = (filename, position, prefix_hash.hexdigest(), info.st_size, observed, status)
     if checkpoint is None:
         cursor.execute('INSERT INTO ufw_file_checkpoints '
                        '(filename,byte_position,prefix_sha,observed_size,observed_sha,status,source_scope,file_device,file_inode,checked_at) '
                        'VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,UTC_TIMESTAMP(6))',
                        values + (scope, info.st_dev, info.st_ino))
+        checkpoint = cursor.lastrowid
     else:
         cursor.execute('UPDATE ufw_file_checkpoints SET filename=%s,byte_position=%s,prefix_sha=%s,'
                        'observed_size=%s,observed_sha=%s,status=%s,checked_at=UTC_TIMESTAMP(6) '
                        'WHERE id=%s AND source_scope=%s', values + (checkpoint, scope))
+    if generation is not None:
+        cursor.execute('UPDATE ufw_file_checkpoints SET generation_key=%s,file_mtime_ns=%s '
+                       'WHERE id=%s AND source_scope=%s',
+                       (generation, current.st_mtime_ns, checkpoint, scope))
+        if verified_generation:
+            cursor.execute("UPDATE ufw_collection_gaps SET resolved=TRUE "
+                           "WHERE source_scope=%s AND checkpoint_id=%s AND reason='MISSING_SOURCE'",
+                           (scope, checkpoint))
     source.seek(position)
     return status
 
 
+def record_proof(cursor, scope, archive_sha, size, digest):
+    cursor.execute('SELECT expanded_sha FROM ufw_archive_proofs '
+                   'WHERE source_scope=%s AND archive_sha=%s AND expanded_size=%s', (scope, archive_sha, size))
+    row = cursor.fetchone()
+    if row is None:
+        cursor.execute('INSERT INTO ufw_archive_proofs (source_scope,archive_sha,expanded_size,expanded_sha) '
+                       'VALUES (%s,%s,%s,%s)', (scope, archive_sha, size, digest))
+    elif row != (digest,):
+        from ingestion.ufw_batch import OccurrenceConflict
+        raise OccurrenceConflict('UFW_ARCHIVE_PROOF_CHANGED')
+
+
 def prove_archive(cursor, source, scope, archive_sha, size, deadline):
-    """A rotated file may have grown after its last observation. Verify its retained prefix."""
+    """Record prefix-content matches, not proof of a checkpoint generation."""
     cursor.execute("SELECT DISTINCT observed_size,observed_sha FROM ufw_file_checkpoints "
                    "WHERE source_scope=%s AND status <> 'RECOVERED' AND observed_size <= %s "
                    "ORDER BY observed_size LIMIT 256", (scope, size))
@@ -133,13 +205,11 @@ def prove_archive(cursor, source, scope, archive_sha, size, deadline):
         except TimeoutError:
             break  # Proof is optional; an unproved gap stays unresolved.
         if actual == observed_sha:
-            cursor.execute('INSERT INTO ufw_archive_proofs (source_scope,archive_sha,expanded_size,expanded_sha) '
-                           'VALUES (%s,%s,%s,%s) ON DUPLICATE KEY UPDATE archive_sha=VALUES(archive_sha)',
-                           (scope, archive_sha, observed_size, actual))
+            record_proof(cursor, scope, archive_sha, observed_size, actual)
 
 
 def reconcile(cursor, scope, filenames, deadline):
-    """Record unavailable generations; only a CRC-verified, fully committed archive resolves them."""
+    """Record missing generations without inferring lineage from equal content."""
     available = set()
     for filename in filenames:
         if time.monotonic() >= deadline:
@@ -151,7 +221,7 @@ def reconcile(cursor, scope, filenames, deadline):
         if stat.S_ISREG(info.st_mode):
             available.add((info.st_dev, info.st_ino))
     cursor.execute("SELECT id,file_device,file_inode,filename,observed_size,observed_sha,status "
-                   "FROM ufw_file_checkpoints WHERE source_scope=%s AND status <> 'RECOVERED' "
+                   "FROM ufw_file_checkpoints WHERE source_scope=%s AND status NOT IN ('RECOVERED','ARCHIVED') "
                    "ORDER BY checked_at DESC LIMIT 257", (scope,))
     rows = cursor.fetchall()
     if len(rows) > MAX_FILES:
@@ -161,22 +231,11 @@ def reconcile(cursor, scope, filenames, deadline):
             return False
         if (device, inode) in available and status != 'SUPERSEDED':
             continue
-        cursor.execute("SELECT 1 FROM ufw_archive_proofs p JOIN ufw_archives a "
-                       "ON a.source_scope=p.source_scope AND a.archive_sha=p.archive_sha "
-                       "WHERE p.source_scope=%s AND p.expanded_size=%s AND p.expanded_sha=%s "
-                       "AND a.status='COMPLETE' LIMIT 1", (scope, size, digest))
-        retained = cursor.fetchone() == (1,)
-        if not retained:
-            cursor.execute('SELECT 1 FROM ufw_file_checkpoints WHERE source_scope=%s AND id <> %s '
-                           'AND observed_size=%s AND observed_sha=%s AND byte_position >= %s LIMIT 1',
-                           (scope, checkpoint, size, digest, size))
-            retained = cursor.fetchone() == (1,)
-        if retained:
-            cursor.execute("UPDATE ufw_collection_gaps SET resolved=TRUE WHERE source_scope=%s AND checkpoint_id=%s "
-                           "AND reason IN ('MISSING_SOURCE','CONTENT_CHANGED')", (scope, checkpoint))
-            cursor.execute("UPDATE ufw_file_checkpoints SET status='RECOVERED' WHERE source_scope=%s AND id=%s",
-                           (scope, checkpoint))
-        elif (device, inode) not in available:
+        # Only a producer-recorded generation binding can recover a missing source.
+        from ingestion.ufw_lineage import recover_checkpoint
+        if recover_checkpoint(cursor, scope, checkpoint):
+            continue
+        if (device, inode) not in available:
             gap(cursor, scope, checkpoint, 'MISSING_SOURCE', filename)
     return True
 
@@ -218,6 +277,8 @@ def read_health(connection, scope):
     GAP_DETECTED: unresolved possible loss. DEGRADED: last pass failed.
     UNKNOWN: legacy proof, incomplete inventory or no observation. BACKLOG: available
     unfinished data. HEALTHY: no known problem or backlog in the last confirmed pass.
+    unverified_recoveries counts legacy RECOVERED checkpoints whose generation
+    lineage was never proved; resolved gap rows do not make those recoveries valid.
     """
     with connection.cursor() as cursor:
         cursor.execute('SELECT last_success,last_failure,error_class,active_state,pending_archives,stop_reason,'
@@ -226,6 +287,16 @@ def read_health(connection, scope):
         cursor.execute('SELECT reason,COUNT(*) FROM ufw_collection_gaps WHERE source_scope=%s AND resolved=FALSE '
                        'GROUP BY reason', (scope,))
         gaps = dict(cursor.fetchall())
+        # Old RECOVERED rows were based on content matches, not generation lineage.
+        # Audit them even if their original gaps were already marked resolved.
+        from ingestion.ufw_lineage import VERIFIED_RECOVERY
+        cursor.execute("SELECT /*+ MAX_EXECUTION_TIME(1000) */ COUNT(*) FROM ufw_file_checkpoints f "
+                       "WHERE f.source_scope=%s AND (f.status='RECOVERED' OR "
+                       "(f.status='ARCHIVED' AND NOT " + VERIFIED_RECOVERY + '))', (scope,))
+        audit = cursor.fetchone()
+        if audit is None or len(audit) != 1 or type(audit[0]) is not int or audit[0] < 0:
+            raise RuntimeError('UFW_RECOVERY_AUDIT_UNVERIFIED')
+        unverified_recoveries = audit[0]
     state = 'UNKNOWN'
     if row is not None:
         _success, _failure, error, active, pending, _stop, _active_lines, _archive_lines, plain_backlog = row
@@ -240,9 +311,9 @@ def read_health(connection, scope):
     for reason, count in gaps.items():
         if reason != 'LEGACY_UNVERIFIED':
             gap_count += count
-    if gap_count:
+    if gap_count or unverified_recoveries:
         state = 'GAP_DETECTED'
-    result = {'state': state, 'gaps': gap_count}
+    result = {'state': state, 'gaps': gap_count, 'unverified_recoveries': unverified_recoveries}
     if row is not None:
         names = ('last_success_utc', 'last_failure_utc', 'last_error_class', 'active_state',
                  'pending_archives', 'stop_reason', 'active_lines', 'archive_lines', 'plain_backlog')

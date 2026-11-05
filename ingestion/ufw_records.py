@@ -56,7 +56,7 @@ def quarantine(cursor, raw, reason, filename, position, device, inode, identity,
     return 'duplicates'
 
 
-def process_line(cursor, raw, filename, position, device, inode, identity, stats, *, archive_sha=None, partial=False, writer=None):
+def process_line(cursor, raw, filename, position, device, inode, identity, stats, *, archive_sha=None, partial=False, writer=None, generation=None):
     from ingestion.ufw_to_mysql import decode_log_line, save_event
 
     reason = None
@@ -83,9 +83,12 @@ def process_line(cursor, raw, filename, position, device, inode, identity, stats
         stats['non_ufw'] = stats.get('non_ufw', 0) + 1
         return 0
     if writer is not None:
-        writer.add(line, parsed)
+        writer.add(line, parsed, position=position)
         return 0
-    inserted = save_event(cursor, line, identity=identity)
+    if generation is None:
+        inserted = save_event(cursor, line, identity=identity)
+    else:
+        inserted = save_event(cursor, line, identity=identity, generation=generation, position=position)
     if not inserted:
         stats['duplicates'] = stats.get('duplicates', 0) + 1
     return inserted

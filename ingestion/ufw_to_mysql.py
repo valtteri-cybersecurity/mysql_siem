@@ -84,7 +84,7 @@ def decode_log_line(raw_line, filename, position):
     return line
 
 
-def save_event(cursor, line, *, identity=None):
+def save_event(cursor, line, *, identity=None, generation=None, position=None):
     """Parse and save one UFW event."""
 
     clean_line = line.strip()
@@ -95,6 +95,13 @@ def save_event(cursor, line, *, identity=None):
     info_table = validate_event(line)
     if info_table is None:
         return 0
+
+    if generation is not None:
+        from ingestion.ufw_batch import EventBatch
+        writer = EventBatch(cursor, identity, None, {}, generation=generation)
+        writer.add(line, info_table, position=position)
+        writer.flush()
+        return writer.inserted
 
     event_time = info_table["event_time"]
 
@@ -215,16 +222,16 @@ def process_file(cursor, filename, *, stats=None, max_lines=MAX_LINES, deadline=
         read_deadline = now + max(0, deadline - now) * 0.7
     checkpoint = None
     writer = None
-    if batch:
-        from ingestion.ufw_batch import EventBatch
-        writer = EventBatch(cursor, identity, policy, stats)
+    from ingestion.ufw_batch import EventBatch, OccurrenceConflict
     try:
         descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, 'rb') as source:
             info = os.fstat(source.fileno())
             if not stat.S_ISREG(info.st_mode):
                 raise OSError('UFW source must be a regular file.')
-            checkpoint, prefix, observed = continuity.start(cursor, source, filename, info, scope, deadline)
+            checkpoint, prefix, observed, generation = continuity.start(cursor, source, filename, info, scope, deadline)
+            if batch:
+                writer = EventBatch(cursor, identity, policy, stats, generation=generation)
             while source.tell() < info.st_size:
                 if stats['lines_read'] >= max_lines:
                     stats['stop_reason'] = 'line_limit'
@@ -246,15 +253,17 @@ def process_file(cursor, filename, *, stats=None, max_lines=MAX_LINES, deadline=
                     break
                 stats['file'] = filename
                 stats['position'] = start
-                inserted += process_line(cursor, raw, filename, start, info.st_dev, info.st_ino, identity, stats, writer=writer)
+                inserted += process_line(cursor, raw, filename, start, info.st_dev, info.st_ino, identity, stats, writer=writer, generation=generation)
                 prefix.update(raw)
                 stats['lines_read'] += 1
             if writer is not None:
                 writer.flush()
                 inserted = writer.inserted
-            status = continuity.finish(cursor, source, filename, info, scope, checkpoint, prefix, observed, deadline)
+            status = continuity.finish(cursor, source, filename, info, scope, checkpoint, prefix, observed, deadline, generation=generation)
             stats['file_state'] = status
-    except OSError as error:
+    except (OSError, OccurrenceConflict) as error:
+        if isinstance(error, OccurrenceConflict):
+            stats['stop_reason'] = str(error)
         if not isinstance(error, TimeoutError):
             stats['source_failure'] = (checkpoint or 0, filename)
         raise
@@ -364,6 +373,7 @@ def process_log(
             active_deadline = time.monotonic() + max(0, deadline - time.monotonic()) / 2
         processed_files = 0
         verification_failed = False
+        source_errors = 0
         for filename in logfiles:
             if filename == LOGFILE and skip_active:
                 stats['active_state'] = 'BACKLOG'
@@ -389,6 +399,21 @@ def process_log(
                 stats['stop_reason'] = 'verification_time_limit'
                 stats['active_state'] = 'UNKNOWN'
                 verification_failed = True
+                continue
+            except pymysql.MySQLError:
+                raise
+            except OSError as error:
+                if filename == LOGFILE:
+                    raise
+                failed_checkpoint, failed_filename = stats.get('source_failure', (0, filename))
+                cursor.execute('ROLLBACK TO SAVEPOINT ufw_file')
+                stats.clear()
+                stats.update(previous_stats)
+                source_errors += 1
+                stats['source_errors'] = source_errors
+                continuity.gap(cursor, scope, failed_checkpoint, 'SOURCE_UNAVAILABLE', failed_filename)
+                print(f'UFW source: FAILED class={type(error).__name__} file={filename!r}; '
+                      'file transaction rolled back')
                 continue
             finally:
                 cursor.execute('RELEASE SAVEPOINT ufw_file')
@@ -454,6 +479,12 @@ def process_log(
         cursor.execute("SELECT 1 FROM ufw_file_checkpoints WHERE source_scope=%s AND status='READING' LIMIT 1", (scope,))
         if cursor.fetchone() is not None:
             result['plain_backlog'] = True
+        if source_errors:
+            result['status'] = 'FAILED'
+            result['stop_reason'] = 'source_file_error'
+            continuity.save_health(connection, scope, result, error='SourceFileError')
+            result['collection_state'] = continuity.read_health(connection, scope)['state']
+            return result
         if verification_failed:
             result['status'] = 'FAILED'
             result['active_state'] = 'UNKNOWN'
@@ -481,6 +512,8 @@ def process_log(
             except (OSError, RuntimeError, pymysql.MySQLError):
                 connection.rollback()
                 print('UFW diagnostics: persistence failed; collection state is unconfirmed.')
+        if isinstance(error, RuntimeError) and str(error).startswith('UFW_'):
+            print('UFW collection stopped: ' + str(error))
         print(f"UFW collection: FAILED class={type(error).__name__} stage=collection "
               f"file={stats.get('file')!r} position={stats.get('position')} "
               f"committed_counts={committed or (0, 0)} lines_read={stats['lines_read']}")

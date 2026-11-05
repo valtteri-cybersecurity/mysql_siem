@@ -21,16 +21,31 @@ def cursor_for_files():
         cursor.fetchall.return_value = []
         if 'GET_LOCK' in query or 'information_schema.tables' in query:
             cursor.fetchone.return_value = (1,)
+        elif "status='RECOVERED'" in query and 'COUNT(*)' in query:
+            cursor.fetchone.return_value = (0,)
         elif query.startswith('SELECT id,byte_position'):
             cursor.fetchone.return_value = rows.get(tuple(values))
+        elif query.startswith('SELECT generation_key FROM ufw_file_checkpoints'):
+            checkpoint, scope = values
+            for key, row in rows.items():
+                if row[0] == checkpoint and key[0] == scope:
+                    cursor.fetchone.return_value = (row[6],)
+                    break
         elif query.startswith('INSERT INTO ufw_file_checkpoints'):
             _filename, position, prefix, size, digest, status, scope, device, inode = values
-            rows[(scope, device, inode)] = (len(rows) + 1, position, prefix, size, digest, status)
+            cursor.lastrowid = len(rows) + 1
+            rows[(scope, device, inode)] = (cursor.lastrowid, position, prefix, size, digest, status, None, None)
         elif query.startswith('UPDATE ufw_file_checkpoints SET filename'):
             _filename, position, prefix, size, digest, status, checkpoint, scope = values
             for key, row in rows.items():
                 if row[0] == checkpoint:
-                    rows[key] = (checkpoint, position, prefix, size, digest, status)
+                    rows[key] = (checkpoint, position, prefix, size, digest, status, row[6], row[7])
+                    break
+        elif query.startswith('UPDATE ufw_file_checkpoints SET generation_key'):
+            generation, mtime, checkpoint, scope = values
+            for key, row in rows.items():
+                if row[0] == checkpoint and key[0] == scope:
+                    rows[key] = row[:6] + (generation, mtime)
                     break
     cursor.execute.side_effect = execute
     def executemany(query, rows):
@@ -95,7 +110,7 @@ def test_verification_is_streaming_and_bounded(monkeypatch):
 def test_diagnostic_states_are_read_only(active, error, gaps, expected):
     connection = MagicMock()
     cursor = connection.cursor.return_value.__enter__.return_value
-    cursor.fetchone.return_value = (None, None, error, active, 0, 'snapshot_end', 1, 0, False)
+    cursor.fetchone.side_effect = [(None, None, error, active, 0, 'snapshot_end', 1, 0, False), (0,)]
     cursor.fetchall.return_value = gaps
     assert continuity.read_health(connection, 7)['state'] == expected
     for call in cursor.execute.call_args_list:

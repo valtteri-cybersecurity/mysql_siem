@@ -52,8 +52,8 @@ def batch_cursor():
 def test_default_retains_events_and_filtering_requires_explicit_enable(enabled, normal, filtered):
     cursor = batch_cursor()
     stats = {}
-    writer = EventBatch(cursor, EventIdentity(1, 2, 3), enabled, stats)
-    writer.add(LINE, validate_event(LINE))
+    writer = EventBatch(cursor, EventIdentity(1, 2, 3), enabled, stats, generation=b'g' * 32)
+    writer.add(LINE, validate_event(LINE), position=0)
     writer.flush()
     assert writer.inserted == normal
     assert stats['filtered'] == filtered
@@ -69,16 +69,16 @@ def test_default_retains_events_and_filtering_requires_explicit_enable(enabled, 
 def test_batch_deduplicates_without_hiding_sql_failures():
     cursor = batch_cursor()
     stats = {}
-    writer = EventBatch(cursor, None, None, stats)
+    writer = EventBatch(cursor, None, None, stats, generation=b'g' * 32)
     for _ in range(100):
-        writer.add(LINE, validate_event(LINE))
+        writer.add(LINE, validate_event(LINE), position=0)
     writer.flush()
     assert writer.inserted == 1
     assert stats['duplicates'] == 99
-    assert cursor.execute.call_count == 1
+    assert cursor.execute.call_count == 2
     assert len(cursor.executemany.call_args.args[1]) == 1
     cursor.executemany.side_effect = pymysql.OperationalError(2013, 'synthetic failure')
-    writer.add(LINE, validate_event(LINE))
+    writer.add(LINE, validate_event(LINE), position=0)
     with pytest.raises(pymysql.MySQLError):
         writer.flush()
 
@@ -144,10 +144,10 @@ def test_preview_uses_select_only_and_same_rule():
 
 def test_batch_memory_is_bounded(monkeypatch):
     cursor = batch_cursor()
-    writer = EventBatch(cursor, None, None, {})
+    writer = EventBatch(cursor, None, None, {}, generation=b'g' * 32)
     monkeypatch.setattr('ingestion.ufw_batch.MAX_BYTES', len(LINE.encode()) * 2)
     for index in range(20):
         line = LINE.replace('12:00:00', '12:00:' + str(index).zfill(2))
-        writer.add(line, validate_event(line))
+        writer.add(line, validate_event(line), position=index * len(LINE))
         assert writer.byte_count < len(LINE.encode()) * 2
         assert len(writer.rows) < 2

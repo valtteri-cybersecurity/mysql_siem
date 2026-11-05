@@ -1,11 +1,14 @@
 """Bounded, strict INSERT batches; errors propagate to the checkpoint transaction."""
 import hashlib
 
-from database.identity import identity_schema_enabled
 from ingestion.ufw_filters import match, record_counts
 
 MAX_ROWS = 256
 MAX_BYTES = 256 * 1024
+class OccurrenceConflict(RuntimeError):
+    """A source occurrence cannot be safely attributed or replayed."""
+
+
 FIELDS = 'event_time action src_ip dst_ip protocol src_port dst_port raw_line event_hash'
 
 
@@ -20,7 +23,10 @@ def event_values(line, parsed, identity):
 
 
 class EventBatch:
-    def __init__(self, cursor, identity, enabled, stats):
+    def __init__(self, cursor, identity, enabled, stats, *, generation):
+        if not isinstance(generation, bytes) or len(generation) != 32 or generation == bytes(32):
+            raise ValueError('Invalid UFW file generation.')
+        self.generation = generation
         self.cursor = cursor
         self.identity = identity
         self.enabled = enabled
@@ -28,71 +34,93 @@ class EventBatch:
         self.rows = []
         self.byte_count = 0
         self.inserted = 0
-        self.scoped = identity is not None or identity_schema_enabled(cursor.connection)
 
-    def add(self, line, parsed):
+    def add(self, line, parsed, *, position=None):
+        if type(position) is not int or position < 0:
+            raise ValueError('UFW occurrence requires a nonnegative byte position.')
         size = len(line.encode('utf-8'))
         if self.rows and self.byte_count + size > MAX_BYTES:
             self.flush()
         digest, values = event_values(line, parsed, self.identity)
-        self.rows.append((digest, values, parsed, line))
+        self.rows.append((digest, values, parsed, line, position))
         self.byte_count += size
         if len(self.rows) >= MAX_ROWS or self.byte_count >= MAX_BYTES:
             self.flush()
 
     def flush(self):
+        """Replay by generation and offset; content alone never proves identity."""
         if not self.rows:
             return
-        unique = {}
-        frequencies = {}
-        for digest, values, parsed, line in self.rows:
-            if digest not in unique:
-                unique[digest] = (values, parsed, line)
-                frequencies[digest] = 0
-            frequencies[digest] += 1
-        hashes = tuple(unique)
-        placeholders = ','.join(['%s'] * len(hashes))
-        sql = 'SELECT event_hash FROM ufw_log WHERE event_hash IN (' + placeholders + ')'
-        parameters = hashes
         scope = 0
         if self.identity is not None:
             scope = self.identity.source_id
-        if self.scoped:
-            sql += ' AND source_scope=%s'
-            parameters += (scope,)
-        self.cursor.execute(sql, parameters)
-        stored = set()
+        positions = []
+        hashes = []
+        for digest, _values, _parsed, _line, position in self.rows:
+            positions.append(position)
+            hashes.append(digest)
+        placeholders = ','.join(['%s'] * len(positions))
+        self.cursor.execute('SELECT file_position,event_hash FROM ufw_log WHERE source_scope=%s '
+                            'AND file_generation=%s AND file_position IN (' + placeholders + ')',
+                            (scope, self.generation) + tuple(positions))
+        stored = {}
+        for position, digest in self.cursor.fetchall():
+            stored[position] = digest
+        filtered = {}
+        if self.identity is not None:
+            self.cursor.execute('SELECT file_position,event_hash FROM ufw_filter_seen WHERE source_id=%s '
+                                'AND file_generation=%s AND file_position IN (' + placeholders + ')',
+                                (scope, self.generation) + tuple(positions))
+            for position, digest in self.cursor.fetchall():
+                filtered[position] = digest.hex()
+        # Another file, an unbound legacy row or a recompressed archive is not proof
+        # of replay. Stop visibly rather than silently discard or double-count it.
+        self.cursor.execute('SELECT event_hash FROM ufw_log WHERE source_scope=%s '
+                            'AND (file_generation IS NULL OR file_generation<>%s) '
+                            'AND event_hash IN (' + placeholders + ')',
+                            (scope, self.generation) + tuple(hashes))
+        ambiguous = set()
         for row in self.cursor.fetchall():
-            stored.add(row[0])
-        filtered = set()
+            ambiguous.add(row[0])
         if self.identity is not None:
             binary_hashes = []
             for digest in hashes:
                 binary_hashes.append(bytes.fromhex(digest))
-            self.cursor.execute('SELECT event_hash FROM ufw_filter_seen WHERE source_id=%s AND event_hash IN ('
-                                + placeholders + ')', (scope,) + tuple(binary_hashes))
+            self.cursor.execute('SELECT event_hash FROM ufw_filter_seen WHERE source_id=%s '
+                                'AND file_generation<>%s AND event_hash IN (' + placeholders + ')',
+                                (scope, self.generation) + tuple(binary_hashes))
             for row in self.cursor.fetchall():
-                filtered.add(row[0].hex())
+                ambiguous.add(row[0].hex())
         normal = []
         excluded = []
         duplicates = 0
-        for digest, (values, parsed, line) in unique.items():
-            if digest in stored and digest in filtered:
-                raise RuntimeError('UFW_EVENT_EXISTS_IN_RAW_AND_FILTER_HISTORY')
-            if digest in stored or digest in filtered:
-                duplicates += frequencies[digest]
+        for digest, values, parsed, _line, position in self.rows:
+            if position in stored and position in filtered:
+                raise OccurrenceConflict('UFW_OCCURRENCE_IN_RAW_AND_FILTER_HISTORY')
+            previous = stored.get(position)
+            if previous is None:
+                previous = filtered.get(position)
+            if previous is not None:
+                if previous != digest:
+                    raise OccurrenceConflict('UFW_OCCURRENCE_CONTENT_CHANGED')
+                duplicates += 1
                 continue
-            duplicates += frequencies[digest] - 1
-            if self.enabled and match(line, parsed) == 'MATCH':
-                excluded.append((digest, parsed))
+            if digest in ambiguous:
+                raise OccurrenceConflict('UFW_AMBIGUOUS_OCCURRENCE_SOURCE')
+            if self.enabled and match(_line, parsed) == 'MATCH':
+                excluded.append((digest, parsed, self.generation, position))
+                filtered[position] = digest
             else:
-                normal.append(values)
+                normal.append(values + (self.generation, position))
+                stored[position] = digest
         if normal:
             fields = FIELDS
             if self.identity is not None:
                 fields += ' host_id source_id collector_id sender_id source_scope reported_hostname'
+            fields += ' file_generation file_position'
             placeholders = ','.join(['%s'] * len(normal[0]))
-            self.cursor.executemany('INSERT INTO ufw_log (' + ','.join(fields.split()) + ') VALUES (' + placeholders + ')', normal)
+            self.cursor.executemany('INSERT INTO ufw_log (' + ','.join(fields.split()) + ') VALUES ('
+                                    + placeholders + ')', normal)
         if excluded:
             record_counts(self.cursor, self.identity, excluded)
         self.inserted += len(normal)

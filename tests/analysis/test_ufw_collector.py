@@ -40,7 +40,7 @@ def test_growing_log_stops_at_initial_size_and_resumes_next_pass(tmp_path, monke
     logfile.write_bytes(line())
     seen = []
 
-    def save(cursor, value, *, identity=None):
+    def save(cursor, value, *, identity=None, generation=None, position=None):
         seen.append(value)
         if len(seen) <= 3:
             with logfile.open("ab") as out:
@@ -62,7 +62,7 @@ def test_newline_appended_during_pass_does_not_complete_snapshot_partial_line(tm
     logfile.write_bytes(line() + line(1).rstrip(b"\n"))
     seen = []
 
-    def save(cursor, value, *, identity=None):
+    def save(cursor, value, *, identity=None, generation=None, position=None):
         seen.append(value)
         if len(seen) == 1:
             with logfile.open("ab") as out:
@@ -250,15 +250,24 @@ def test_missing_active_log_rolls_back_progress(tmp_path, monkeypatch):
         assert not call.args[0].startswith("INSERT INTO ufw_file_checkpoints")
 
 
-def test_disappearing_rotation_reports_system_error_and_rolls_back(tmp_path, monkeypatch):
+def test_disappearing_rotation_reports_error_and_commits_active_progress(tmp_path, monkeypatch):
     logfile = tmp_path / "ufw.log"
     logfile.write_bytes(line())
     monkeypatch.setattr(ufw, "LOGFILE", str(logfile))
     monkeypatch.setattr(ufw, "get_logfiles", lambda: [str(logfile) + ".1", str(logfile)])
     connection = connection_for_files()
-    with pytest.raises(FileNotFoundError):
-        ufw.process_log(connection)
-    assert connection.rollback.called
+    result = ufw.process_log(connection)
+    assert result['inserted'] == 1
+    assert result['source_errors'] == 1
+    assert result['status'] == 'FAILED'
+    assert result['active_state'] == 'HEALTHY'
+    assert result['plain_backlog']
+    assert connection.commit.called
+    connection.rollback.assert_not_called()
+    queries = []
+    for call in connection.cursor.return_value.execute.call_args_list:
+        queries.append(call.args[0])
+    assert 'ROLLBACK TO SAVEPOINT ufw_file' in queries
 
 
 def test_existing_cron_command_without_options_uses_bounded_defaults(monkeypatch):
@@ -295,7 +304,10 @@ def test_nul_prefix_recovery_preserves_event_hash_and_byte_position(tmp_path, ca
     for call in cursor.execute.call_args_list:
         if 'INSERT INTO ufw_log' in call.args[0]:
             writes.append(call.args[1])
-    assert writes[0] == writes[1]
+    assert writes[0][:-2] == writes[1][:-2]
+    assert writes[0][-2] == writes[1][-2]
+    assert writes[0][-1] == 0
+    assert writes[1][-1] == len(clean)
     assert writes[0][:7] == (datetime(2026, 10, 22, 9, 0, 0, 123456), 'BLOCK',
                              '192.0.2.1', '198.51.100.1', 'TCP', 0, 1000)
     assert writes[0][7] == clean.decode().strip()

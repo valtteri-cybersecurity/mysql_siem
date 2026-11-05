@@ -106,6 +106,7 @@ def test_managed_cron_is_repeatable_and_preserves_other_jobs(project, tmp_path):
 verify_installation_health() { :; }
 local_identity_setup() { :; }
 audit_installation() { :; }
+ufw_rotation() { if [[ "$1" == apply ]]; then printf 0; fi; }
 crontab() {
     if [[ "$*" == *" -l" ]]; then
         cat "$TEST_CRONTAB"

@@ -51,6 +51,7 @@ def test_corruption_is_never_published(tmp_path, cache, damage):
     assert result == 1
     assert record['status'] == 'ERROR'
     assert not (cache / (digest + '.data')).exists()
+    assert not (cache / (digest + '.part')).exists()
 
 
 @pytest.mark.parametrize('kind', ['ratio', 'expanded', 'disk', 'compressed', 'time'])
@@ -69,6 +70,7 @@ def test_resource_limits_preserve_incomplete_state(tmp_path, cache, monkeypatch,
     assert result == 1
     assert record['status'] == 'ERROR'
     assert not (cache / (digest + '.data')).exists()
+    assert not (cache / (digest + '.part')).exists()
 
 
 def test_exact_discovery_gaps_and_symlink(tmp_path):
@@ -185,3 +187,107 @@ def test_archive_changed_during_decompression_is_not_ready(tmp_path, cache, monk
     assert archives.worker(str(path), cache, digest) == 1
     assert archives.read_manifest(cache / (digest + '.json'))['status'] == 'ERROR'
     assert not (cache / (digest + '.data')).exists()
+
+
+@pytest.fixture
+def tight_cache(cache, monkeypatch):
+    monkeypatch.setattr(archives, 'MAX_EXPANDED', 4096)
+    monkeypatch.setattr(archives, 'MAX_CACHE', 6000)
+    monkeypatch.setattr(archives, 'MAX_RATIO', 10000)
+    monkeypatch.setattr(archives, 'CHUNK', 1024)
+    monkeypatch.setattr(archives, 'RESERVE_FREE', 0)
+    return cache
+
+
+def test_bad_crc_does_not_block_next_valid_archive(tmp_path, tight_cache):
+    raw = b'x' * 4096
+    valid = gzip.compress(raw, mtime=0)
+    damaged = bytearray(valid)
+    damaged[-8] ^= 1
+    result, digest, record = run_worker(tmp_path, tight_cache, damaged)
+    assert result == 1
+    assert record['reason'] == 'GZIP_CRC_OR_HEADER'
+    assert not (tight_cache / (digest + '.part')).exists()
+    assert not (tight_cache / (digest + '.data')).exists()
+    assert (tmp_path / 'ufw.log.2.gz').read_bytes() == damaged
+    result, digest, record = run_worker(tmp_path, tight_cache, valid)
+    assert result == 0
+    assert record['status'] == 'READY'
+    assert (tight_cache / (digest + '.data')).read_bytes() == raw
+
+
+@pytest.mark.parametrize('same_archive', [True, False])
+def test_orphan_partial_is_removed_before_capacity_check(tmp_path, tight_cache, same_archive):
+    content = gzip.compress(b'x' * 4096, mtime=0)
+    digest = hashlib.sha256(content).hexdigest()
+    partial_digest = digest
+    if not same_archive:
+        partial_digest = 'a' * 64
+        archives.write_manifest(tight_cache / (partial_digest + '.json'), {'status': 'ERROR'})
+    partial = tight_cache / (partial_digest + '.part')
+    partial.write_bytes(b'x' * 4096)
+    partial.chmod(0o600)
+    result, digest, record = run_worker(tmp_path, tight_cache, content)
+    assert result == 0
+    assert record['status'] == 'READY'
+    assert not partial.exists()
+
+
+@pytest.mark.parametrize('kind', ['symlink', 'dangling_symlink', 'hardlink', 'mode'])
+def test_cleanup_preserves_unsafe_partial_and_external_target(tmp_path, tight_cache, kind):
+    import os
+    target = tmp_path / 'external'
+    target.write_bytes(b'preserve external data')
+    target.chmod(0o600)
+    partial = tight_cache / ('a' * 64 + '.part')
+    if kind == 'symlink':
+        partial.symlink_to(target)
+    elif kind == 'dangling_symlink':
+        partial.symlink_to(tmp_path / 'absent')
+    elif kind == 'hardlink':
+        os.link(target, partial)
+    else:
+        partial.write_bytes(b'not a private cache file')
+        partial.chmod(0o644)
+    result, digest, record = run_worker(tmp_path, tight_cache, gzip.compress(RAW))
+    assert result == 1
+    assert record['status'] == 'ERROR'
+    assert partial.lstat()
+    assert target.read_bytes() == b'preserve external data'
+    assert not (tight_cache / (digest + '.data')).exists()
+
+
+def test_cleanup_preserves_ready_spool_and_unrecognized_files(tmp_path, cache):
+    ready = cache / ('a' * 64 + '.data')
+    ready.write_bytes(b'already verified spool')
+    unknown = cache / 'notes.part'
+    unknown.write_bytes(b'not a collector temporary')
+    result, _digest, record = run_worker(tmp_path, cache, gzip.compress(RAW))
+    assert result == 0
+    assert record['status'] == 'READY'
+    assert ready.read_bytes() == b'already verified spool'
+    assert unknown.read_bytes() == b'not a collector temporary'
+
+
+def test_cleanup_failure_retains_original_error_and_is_reported(tmp_path, tight_cache, monkeypatch):
+    content = bytearray(gzip.compress(b'x' * 4096, mtime=0))
+    content[-8] ^= 1
+    def denied(folder, digest):
+        raise PermissionError('synthetic cleanup failure')
+    monkeypatch.setattr(archives, 'discard_partial', denied)
+    result, digest, record = run_worker(tmp_path, tight_cache, content)
+    assert result == 1
+    assert record['reason'] == 'GZIP_CRC_OR_HEADER'
+    assert record['cleanup_error'] == 'PermissionError'
+    assert (tight_cache / (digest + '.part')).exists()
+    assert not (tight_cache / (digest + '.data')).exists()
+
+
+@pytest.mark.parametrize('digest', ['../' + 'a' * 64, 'A' * 64, 'a' * 63, None])
+def test_invalid_digest_cannot_redirect_cleanup(tmp_path, cache, digest):
+    target = tmp_path / ('a' * 64 + '.part')
+    target.write_bytes(b'preserve external data')
+    target.chmod(0o600)
+    with pytest.raises(ValueError, match='INVALID_ARCHIVE_ID'):
+        archives.worker(str(tmp_path / 'missing.gz'), cache, digest)
+    assert target.read_bytes() == b'preserve external data'

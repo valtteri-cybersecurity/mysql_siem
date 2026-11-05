@@ -201,9 +201,15 @@ def record_counts(cursor, identity, entries):
     buckets = {}
     values = []
     recorded_at = datetime.now(timezone.utc).replace(tzinfo=None)
-    for digest, parsed in entries:
+    if not entries:
+        return
+    occurrences = len(entries[0]) == 4
+    for entry in entries:
+        digest, parsed = entry[:2]
         event_time = parsed['event_time']
         values.append((identity.source_id, bytes.fromhex(digest), identity.host_id, RULE_KEY, RULE_VERSION, event_time, recorded_at))
+        if occurrences:
+            values[-1] += (entry[2], entry[3])
         start = event_time.replace(minute=0, second=0, microsecond=0)
         if start not in buckets:
             buckets[start] = [0, event_time, event_time]
@@ -213,9 +219,11 @@ def record_counts(cursor, identity, entries):
         bucket[2] = max(bucket[2], event_time)
     if not values:
         return
-    cursor.executemany('INSERT INTO ufw_filter_seen '
-                       '(source_id,event_hash,host_id,rule_key,rule_version,event_time,recorded_at) '
-                       'VALUES (%s,%s,%s,%s,%s,%s,%s)', values)
+    fields = 'source_id,event_hash,host_id,rule_key,rule_version,event_time,recorded_at'
+    if occurrences:
+        fields += ',file_generation,file_position'
+    placeholders = ','.join(['%s'] * len(values[0]))
+    cursor.executemany('INSERT INTO ufw_filter_seen (' + fields + ') VALUES (' + placeholders + ')', values)
     for start, (count, first, last) in buckets.items():
         cursor.execute('INSERT INTO ufw_filter_stats '
                        '(source_id,host_id,rule_key,rule_version,period_start,period_end,filtered_count,'

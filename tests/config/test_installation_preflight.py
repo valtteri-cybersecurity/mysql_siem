@@ -189,7 +189,7 @@ def test_invalid_recovery_state_is_rejected_without_repair(prepared, fault):
 
 
 @pytest.mark.parametrize('operation', ['reset', 'upgrade'])
-@pytest.mark.parametrize('failure', ['recovery', 'mysql', 'audit', 'snapshot'])
+@pytest.mark.parametrize('failure', ['recovery', 'mysql', 'ufw', 'audit', 'snapshot'])
 def test_failed_preflight_stops_shell_before_new_maintenance_and_database(operation, failure):
     installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
     start = installer.index('service_installation preflight "$PROJECT_DIR"')
@@ -219,6 +219,7 @@ preflight_python() {
     printf 'mysql\\n'
     [[ "$FAILURE" != mysql ]] || return 17
 }
+ufw_rotation() { printf 'ufw\\n'; [[ "$FAILURE" != ufw ]] || return 17; }
 audit_installation() { printf 'audit\\n'; [[ "$FAILURE" != audit ]] || return 17; }
 local_identity_setup() { printf 'UNEXPECTED maintenance\\n'; return 91; }
 systemctl() { printf 'UNEXPECTED service change\\n'; return 91; }
@@ -375,6 +376,11 @@ def test_migration_conflicts_stop_read_only_preflight_before_maintenance(mysql, 
 
 @pytest.mark.parametrize('status', ['APPLIED', 'RUNNING', 'FAILED'])
 def test_migration_history_preflight_accepts_original_sources_using_select_only(mysql, status, monkeypatch):
+    from database import ufw_archive_lineage_schema, ufw_occurrence_schema
+    lineage_guard = Mock()
+    monkeypatch.setattr(ufw_archive_lineage_schema, "verify", lineage_guard)
+    occurrence_guard = Mock()
+    monkeypatch.setattr(ufw_occurrence_schema, "verify", occurrence_guard)
     from database import ufw_analysis_keys
     guard = Mock()
     monkeypatch.setattr(ufw_analysis_keys, "preflight", guard)
@@ -389,8 +395,12 @@ def test_migration_history_preflight_accepts_original_sources_using_select_only(
     assert migrate.check_migration_history(mysql.connection) == expected
     if status == "APPLIED":
         guard.assert_called_once_with(mysql.connection)
+        occurrence_guard.assert_called_once_with(mysql.connection)
+        lineage_guard.assert_called_once_with(mysql.connection)
     else:
         guard.assert_not_called()
+        occurrence_guard.assert_not_called()
+        lineage_guard.assert_not_called()
     mysql.connection.commit.assert_not_called()
     for call in mysql.cursor.execute.call_args_list:
         assert call.args[0].startswith('SELECT ')

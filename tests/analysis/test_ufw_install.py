@@ -89,6 +89,7 @@ def test_managed_cron_replaces_old_job_once_and_preserves_other_jobs(tmp_path):
 verify_installation_health() { :; }
 local_identity_setup() { :; }
 audit_installation() { :; }
+ufw_rotation() { if [[ "$1" == apply ]]; then printf 0; fi; }
 crontab() {
     if [[ "$*" == *" -l" ]]; then cat "$TEST_CRONTAB"; else cp "${@: -1}" "$TEST_CRONTAB"; fi
 }
@@ -187,6 +188,7 @@ def test_standalone_retired_cron_removed_only_for_this_installation(tmp_path):
 verify_installation_health() { :; }
 local_identity_setup() { :; }
 audit_installation() { :; }
+ufw_rotation() { if [[ "$1" == apply ]]; then printf 0; fi; }
 crontab() {
     if [[ "$*" == *" -l" ]]; then cat "$TEST_CRONTAB"; else cp "${@: -1}" "$TEST_CRONTAB"; fi
 }

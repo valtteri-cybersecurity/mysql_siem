@@ -1,7 +1,7 @@
 """Read-only checks for the persistent collector storage contract."""
 
 
-def verify(connection, *, continuity=False, filtering=False):
+def verify(connection, *, continuity=False, filtering=False, occurrences=False):
     from database.migrate import MigrationError
 
     columns = {
@@ -42,6 +42,11 @@ def verify(connection, *, continuity=False, filtering=False):
             'ufw_filter_seen': (0, ('source_id', 'event_hash')),
             'ufw_filter_stats': (0, ('source_id', 'rule_key', 'rule_version', 'period_start')),
         })
+    if occurrences:
+        columns['ufw_archives'] += ' file_mtime_ns'
+        columns['ufw_file_checkpoints'] += ' generation_key file_mtime_ns'
+        columns['ufw_filter_seen'] += ' file_generation file_position modern_position'
+        required['ufw_filter_seen'] = (0, ('source_id', 'file_generation', 'file_position', 'event_hash'))
     with connection.cursor() as cursor:
         for table, names in columns.items():
             cursor.execute('SELECT engine,table_type FROM information_schema.tables '

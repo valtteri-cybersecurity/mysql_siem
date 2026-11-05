@@ -1,7 +1,5 @@
 from datetime import datetime
 
-import pymysql
-
 from database.identity import configured_identity, identity_schema_enabled
 
 
@@ -47,11 +45,9 @@ def save_metrics_db(connection, data):
             "System-metrics successfully written to the database!"
         )
 
-    except pymysql.MySQLError:
-        print(f"{timestamp}:   System metric database operation failed.")
-
-        if connection:
-            connection.rollback()
+    except BaseException:
+        connection.rollback()
+        raise
 
     finally:
         if cursor:
