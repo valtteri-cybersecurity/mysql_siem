@@ -717,3 +717,31 @@ def test_committed_transition_cannot_continue_while_legacy_writer_is_running(mys
         other.close()
     assert enroll(mysql, receipt, ufw_paths=ufw_paths, auth_paths=auth_paths) == expected
     assert checkpoint_snapshot(mysql) == before
+
+
+def test_enrollment_keeps_verified_auth_origin_and_resumes_without_duplicates(mysql, tmp_path, monkeypatch):
+    apply_environment(monkeypatch, {})
+    auth = tmp_path / 'auth.log'
+    auth.write_text(ssh_line(0) * 2)
+    assert collect_auth_events(mysql, auth, collector_id='reader')['inserted'] == 2
+    fields = 'last_position, position_hash, generation_key, prefix_sha, observed_size, observed_sha, file_mtime_ns'
+    with mysql.cursor() as cursor:
+        cursor.execute('SELECT ' + fields + ' FROM auth_ingestion_state WHERE source_scope=0')
+        original = cursor.fetchone()
+        cursor.execute('SELECT id,event_hash FROM auth_events WHERE source_scope=0 ORDER BY id')
+        events = cursor.fetchall()
+    settings = enroll(mysql, tmp_path / 'receipt.json', auth_paths=[auth])
+    source_id = settings[local.LOCAL_KEYS['auth']]
+    with mysql.cursor() as cursor:
+        cursor.execute('SELECT ' + fields + ' FROM auth_ingestion_state WHERE source_scope=%s', (source_id,))
+        assert cursor.fetchone() == original
+    apply_environment(monkeypatch, settings)
+    with auth.open('a') as output:
+        output.write(ssh_line(1))
+    assert collect_auth_events(mysql, auth, collector_id='reader')['inserted'] == 1
+    assert collect_auth_events(mysql, auth, collector_id='reader')['inserted'] == 0
+    with mysql.cursor() as cursor:
+        cursor.execute('SELECT id,event_hash FROM auth_events WHERE source_scope=0 ORDER BY id')
+        assert cursor.fetchall() == events
+        cursor.execute('SELECT generation_key FROM auth_ingestion_state WHERE source_scope=%s', (source_id,))
+        assert cursor.fetchone() == (original[2],)

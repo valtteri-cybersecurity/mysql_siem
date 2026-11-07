@@ -708,6 +708,8 @@ for path in \
     config/installation_role_setup.py \
     config/ssh.env.example \
     ingestion/auth/main.py \
+    ingestion/auth/identity.py \
+    database/auth_occurrence_schema.py \
     detection/ssh_brute_force/main.py \
     config/port_scan.env.example \
     detection/port_scan/main.py \
@@ -717,6 +719,8 @@ for path in \
     ingestion/ufw_compress.py \
     ingestion/ufw_lineage.py \
     database/ufw_archive_lineage_schema.py \
+    database/ufw_archive_retry_schema.py \
+    ingestion/ufw_archive_retry.py \
     config/ufw_rotation.py \
     config/ufw-compress.sh \
     ingestion/ufw_records.py \
@@ -979,7 +983,7 @@ grants = {
     'ufw_archives': 'SELECT, INSERT, UPDATE',
     'ufw_compression_jobs': 'SELECT, INSERT, UPDATE',
     'ufw_archive_lineage': 'SELECT, INSERT',
-    'ufw_archive_failures': 'SELECT, INSERT',
+    'ufw_archive_failures': 'SELECT, INSERT, UPDATE',
     'ufw_file_checkpoints': 'SELECT, INSERT, UPDATE',
     'ufw_collection_gaps': 'SELECT, INSERT, UPDATE',
     'ufw_archive_proofs': 'SELECT, INSERT',

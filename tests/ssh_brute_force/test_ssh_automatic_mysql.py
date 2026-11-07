@@ -11,6 +11,7 @@ from detection.ssh_brute_force.runner import run_automatic
 from ingestion.auth.collector import (
     AUTH_WRITER_LOCK,
     AuthCollectionBusy,
+    AuthCollectionError,
     collect_auth_events,
 )
 from ingestion.auth.db import save_event
@@ -280,12 +281,13 @@ def test_bounded_collection_counts_and_resumes_without_loss(automatic_mysql, tmp
     assert stats["remaining_bytes"] == 0
     replay = tmp_path / "replayed-auth.log"
     replay.write_bytes(logfile.read_bytes())
-    assert collect_auth_events(automatic_mysql, replay, collector_id="test", stats=stats)["inserted"] == 0
-    assert stats["lines_read"] == 3
-    assert stats["failures_recognized"] == 3
-    assert stats["duplicates"] == 3
-    assert stats["unrecognized_lines"] == 0
-    assert stats["invalid_lines"] == 0
-    assert stats["remaining_bytes"] == 0
-    assert stats["budget_exhausted"] is False
-    assert stats["elapsed_seconds"] >= 0
+    with automatic_mysql.cursor() as cursor:
+        cursor.execute('SELECT * FROM auth_ingestion_state ORDER BY file_device,file_inode')
+        before = cursor.fetchall()
+    with pytest.raises(AuthCollectionError, match='Ambiguous Auth occurrence'):
+        collect_auth_events(automatic_mysql, replay, collector_id='test', stats=stats)
+    with automatic_mysql.cursor() as cursor:
+        cursor.execute('SELECT * FROM auth_ingestion_state ORDER BY file_device,file_inode')
+        assert cursor.fetchall() == before
+        cursor.execute('SELECT COUNT(*) FROM auth_events')
+        assert cursor.fetchone() == (3,)

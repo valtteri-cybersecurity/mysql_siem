@@ -137,11 +137,13 @@ def test_duplicate_id_does_not_reach_threshold():
     assert detect_ssh_brute_force(events + [dict(events[0])]) == []
 
 
-def test_duplicate_hash_with_different_ids_does_not_reach_threshold():
+def test_equal_hash_with_different_saved_ids_reaches_threshold():
     events = make_events(4)
     events[0]["event_hash"] = "a" * 64
     duplicate = dict(events[0], id=99)
-    assert detect_ssh_brute_force(events + [duplicate]) == []
+    finding = detect_ssh_brute_force(events + [duplicate])[0]
+    assert finding['failure_count'] == 5
+    assert finding['evidence_ids'] == [1, 99, 2, 3, 4]
 
 
 def test_unsaved_duplicate_content_does_not_reach_threshold():
@@ -235,7 +237,7 @@ def test_publickey_failure_counts_once_and_distinct_attempts_count():
     assert event is not None
     event["id"] = 100
     duplicate = dict(event)
-    duplicate["id"] = 101
+    duplicate["id"] = 100
     assert detect_ssh_brute_force(make_events(3) + [event, duplicate]) == []
     separate = parse_auth_line(raw.replace("sshd-auth[100]", "sshd-auth[102]"))
     assert separate is not None

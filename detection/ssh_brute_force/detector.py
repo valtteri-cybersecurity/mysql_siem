@@ -54,11 +54,12 @@ def _normalize_event(event):
 
 
 def _identity_keys(event):
-    """Use durable IDs/hashes; fall back to observable content for unsaved rows."""
+    """Saved IDs identify occurrences; content hashes apply only to unsaved rows."""
     keys = []
     event_id = event.get("id")
     if type(event_id) is int and event_id > 0:
         keys.append(("id", event_id))
+        return keys
     event_hash = event.get("event_hash")
     if (isinstance(event_hash, str) and len(event_hash) == 64
             and all(char in "0123456789abcdef" for char in event_hash)):

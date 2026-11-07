@@ -484,7 +484,11 @@ def copy_checkpoints(cursor, settings, *, auth_reader, ufw_paths, auth_paths):
             ('auth_ingestion_state', 'auth_events', 'auth', auth_paths)):
         fields = 'logfile, last_position, file_device, file_inode'
         if source_type == 'auth':
+            from database.migration_steps import columns
             fields += ', collector_id, position_hash'
+            origin_fields = ('generation_key', 'prefix_sha', 'observed_size', 'observed_sha', 'file_mtime_ns')
+            if set(origin_fields).issubset(columns(cursor, table)):
+                fields += ', ' + ', '.join(origin_fields)
         cursor.execute(f'SELECT {fields} FROM {table} WHERE source_scope = 0 FOR UPDATE')
         rows = cursor.fetchall()
         cursor.execute(f'SELECT 1 FROM {events} WHERE source_scope = 0 LIMIT 1')
@@ -516,6 +520,20 @@ def copy_checkpoints(cursor, settings, *, auth_reader, ufw_paths, auth_paths):
             try:
                 validate_checkpoint(matched, device, inode, offset, digest)
                 validate_checkpoint_history(cursor, events, matched, info, offset)
+                if source_type == 'auth' and len(row) > 6 and row[6] is not None:
+                    from ingestion.auth.collector import open_logfile
+                    from ingestion.auth.identity import AuthCollectionError, start
+                    try:
+                        with open_logfile(matched) as source:
+                            opened = os.fstat(source.fileno())
+                            if (opened.st_dev, opened.st_ino) != (device, inode):
+                                raise IdentityError('The Auth checkpoint source was replaced during enrollment.')
+                            stats = {'source_resets': 0, 'coverage_gaps': 0}
+                            generation, _prefix, _observed = start(source, opened, (offset, digest) + row[6:], stats, None)
+                            if generation != row[6] or source.tell() != offset:
+                                raise IdentityError('The Auth checkpoint generation changed; manual recovery required.')
+                    except AuthCollectionError as error:
+                        raise IdentityError(str(error)) from None
             except OSError:
                 raise IdentityError('Cannot safely read a checkpoint log; manual recovery required.') from None
             # A local file already claimed by a different registered source is

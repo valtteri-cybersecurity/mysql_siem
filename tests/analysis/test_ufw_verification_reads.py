@@ -4,7 +4,9 @@ import os
 
 import pytest
 
+from database.identity import EventIdentity
 from ingestion import ufw_continuity as continuity
+from ingestion import ufw_to_mysql as ufw
 from tests.analysis.test_ufw_continuity import cursor_for_files
 
 
@@ -144,3 +146,51 @@ def test_appended_snapshot_verifies_old_observation_and_partial_prefix_in_one_pa
         assert continuity.finish(cursor, counted, str(path), info, 7, key, prefix, observed, None,
                                  generation=generation) == 'READING'
         assert counted.bytes_read == 2 * len(content)
+
+
+@pytest.mark.parametrize('initial_seconds,final_seconds,line_seconds', [(0.8, 0.8, 0.1), (1.3, 0.2, 0.01)])
+def test_measured_final_hash_reserve_prevents_repeated_rollback(tmp_path, monkeypatch, initial_seconds, final_seconds, line_seconds):
+    path = tmp_path / 'ufw.log'
+    content = b'ordinary log line\n' * 60000
+    path.write_bytes(content)
+    cursor = cursor_for_files()
+    seed(cursor, path, content, 0)
+    clock = [0.0]
+    opened = os.fdopen
+    readers = []
+    class SlowFile(CountingFile):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return self.source.__exit__(*args)
+
+        def read(self, size):
+            block = super().read(size)
+            seconds = initial_seconds
+            if self.bytes_read > len(content):
+                seconds = final_seconds
+            clock[0] += len(block) / len(content) * seconds
+            return block
+
+        def readline(self, size):
+            clock[0] += line_seconds
+            return self.source.readline(size)
+
+    def open_counted(*args, **kwargs):
+        reader = SlowFile(opened(*args, **kwargs))
+        readers.append(reader)
+        return reader
+    monkeypatch.setattr(os, 'fdopen', open_counted)
+    monkeypatch.setattr(continuity.time, 'monotonic', lambda: clock[0])
+    stats = {'lines_read': 0}
+    ufw.process_file(cursor, str(path), stats=stats, deadline=2, identity=EventIdentity(1, 7, 3))
+    assert stats['lines_read'] >= 1
+    assert stats['file_state'] == 'READING'
+    assert readers[0].bytes_read == 2 * len(content)
+    assert clock[0] < 2
+    positions = []
+    for call in cursor.execute.call_args_list:
+        if call.args[0].startswith('UPDATE ufw_file_checkpoints SET filename'):
+            positions.append(call.args[1][1])
+    assert positions == [stats['lines_read'] * len(b'ordinary log line\n')]

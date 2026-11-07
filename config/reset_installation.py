@@ -236,7 +236,7 @@ RUNTIME_TABLE_PRIVILEGES = {
     'ufw_archives': 'SELECT, INSERT, UPDATE',
     'ufw_compression_jobs': 'SELECT, INSERT, UPDATE',
     'ufw_archive_lineage': 'SELECT, INSERT',
-    'ufw_archive_failures': 'SELECT, INSERT',
+    'ufw_archive_failures': 'SELECT, INSERT, UPDATE',
     'ufw_file_checkpoints': 'SELECT, INSERT, UPDATE',
     'ufw_collection_gaps': 'SELECT, INSERT, UPDATE',
     'ufw_archive_proofs': 'SELECT, INSERT',

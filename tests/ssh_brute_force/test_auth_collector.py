@@ -1,5 +1,6 @@
 """File/state and transaction behavior without a database server."""
 
+import hashlib
 from unittest.mock import MagicMock
 
 import pymysql
@@ -17,6 +18,26 @@ from ingestion.auth.db import save_event
 from ingestion.auth.parser import parse_auth_line
 
 LINE = b"2026-10-22T12:00:00Z server-a sshd[12]: Failed password for alice from 192.0.2.1 port 22 ssh2\n"
+
+
+def prepare_cursor(cursor, state=None):
+    """Answer the checkpoint and occurrence lookups independently of query count."""
+    def fetchone():
+        sql = cursor.execute.call_args.args[0]
+        if 'GET_LOCK' in sql or 'RELEASE_LOCK' in sql:
+            return (1,)
+        if 'FROM auth_ingestion_state' in sql:
+            return state
+        return None
+    cursor.fetchone.side_effect = fetchone
+
+
+def verified_state(path, position):
+    content = path.read_bytes()
+    with path.open('rb') as source:
+        legacy_hash = position_hash(source, position)
+    return (position, legacy_hash, b'g' * 32, hashlib.sha256(content[:position]).hexdigest(),
+            len(content), hashlib.sha256(content).hexdigest(), path.stat().st_mtime_ns)
 
 
 def test_duplicate_event_only_suppresses_duplicate_key_error(monkeypatch):
@@ -53,10 +74,8 @@ def test_partial_line_waits_for_next_run(tmp_path):
 def test_resumes_position_and_reads_only_new_complete_lines(tmp_path):
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE * 2)
-    with logfile.open("rb") as infile:
-        digest = position_hash(infile, len(LINE))
     cursor = MagicMock()
-    cursor.fetchone.return_value = (len(LINE), digest)
+    prepare_cursor(cursor, verified_state(logfile, len(LINE)))
     assert process_file(cursor, str(logfile), "collector") == (1, 0)
     assert cursor.execute.call_args_list[-1].args[1][4] == len(LINE) * 2
 
@@ -81,7 +100,9 @@ def test_truncation_or_changed_checkpoint_restarts_file(tmp_path, previous_posit
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE)
     cursor = MagicMock()
-    cursor.fetchone.return_value = (previous_position, digest)
+    state = (previous_position, digest, b'g' * 32, digest, max(previous_position, len(LINE)),
+             hashlib.sha256(LINE).hexdigest(), logfile.stat().st_mtime_ns)
+    prepare_cursor(cursor, state)
     assert process_file(cursor, str(logfile), "collector") == (1, 0)
 
 
@@ -90,7 +111,7 @@ def test_database_failure_rolls_back_and_releases_lock(tmp_path):
     logfile.write_bytes(LINE)
     connection = MagicMock()
     cursor = connection.cursor.return_value
-    cursor.fetchone.side_effect = [(1,), None]
+    prepare_cursor(cursor)
 
     def fail_insert(sql, values):
         if "INSERT INTO auth_events" in sql:
@@ -138,7 +159,7 @@ def test_rotation_disappearing_between_listing_and_open_is_safe(tmp_path, monkey
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE)
     connection = MagicMock()
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    prepare_cursor(connection.cursor.return_value)
     monkeypatch.setattr("ingestion.auth.collector.get_logfiles",
                         lambda *args, **kwargs: [str(logfile) + ".1", str(logfile)])
     assert collect_auth_events(connection, logfile, collector_id="test")["inserted"] == 1
@@ -157,7 +178,7 @@ def test_new_openssh_failures_are_collected_and_detected(tmp_path, process, monk
     logfile.write_text("".join(lines))
     events = []
 
-    def capture_event(cursor, event, *, identity=None):
+    def capture_event(cursor, event, *, identity=None, **occurrence):
         events.append(event)
         return 1
 
@@ -173,7 +194,7 @@ def test_invalid_utf8_rolls_back_events_and_checkpoint(tmp_path):
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE + b"\xff\n")
     connection = MagicMock()
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    prepare_cursor(connection.cursor.return_value)
     stats = {}
     with pytest.raises(AuthCollectionError, match="UTF-8"):
         collect_auth_events(connection, logfile, collector_id="test", stats=stats)
@@ -193,12 +214,12 @@ def test_syslog_without_context_remains_replayable_then_succeeds(tmp_path):
     logfile.write_bytes(LINE.replace(b"2026-10-22T12:00:00Z", b"Oct 22 12:00:00"))
     connection = MagicMock()
     cursor = connection.cursor.return_value
-    cursor.fetchone.side_effect = [(1,), None]
+    prepare_cursor(cursor)
     with pytest.raises(AuthParseError, match="confirmed source interval"):
         collect_auth_events(connection, logfile, collector_id="test")
     connection.rollback.assert_called_once()
     connection.commit.assert_not_called()
-    cursor.fetchone.side_effect = [(1,), None]
+    prepare_cursor(cursor)
     result = collect_auth_events(connection, logfile, collector_id="test",
                                  syslog_start=datetime(2026, 10, 22, tzinfo=timezone.utc),
                                  syslog_end=datetime(2026, 10, 23, tzinfo=timezone.utc),
@@ -210,10 +231,8 @@ def test_syslog_without_context_remains_replayable_then_succeeds(tmp_path):
 def test_unchanged_checkpoint_does_not_write_state_again(tmp_path):
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE)
-    with logfile.open("rb") as infile:
-        digest = position_hash(infile, len(LINE))
     cursor = MagicMock()
-    cursor.fetchone.return_value = (len(LINE), digest)
+    prepare_cursor(cursor, verified_state(logfile, len(LINE)))
     assert process_file(cursor, str(logfile), "test") == (0, 0)
     for call in cursor.execute.call_args_list:
         assert "INSERT" not in call.args[0]
@@ -224,8 +243,12 @@ def test_elapsed_budget_commits_complete_lines_and_retains_backlog(tmp_path, mon
     logfile.write_bytes(LINE * 3)
     cursor = MagicMock()
     cursor.fetchone.return_value = None
-    clock = iter([0, 10])
-    monkeypatch.setattr("ingestion.auth.collector.time.monotonic", lambda: next(clock))
+    clock = [0]
+    monkeypatch.setattr("ingestion.auth.collector.time.monotonic", lambda: clock[0])
+    def saved(*args, **kwargs):
+        clock[0] = 4
+        return 1
+    monkeypatch.setattr('ingestion.auth.collector.save_event', saved)
     stats = {}
     assert process_file(cursor, str(logfile), "test", stats=stats, deadline=5) == (1, 0)
     assert stats["budget_exhausted"] is True
@@ -238,7 +261,7 @@ def test_line_budget_is_shared_across_rotations(tmp_path):
     logfile.write_bytes(LINE)
     (tmp_path / "auth.log.1").write_bytes(LINE * 3)
     connection = MagicMock()
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None, None]
+    prepare_cursor(connection.cursor.return_value)
     stats = {}
     assert collect_auth_events(connection, logfile, collector_id="test", stats=stats,
                                max_lines=2) == {"inserted": 2, "skipped": 0}
@@ -289,7 +312,7 @@ def test_truncate_and_regrow_during_pass_rolls_back(tmp_path, monkeypatch):
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE * 3)
     connection = MagicMock()
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    prepare_cursor(connection.cursor.return_value)
 
     def replace_event(*args, **kwargs):
         logfile.write_bytes(LINE.replace(b"alice", b"other") * 4)
@@ -342,7 +365,7 @@ def test_commit_failure_rolls_back_checkpoint_and_events(tmp_path):
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE)
     connection = MagicMock()
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    prepare_cursor(connection.cursor.return_value)
     connection.commit.side_effect = pymysql.OperationalError(2013, "synthetic disconnect")
     with pytest.raises(pymysql.OperationalError):
         collect_auth_events(connection, logfile, collector_id="test")
@@ -390,7 +413,7 @@ def test_compressed_rotation_is_reported_without_decompression(tmp_path):
     logfile.write_bytes(LINE)
     (tmp_path / "auth.log.2.gz").write_bytes(b"not opened or decompressed")
     connection = MagicMock()
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    prepare_cursor(connection.cursor.return_value)
     stats = {}
     result = collect_auth_events(connection, logfile, collector_id="test", stats=stats)
     assert result["inserted"] == 1
@@ -404,7 +427,7 @@ def test_disappearing_rotation_reports_coverage_gap(tmp_path, monkeypatch):
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE)
     connection = MagicMock()
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    prepare_cursor(connection.cursor.return_value)
     monkeypatch.setattr("ingestion.auth.collector.get_logfiles",
                         lambda *args, **kwargs: [str(logfile) + ".1", str(logfile)])
     stats = {}
@@ -418,7 +441,7 @@ def test_cleanup_failure_retains_confirmed_commit_state(tmp_path):
     logfile.write_bytes(LINE)
     connection = MagicMock()
     cursor = connection.cursor.return_value
-    cursor.fetchone.side_effect = [(1,), None]
+    prepare_cursor(cursor)
 
     def fail_release(sql, parameters):
         if "RELEASE_LOCK" in sql:
@@ -436,7 +459,7 @@ def test_commit_ack_failure_has_unknown_state(tmp_path):
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE)
     connection = MagicMock()
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    prepare_cursor(connection.cursor.return_value)
     connection.commit.side_effect = pymysql.OperationalError(2013, "synthetic lost acknowledgement")
     stats = {}
     with pytest.raises(pymysql.OperationalError):

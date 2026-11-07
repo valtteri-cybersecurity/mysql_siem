@@ -376,7 +376,16 @@ def test_migration_conflicts_stop_read_only_preflight_before_maintenance(mysql, 
 
 @pytest.mark.parametrize('status', ['APPLIED', 'RUNNING', 'FAILED'])
 def test_migration_history_preflight_accepts_original_sources_using_select_only(mysql, status, monkeypatch):
-    from database import ufw_archive_lineage_schema, ufw_occurrence_schema
+    from database import (
+        auth_occurrence_schema,
+        ufw_archive_lineage_schema,
+        ufw_archive_retry_schema,
+        ufw_occurrence_schema,
+    )
+    auth_guard = Mock()
+    monkeypatch.setattr(auth_occurrence_schema, "verify", auth_guard)
+    retry_guard = Mock()
+    monkeypatch.setattr(ufw_archive_retry_schema, "verify", retry_guard)
     lineage_guard = Mock()
     monkeypatch.setattr(ufw_archive_lineage_schema, "verify", lineage_guard)
     occurrence_guard = Mock()
@@ -397,10 +406,14 @@ def test_migration_history_preflight_accepts_original_sources_using_select_only(
         guard.assert_called_once_with(mysql.connection)
         occurrence_guard.assert_called_once_with(mysql.connection)
         lineage_guard.assert_called_once_with(mysql.connection)
+        retry_guard.assert_called_once_with(mysql.connection)
+        auth_guard.assert_called_once_with(mysql.connection)
     else:
         guard.assert_not_called()
         occurrence_guard.assert_not_called()
         lineage_guard.assert_not_called()
+        retry_guard.assert_not_called()
+        auth_guard.assert_not_called()
     mysql.connection.commit.assert_not_called()
     for call in mysql.cursor.execute.call_args_list:
         assert call.args[0].startswith('SELECT ')

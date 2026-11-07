@@ -14,6 +14,7 @@ import pymysql
 import pytest
 
 from database.auth_migrations import upgrade_auth_events
+from database.auth_occurrence_schema import upgrade as upgrade_occurrences
 from detection.ssh_brute_force.detector import detect_ssh_brute_force
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -96,6 +97,15 @@ def mysql(private_server, apply_migration):
         connection.select_db(schema_name)
         apply_migration(connection, "007_auth_events.sql")
         upgrade_auth_events(connection, ROOT / "database/migrations/021_auth_logins.sql")
+        # Keep this small standalone fixture in the same scoped shape as migration 016.
+        with connection.cursor() as cursor:
+            cursor.execute('ALTER TABLE auth_events ADD COLUMN source_scope BIGINT UNSIGNED NOT NULL DEFAULT 0')
+            cursor.execute('ALTER TABLE auth_events DROP INDEX uq_auth_event_hash, '
+                           'ADD UNIQUE KEY uq_auth_event_hash (source_scope,event_hash)')
+            cursor.execute('ALTER TABLE auth_ingestion_state ADD COLUMN source_scope BIGINT UNSIGNED NOT NULL DEFAULT 0')
+            cursor.execute('ALTER TABLE auth_ingestion_state DROP PRIMARY KEY, '
+                           'ADD PRIMARY KEY (collector_id,file_device,file_inode,source_scope)')
+        upgrade_occurrences(connection)
         connection.commit()
         yield connection
     finally:

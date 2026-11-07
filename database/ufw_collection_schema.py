@@ -58,7 +58,17 @@ def verify(connection, *, continuity=False, filtering=False, occurrences=False):
             actual = []
             for row in cursor.fetchall():
                 actual.append(row[0])
-            if actual != names.split():
+            # Additive retry DDL may be partially applied after an interruption.
+            # Older migration checks validate their own columns, without rejecting
+            # the known appended fields. Migration 031 separately requires all of them.
+            from database.ufw_archive_retry_schema import COLUMNS
+            extra = []
+            for field in COLUMNS.get(table, ()):
+                extra.append(field[0])
+            expected = names.split()
+            if len(actual) > len(expected):
+                expected.extend(extra[:len(actual) - len(expected)])
+            if actual != expected:
                 raise MigrationError('Incompatible UFW collector columns: ' + table)
             cursor.execute('SELECT index_name,non_unique,column_name FROM information_schema.statistics '
                            'WHERE table_schema=DATABASE() AND table_name=%s ORDER BY index_name,seq_in_index', (table,))

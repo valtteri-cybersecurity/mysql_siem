@@ -6,7 +6,11 @@ import pymysql
 import pytest
 
 from detection.ssh_brute_force.detector import detect_ssh_brute_force
-from ingestion.auth.collector import AUTH_WRITER_LOCK, collect_auth_events
+from ingestion.auth.collector import (
+    AUTH_WRITER_LOCK,
+    AuthCollectionError,
+    collect_auth_events,
+)
 from ingestion.auth.db import save_event
 from ingestion.auth.parser import parse_auth_line
 
@@ -73,8 +77,9 @@ def test_copytruncate_and_regrow_past_old_position(mysql, tmp_path):
     collect_auth_events(mysql, logfile, collector_id="test")
     (tmp_path / "auth.log.1").write_text(line(0))
     logfile.write_text(line(1) + line(2))
-    assert collect_auth_events(mysql, logfile, collector_id="test")["inserted"] == 2
-    assert len(read_events(mysql)) == 3
+    with pytest.raises(AuthCollectionError, match="Ambiguous Auth occurrence"):
+        collect_auth_events(mysql, logfile, collector_id="test")
+    assert len(read_events(mysql)) == 1
 
 
 def test_changed_source_path_replay_does_not_duplicate(mysql, tmp_path):
@@ -83,8 +88,9 @@ def test_changed_source_path_replay_does_not_duplicate(mysql, tmp_path):
     first.write_text(line(0))
     collect_auth_events(mysql, first, collector_id="test")
     second.write_text(line(0) + line(1))
-    assert collect_auth_events(mysql, second, collector_id="test")["inserted"] == 1
-    assert len(read_events(mysql)) == 2
+    with pytest.raises(AuthCollectionError, match="Ambiguous Auth occurrence"):
+        collect_auth_events(mysql, second, collector_id="test")
+    assert len(read_events(mysql)) == 1
 
 
 def test_database_error_rolls_back_events_and_position_and_allows_retry(mysql, tmp_path):

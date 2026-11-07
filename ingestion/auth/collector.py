@@ -9,7 +9,9 @@ import time
 from pathlib import Path
 
 from database.identity import configured_identity
+from ingestion.auth import identity as origin
 from ingestion.auth.db import load_position, save_event, save_position
+from ingestion.auth.identity import AuthCollectionError
 from ingestion.auth.parser import (
     ISO_TIME,
     SYSLOG_TIME,
@@ -23,10 +25,6 @@ AUTH_WRITER_LOCK = "mysql_siem_auth_events_writer"
 MAX_LINES = 5000
 MAX_SECONDS = 30
 MAX_LINE_BYTES = 60002
-
-
-class AuthCollectionError(RuntimeError):
-    """An expected source or checkpoint failure prevents safe progress."""
 
 
 class AuthCollectionBusy(RuntimeError):
@@ -56,9 +54,10 @@ def get_logfiles(logfile, *, stats=None):
 
 def open_logfile(filename):
     """Reject non-files without blocking on a misconfigured pipe or device."""
-    descriptor = os.open(filename, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+    descriptor = os.open(filename, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY | os.O_NOFOLLOW)
     infile = os.fdopen(descriptor, "rb")
-    if not stat.S_ISREG(os.fstat(infile.fileno()).st_mode):
+    info = os.fstat(infile.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         infile.close()
         raise AuthCollectionError("The auth source must be a regular file.")
     return infile
@@ -135,30 +134,23 @@ def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_L
         if identity is not None:
             source_scope = identity.source_id
         state = load_position(cursor, collector_id, info.st_dev, info.st_ino,
-                              source_scope=source_scope)
-        position = 0
-        if state is not None:
-            previous_position, previous_hash = state
-            if type(previous_position) is not int or previous_position < 0:
-                raise AuthCollectionError("Invalid auth checkpoint position.")
-            if (previous_position <= info.st_size
-                    and position_hash(infile, previous_position) == previous_hash):
-                position = previous_position
-            else:
-                # Replay surviving bytes, but lost pre-truncation bytes cannot
-                # be proven complete from a checkpoint fingerprint alone.
-                stats["source_resets"] += 1
-                stats["coverage_gaps"] += 1
-        anchor_position = max(position, min(info.st_size, 256))
-        anchor_digest = position_hash(infile, anchor_position)
-        infile.seek(position)
+                              source_scope=source_scope, with_origin=True)
+        verification_started = time.monotonic()
+        generation, prefix, observed = origin.start(infile, info, state, stats, deadline)
+        read_deadline = deadline
+        if deadline is not None:
+            now = time.monotonic()
+            remaining = max(0, deadline - now)
+            reserve = max(remaining * 0.3, (now - verification_started) * 1.25)
+            reserve = min(reserve, remaining * 0.9)
+            read_deadline = now + max(0, remaining - reserve)
 
         # Bound memory as well as lines; never consume an unfinished log record.
         while infile.tell() < info.st_size:
             if lines_read >= line_limit:
                 stats["budget_exhausted"] = True
                 break
-            if deadline is not None and time.monotonic() >= deadline:
+            if read_deadline is not None and time.monotonic() >= read_deadline:
                 stats["budget_exhausted"] = True
                 break
             start = infile.tell()
@@ -172,6 +164,7 @@ def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_L
                     raise AuthCollectionError("Auth line exceeds the safe size limit.")
                 stats["waiting_for_line"] = True
                 break
+            prefix.update(raw_line)
             lines_read += 1
             stats["lines_read"] += 1
             try:
@@ -195,20 +188,19 @@ def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_L
                 stats["successes_recognized"] += 1
             else:
                 stats["local_logins_recognized"] += 1
-            saved = save_event(cursor, event, identity=identity)
+            saved = save_event(cursor, event, identity=identity, generation=generation, position=start)
             inserted += saved
             stats["duplicates"] += 1 - saved
 
         position = infile.tell()
-        if os.fstat(infile.fileno()).st_size < position:
-            raise AuthCollectionError("Auth source was truncated during collection.")
-        if position_hash(infile, anchor_position) != anchor_digest:
-            raise AuthCollectionError("Auth source content changed during collection.")
         digest = position_hash(infile, position)
-        # Idle minute passes need SELECT and a bounded fingerprint, not an UPDATE.
-        if state != (position, digest):
+        mtime_ns = origin.finish(infile, info, prefix, observed, deadline)
+        current = (position, digest, generation, prefix.hexdigest(), info.st_size, observed, mtime_ns)
+        if state != current:
             save_position(cursor, collector_id, info.st_dev, info.st_ino,
-                          filename, position, digest, source_scope=source_scope)
+                          filename, position, digest, source_scope=source_scope, generation=generation,
+                          prefix_sha=prefix.hexdigest(), observed_size=info.st_size,
+                          observed_sha=observed, mtime_ns=mtime_ns)
         stats["files_processed"] += 1
         stats["remaining_bytes"] += max(0, info.st_size - position)
     return inserted, skipped

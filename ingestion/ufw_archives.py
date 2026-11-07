@@ -1,11 +1,13 @@
 """Private, CRC-verified gzip spools; persistent logical offsets, one bounded worker."""
 import argparse
+import errno
 import fcntl
 import gzip
 import hashlib
 import json
 import os
 import resource
+import secrets
 import shutil
 import signal
 import stat
@@ -24,6 +26,31 @@ MAX_RATIO = 200
 WORKER_SECONDS = 120
 RESERVE_FREE = 256 * 1024 * 1024
 CHUNK = 65536
+
+
+MAX_ATTEMPTS = 3
+RETRY_SECONDS = 60
+TRANSIENT = ('ARCHIVE_DISK_LIMIT', 'ARCHIVE_HASH_TIME_LIMIT', 'ARCHIVE_DECOMPRESSION_TIME_LIMIT',
+             'ARCHIVE_WALL_TIME_LIMIT', 'ARCHIVE_IO_TRANSIENT', 'WORKER_INTERRUPTED', 'ARCHIVE_SPOOL_MISSING')
+IO_ERRORS = (errno.EAGAIN, errno.EBUSY, errno.EIO, errno.ETIMEDOUT, errno.ENOSPC, errno.EDQUOT,
+             errno.EMFILE, errno.ENFILE, errno.EACCES)
+
+
+def error_reason(error):
+    if isinstance(error, OSError) and error.errno in IO_ERRORS:
+        return 'ARCHIVE_IO_TRANSIENT'
+    if error.args and error.args[0] in TRANSIENT:
+        return error.args[0]
+    return None
+
+
+def manifest_reason(record):
+    reason = record.get('reason', 'ARCHIVE_UNVERIFIED')
+    if record.get('cleanup_error'):
+        return 'ARCHIVE_CLEANUP_UNVERIFIED'
+    if not isinstance(reason, str) or len(reason) > 64:
+        return 'ARCHIVE_UNVERIFIED'
+    return reason
 
 
 def regular(path, flags=os.O_RDONLY):
@@ -191,11 +218,22 @@ def worker(filename, folder, digest):
     manifest = folder / (digest + '.json')
     data = folder / (digest + '.data')
     temporary = folder / (digest + '.part')
+    attempt = read_manifest(manifest)
+    attempts = 1
+    restarts = 0
+    if attempt is not None:
+        attempts = attempt.get('attempts', 1)
+        restarts = attempt.get('restarts', 0)
     try:
         deadline = time.monotonic() + WORKER_SECONDS
         actual, initial = archive_digest(filename, deadline)
         if actual != digest:
             raise OSError('ARCHIVE_CHANGED')
+        # A failed publication may leave a disposable spool, never accepted as READY.
+        if data.exists() or data.is_symlink():
+            descriptor = private_file(data)
+            os.close(descriptor)
+            data.unlink()
         used = 0
         # The inherited single-worker lock excludes another active extraction.
         # Reclaim crashed/failed extractions before reserving space for new data.
@@ -236,9 +274,11 @@ def worker(filename, folder, digest):
         os.replace(temporary, data)
         write_manifest(manifest, {'status': 'READY', 'sha256': digest,
                                  'expanded_sha256': expanded_hash.hexdigest(),
-                                 'signature': signature(data.stat())})
+                                 'signature': signature(data.stat()), 'attempts': attempts, 'restarts': restarts})
     except (OSError, EOFError, ValueError, zlib.error) as error:
-        reason = 'ARCHIVE_IO_ERROR'
+        reason = error_reason(error)
+        if reason is None:
+            reason = 'ARCHIVE_IO_ERROR'
         if isinstance(error, gzip.BadGzipFile):
             reason = 'GZIP_CRC_OR_HEADER'
         elif isinstance(error, EOFError):
@@ -249,7 +289,8 @@ def worker(filename, folder, digest):
                                              'ARCHIVE_DECOMPRESSION_TIME_LIMIT', 'ARCHIVE_HASH_TIME_LIMIT',
                                              'ARCHIVE_COMPRESSED_LIMIT', 'ARCHIVE_WALL_TIME_LIMIT'):
             reason = error.args[0]
-        record = {'status': 'ERROR', 'class': type(error).__name__, 'reason': reason}
+        record = {'status': 'ERROR', 'class': type(error).__name__, 'reason': reason,
+                  'attempts': attempts, 'restarts': restarts, 'retry_after': int(time.time()) + RETRY_SECONDS}
         try:
             discard_partial(folder, digest)
         except OSError as cleanup_error:
@@ -265,7 +306,7 @@ def prepare(filename, digest):
     folder = cache_directory()
     manifest = folder / (digest + '.json')
     record = read_manifest(manifest)
-    if record is not None and record.get('status') in ('READY', 'ERROR'):
+    if record is not None and record.get('status') == 'READY':
         return record
     lock = regular(folder / '.worker.lock', os.O_RDWR | os.O_CREAT)
     try:
@@ -273,18 +314,52 @@ def prepare(filename, digest):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return {'status': 'BUSY'}
+        record = read_manifest(manifest)
+        attempts = 0
         restarts = 0
         if record is not None:
-            restarts = record.get('restarts', 0) + 1
-            if restarts > 1:
-                write_manifest(manifest, {'status': 'ERROR', 'class': 'WORKER_INTERRUPTED'})
-                return {'status': 'ERROR'}
-        write_manifest(manifest, {'status': 'WORKING', 'restarts': restarts})
-        subprocess.Popen([sys.executable, '-I', '-B', str(Path(__file__).resolve()),
-                          '--worker', filename, str(folder), digest, str(lock)],
-                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         start_new_session=True, pass_fds=(lock,),
-                         env={'PATH': os.defpath, 'LANG': 'C.UTF-8'})
+            if record.get('status') == 'READY':
+                return record
+            attempts = record.get('attempts', 1)
+            restarts = record.get('restarts', 0)
+            if type(attempts) is not int or not 1 <= attempts <= MAX_ATTEMPTS:
+                raise ValueError('INVALID_ARCHIVE_ATTEMPTS')
+            if type(restarts) is not int or not 0 <= restarts <= 1:
+                raise ValueError('INVALID_ARCHIVE_RESTARTS')
+            if record.get('status') == 'ERROR':
+                if manifest_reason(record) not in TRANSIENT or attempts >= MAX_ATTEMPTS:
+                    return record
+                after = record.get('retry_after', 0)
+                if type(after) is not int or after < 0:
+                    raise ValueError('INVALID_ARCHIVE_RETRY_TIME')
+                if time.time() < after:
+                    return record
+            elif record.get('status') == 'WORKING':
+                restarts += 1
+                if restarts > 1 or attempts >= MAX_ATTEMPTS:
+                    record = {'status': 'ERROR', 'class': 'WORKER_INTERRUPTED', 'reason': 'WORKER_INTERRUPTED',
+                              'attempts': MAX_ATTEMPTS, 'restarts': 1}
+                    write_manifest(manifest, record)
+                    return record
+            else:
+                raise ValueError('INVALID_ARCHIVE_WORKER_STATE')
+        attempts += 1
+        write_manifest(manifest, {'status': 'WORKING', 'attempts': attempts, 'restarts': restarts})
+        try:
+            subprocess.Popen([sys.executable, '-I', '-B', str(Path(__file__).resolve()),
+                              '--worker', filename, str(folder), digest, str(lock)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True, pass_fds=(lock,),
+                             env={'PATH': os.defpath, 'LANG': 'C.UTF-8'})
+        except OSError as error:
+            reason = error_reason(error)
+            if reason is None:
+                reason = 'WORKER_START_FAILED'
+            record = {'status': 'ERROR', 'class': type(error).__name__,
+                      'reason': reason, 'attempts': attempts,
+                      'restarts': restarts, 'retry_after': int(time.time()) + RETRY_SECONDS}
+            write_manifest(manifest, record)
+            return record
         return {'status': 'WORKING'}
     finally:
         os.close(lock)  # The child retains the open file description and its lock.
@@ -295,6 +370,7 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
     import pymysql
 
     from database.identity import configured_identity
+    from ingestion import ufw_archive_retry as retry
     from ingestion.ufw_batch import EventBatch, OccurrenceConflict
     from ingestion.ufw_continuity import gap, prove_archive, record_proof
     from ingestion.ufw_lineage import archive_binding, output_job, verify_binding
@@ -311,16 +387,24 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
     if identity is not None:
         scope = identity.source_id
     cache_directory()
+    with connection.cursor() as cursor:
+        retry.resume_due(cursor, scope)
+    connection.commit()  # Persist the retry count before any extraction can start.
     candidates = discover(logfile)
     for index, (_number, filename) in enumerate(candidates):
         if time.monotonic() >= deadline:
             totals['archives_unscanned'] += len(candidates) - index
             break
         job = None
+        candidate_info = None
         try:
-            with os.fdopen(regular(filename), 'rb') as candidate:
-                candidate_info = os.fstat(candidate.fileno())
+            candidate_info = os.stat(filename, follow_symlinks=False)
+            if not stat.S_ISREG(candidate_info.st_mode) or candidate_info.st_nlink != 1:
+                raise OSError('UNSAFE_ARCHIVE_FILE')
             with connection.cursor() as cursor:
+                if not retry.discovery_allowed(cursor, scope, candidate_info):
+                    continue
+                connection.commit()  # A recheck attempt survives process interruption.
                 job = output_job(cursor, scope, candidate_info)
             if candidate_info.st_size == 0 or (job is not None and job[0] != 'READY'):
                 totals['archives_unscanned'] += 1
@@ -340,15 +424,31 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
             if error.args and error.args[0] == 'ARCHIVE_HASH_TIME_LIMIT':
                 totals['archives_unscanned'] += len(candidates) - index
                 break
-            failure_key = hashlib.sha256(os.fsencode(filename)).hexdigest()
+            failure_key = secrets.token_hex(32)
             with connection.cursor() as cursor:
                 if isinstance(error, FileNotFoundError):
                     gap(cursor, scope, 0, 'ARCHIVE_MISSING', filename)
-                cursor.execute('SELECT 1 FROM ufw_archive_failures WHERE source_scope=%s AND source_key=%s',
-                               (scope, failure_key))
+                known = None
+                if candidate_info is not None:
+                    cursor.execute('SELECT archive_sha FROM ufw_archives WHERE source_scope=%s '
+                                   'AND file_device=%s AND file_inode=%s AND file_mtime_ns=%s',
+                                   (scope, candidate_info.st_dev, candidate_info.st_ino, candidate_info.st_mtime_ns))
+                    matches = cursor.fetchall()
+                    if len(matches) == 1:
+                        known = matches[0][0]
+                retryable = error_reason(error) is not None and known is not None
+                cursor.execute('SELECT 1 FROM ufw_archive_failures WHERE source_scope=%s AND filename=%s '
+                               'AND reason=%s AND archive_sha <=> %s AND resolved_at IS NULL LIMIT 1',
+                               (scope, filename, type(error).__name__, known))
                 if cursor.fetchone() is None:
-                    cursor.execute('INSERT INTO ufw_archive_failures (source_scope,source_key,filename,reason) '
-                                   'VALUES (%s,%s,%s,%s)', (scope, failure_key, filename, type(error).__name__))
+                    cursor.execute('INSERT INTO ufw_archive_failures '
+                                   '(source_scope,source_key,filename,reason,archive_sha,retryable) '
+                                   'VALUES (%s,%s,%s,%s,%s,%s)',
+                                   (scope, failure_key, filename, type(error).__name__, known, retryable))
+                if retryable:
+                    cursor.execute("SELECT status FROM ufw_archives WHERE source_scope=%s AND archive_sha=%s", (scope, known))
+                    complete = cursor.fetchone() == ('COMPLETE',)
+                    retry.failed(cursor, scope, known, error_reason(error), complete=complete)
             connection.commit()
             print(f'UFW archive: FAILED class={type(error).__name__} stage=discovery file={filename!r}')
             continue
@@ -369,30 +469,43 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
                     gap(cursor, scope, 0, 'AMBIGUOUS_SOURCE', filename)
                     connection.commit()
                     raise OccurrenceConflict('UFW_AMBIGUOUS_ARCHIVE_GENERATION')
+                cursor.execute('UPDATE ufw_archives SET filename=%s WHERE source_scope=%s AND archive_sha=%s',
+                               (filename, scope, digest))
             if existing is None:
                 cursor.execute('INSERT INTO ufw_archives (source_scope,archive_sha,filename,file_device,file_inode,file_mtime_ns) '
                                'VALUES (%s,%s,%s,%s,%s,%s)', (scope, digest, filename, info[0], info[1], info[3]))
+            if existing is not None and existing[0] == 'FAILED':
+                retry.adopt_legacy(cursor, scope, digest, read_manifest(CACHE / (digest + '.json')))
+            retry.resolve(cursor, scope, digest)
         connection.commit()
     with connection.cursor() as cursor:
         cursor.execute("SELECT COUNT(*) FROM ufw_archives WHERE source_scope=%s AND status <> 'COMPLETE'", (scope,))
         totals['archives_pending'] = cursor.fetchone()[0]
-        cursor.execute("SELECT archive_sha,filename,file_device,file_inode,logical_position,status FROM ufw_archives "
+        cursor.execute("SELECT archive_sha,filename,file_device,file_inode,logical_position,status,file_mtime_ns FROM ufw_archives "
                        "WHERE source_scope=%s AND status IN ('PENDING','READING') ORDER BY checked_at,archive_sha LIMIT 64", (scope,))
         pending = cursor.fetchall()
-    for digest, filename, device, inode, position, status in pending:
+    for digest, filename, device, inode, position, status, mtime in pending:
         if time.monotonic() >= deadline or totals['lines_read'] >= max_lines:
             break
         part = {'lines_read': 0, 'inserted': 0, 'duplicates': 0, 'quarantined': 0, 'non_ufw': 0, 'filtered': 0}
+        failure_reason = None
         try:
-            if status == 'FAILED':
-                raise OSError('ARCHIVE_PREVIOUSLY_FAILED')
+            saved = read_manifest(CACHE / (digest + '.json'))
+            if saved is None or saved.get('status') != 'READY':
+                with os.fdopen(regular(filename), 'rb') as original:
+                    info = os.fstat(original.fileno())
+                if (info.st_dev, info.st_ino) != (device, inode):
+                    raise OccurrenceConflict('UFW_AMBIGUOUS_ARCHIVE_COPY')
+                if mtime is not None and info.st_mtime_ns != mtime:
+                    raise OccurrenceConflict('UFW_AMBIGUOUS_ARCHIVE_GENERATION')
             record = prepare(filename, digest)
             if record['status'] in ('BUSY', 'WORKING'):
                 continue
             if record['status'] != 'READY' or record.get('sha256') != digest:
                 if record.get('class') == 'FileNotFoundError':
                     raise FileNotFoundError('ARCHIVE_SOURCE_MISSING')
-                reason = record.get('reason', 'ARCHIVE_UNVERIFIED')
+                reason = manifest_reason(record)
+                failure_reason = reason
                 if reason not in ('GZIP_CRC_OR_HEADER', 'GZIP_TRUNCATED', 'GZIP_DEFLATE', 'ARCHIVE_CHANGED',
                                   'ARCHIVE_DISK_LIMIT', 'ARCHIVE_EXPANSION_LIMIT', 'ARCHIVE_DECOMPRESSION_TIME_LIMIT',
                                   'ARCHIVE_HASH_TIME_LIMIT', 'ARCHIVE_COMPRESSED_LIMIT', 'ARCHIVE_WALL_TIME_LIMIT'):
@@ -400,7 +513,16 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
                 print(f'UFW archive: FAILED reason={reason} file={filename!r}')
                 raise OSError('ARCHIVE_NOT_VERIFIED')
             path = CACHE / (digest + '.data')
-            with os.fdopen(private_file(path), 'rb') as source:
+            try:
+                spool = private_file(path)
+            except FileNotFoundError:
+                failure_reason = 'ARCHIVE_SPOOL_MISSING'
+                interrupted = dict(record)
+                interrupted.update({'status': 'ERROR', 'reason': failure_reason,
+                                    'retry_after': int(time.time()) + RETRY_SECONDS})
+                write_manifest(CACHE / (digest + '.json'), interrupted)
+                raise OSError(failure_reason) from None
+            with os.fdopen(spool, 'rb') as source:
                 if signature(os.fstat(source.fileno())) != record['signature']:
                     raise OSError('ARCHIVE_SPOOL_CHANGED')
                 connection.begin()
@@ -438,12 +560,8 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
                     record_proof(cursor, scope, digest, record['signature'][2], record['expanded_sha256'])
                     cursor.execute('UPDATE ufw_archives SET logical_position=%s,status=%s,checked_at=CURRENT_TIMESTAMP(6) '
                                    'WHERE source_scope=%s AND archive_sha=%s', (position, new_status, scope, digest))
-                connection.commit()
-            for key, value in part.items():
-                totals[key] += value
-            if complete:
-                totals['archives_pending'] -= 1
-                path.unlink()  # Only our disposable, committed spool; never the source archive.
+                    retry.resolve(cursor, scope, digest)
+            connection.commit()
         except (OSError, EOFError, ValueError, RuntimeError, pymysql.MySQLError) as error:
             connection.rollback()
             if isinstance(error, pymysql.MySQLError):
@@ -456,14 +574,27 @@ def process_archives(connection, logfile, *, max_lines, deadline, totals=None):
                 with connection.cursor() as cursor:
                     if isinstance(error, FileNotFoundError):
                         gap(cursor, scope, 0, 'ARCHIVE_MISSING', filename)
-                    cursor.execute("UPDATE ufw_archives SET status='FAILED',checked_at=CURRENT_TIMESTAMP(6) WHERE source_scope=%s AND archive_sha=%s",
-                                   (scope, digest))
+                    if failure_reason is None:
+                        failure_reason = error_reason(error)
+                        if failure_reason is None:
+                            failure_reason = type(error).__name__
+                    retry.failed(cursor, scope, digest, failure_reason)
                 connection.commit()
+            continue
+        # Everything below follows a successful COMMIT and cannot undo its state.
+        for key, value in part.items():
+            totals[key] += value
+        if complete:
+            totals['archives_pending'] -= 1
+            try:
+                path.unlink()  # Only the disposable spool, never the source archive.
+            except OSError as error:
+                print(f'UFW archive spool cleanup deferred: {type(error).__name__} archive_sha={digest}')
     with connection.cursor() as cursor:
         cursor.execute("SELECT COUNT(*) FROM ufw_archives WHERE source_scope=%s AND status='FAILED'", (scope,))
         failed = cursor.fetchone()[0]
         totals['archive_errors'] += failed
-        cursor.execute('SELECT COUNT(*) FROM ufw_archive_failures WHERE source_scope=%s', (scope,))
+        cursor.execute('SELECT COUNT(*) FROM ufw_archive_failures WHERE source_scope=%s AND resolved_at IS NULL', (scope,))
         totals['archive_errors'] += cursor.fetchone()[0]
     return totals
 

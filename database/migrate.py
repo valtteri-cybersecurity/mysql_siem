@@ -52,6 +52,8 @@ MIGRATIONS = (
     ("028", "ufw_analysis_time_basis_indexes", ROOT / "migrations/028_ufw_analysis_time_basis_indexes.sql"),
     ("029", "ufw_occurrences", ROOT / "ufw_occurrence_schema.py"),
     ("030", "ufw_archive_lineage", ROOT / "ufw_archive_lineage_schema.py"),
+    ("031", "ufw_archive_retries", ROOT / "ufw_archive_retry_schema.py"),
+    ("032", "auth_occurrences", ROOT / "auth_occurrence_schema.py"),
 )
 
 
@@ -203,6 +205,12 @@ def check_migration_history(connection):
         verify(connection)
     if records.get('030', (None, None))[1] == 'APPLIED':
         from database.ufw_archive_lineage_schema import verify
+        verify(connection)
+    if records.get('031', (None, None))[1] == 'APPLIED':
+        from database.ufw_archive_retry_schema import verify
+        verify(connection)
+    if records.get('032', (None, None))[1] == 'APPLIED':
+        from database.auth_occurrence_schema import verify
         verify(connection)
     return records
 
@@ -562,6 +570,14 @@ def apply_one(connection, version):
     elif version == "020":
         from database.audit_migrations import upgrade_audit
         upgrade_audit(connection, ROOT / "migrations/020_audit.sql")
+
+    elif version == "032":
+        from database.auth_occurrence_schema import upgrade
+        upgrade(connection)
+
+    elif version == "031":
+        from database.ufw_archive_retry_schema import upgrade
+        upgrade(connection)
 
     elif version == "030":
         from database.ufw_archive_lineage_schema import upgrade

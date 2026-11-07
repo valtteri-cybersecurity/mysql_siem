@@ -4,6 +4,7 @@ import pytest
 
 from ingestion.auth import main
 from ingestion.auth.collector import AuthCollectionBusy, process_file
+from tests.ssh_brute_force.test_auth_collector import prepare_cursor
 
 LINE = b"2026-10-22T12:00:00Z server-a sshd[12]: Failed password for alice from 192.0.2.1 port 22 ssh2\n"
 
@@ -100,7 +101,7 @@ def test_unknown_writer_lock_result_is_a_failure(connection, monkeypatch, capsys
 def test_partial_status_after_bounded_committed_batch(monkeypatch, tmp_path, connection, capsys):
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE * 2)
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    prepare_cursor(connection.cursor.return_value)
     monkeypatch.setattr(main, "get_connection", Mock(return_value=connection))
     assert main.main(["--logfile", str(logfile), "--max-lines", "1"]) == 0
     output = capsys.readouterr().out
@@ -113,7 +114,7 @@ def test_partial_status_after_bounded_committed_batch(monkeypatch, tmp_path, con
 def test_known_format_gap_fails_without_private_payload(monkeypatch, tmp_path, connection, capsys):
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE.replace(b"2026-10-22T12:00:00Z", b"Oct 22 12:00:00"))
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    prepare_cursor(connection.cursor.return_value)
     monkeypatch.setattr(main, "get_connection", Mock(return_value=connection))
     assert main.main(["--logfile", str(logfile)]) == 1
     captured = capsys.readouterr()
@@ -152,7 +153,7 @@ def test_invalid_syslog_context_never_connects(monkeypatch, arguments):
 def test_explicit_syslog_context_collects_success(monkeypatch, tmp_path, connection, capsys):
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE.replace(b"2026-10-22T12:00:00Z", b"Oct 22 12:00:00").replace(b"Failed", b"Accepted"))
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    prepare_cursor(connection.cursor.return_value)
     monkeypatch.setattr(main, "get_connection", Mock(return_value=connection))
     assert main.main(["--logfile", str(logfile), "--syslog-start", "2026-10-22T00:00:00Z",
                       "--syslog-end", "2026-10-23T00:00:00Z", "--syslog-timezone", "UTC"]) == 0
@@ -201,7 +202,7 @@ def test_compressed_history_reports_partial(monkeypatch, tmp_path, connection, c
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE)
     (tmp_path / "auth.log.2.gz").write_bytes(b"unread archive")
-    connection.cursor.return_value.fetchone.side_effect = [(1,), None]
+    prepare_cursor(connection.cursor.return_value)
     monkeypatch.setattr(main, "get_connection", Mock(return_value=connection))
     assert main.main(["--logfile", str(logfile)]) == 0
     captured = capsys.readouterr()

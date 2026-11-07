@@ -216,10 +216,6 @@ def process_file(cursor, filename, *, stats=None, max_lines=MAX_LINES, deadline=
     if identity is not None:
         scope = identity.source_id
     inserted = 0
-    read_deadline = deadline
-    if deadline is not None:
-        now = time.monotonic()
-        read_deadline = now + max(0, deadline - now) * 0.7
     checkpoint = None
     writer = None
     from ingestion.ufw_batch import EventBatch, OccurrenceConflict
@@ -229,7 +225,19 @@ def process_file(cursor, filename, *, stats=None, max_lines=MAX_LINES, deadline=
             info = os.fstat(source.fileno())
             if not stat.S_ISREG(info.st_mode):
                 raise OSError('UFW source must be a regular file.')
+            verification_started = time.monotonic()
             checkpoint, prefix, observed, generation = continuity.start(cursor, source, filename, info, scope, deadline)
+            read_deadline = deadline
+            if deadline is not None:
+                now = time.monotonic()
+                remaining = max(0, deadline - now)
+                verification_seconds = now - verification_started
+                # Reserve a full verification pass, with headroom for I/O variance.
+                # A fixed 30% alone can be too short after a slow initial hash.
+                reserve = max(remaining * 0.3, verification_seconds * 1.25)
+                # Cold initial reads can be slower than the cached final pass.
+                reserve = min(reserve, remaining * 0.9)
+                read_deadline = now + max(0, remaining - reserve)
             if batch:
                 writer = EventBatch(cursor, identity, policy, stats, generation=generation)
             while source.tell() < info.st_size:
@@ -335,7 +343,7 @@ def process_log(
         if cursor.fetchone() == (1,):
             cursor.execute("SELECT 1 FROM ufw_archives WHERE source_scope=%s AND status <> 'COMPLETE' LIMIT 1", (scope,))
             pending = cursor.fetchone()
-            cursor.execute('SELECT 1 FROM ufw_archive_failures WHERE source_scope=%s LIMIT 1', (scope,))
+            cursor.execute('SELECT 1 FROM ufw_archive_failures WHERE source_scope=%s AND resolved_at IS NULL LIMIT 1', (scope,))
             failed = cursor.fetchone()
             has_archives = has_archives or pending is not None or failed is not None
         elif identity_schema_enabled(connection):
