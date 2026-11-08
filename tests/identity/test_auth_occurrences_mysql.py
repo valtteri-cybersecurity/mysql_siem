@@ -208,7 +208,7 @@ def test_migration_preserves_old_rows_checkpoints_and_evidence_and_resumes(empty
         failure.setattr(auth_occurrence_schema, 'add_column', interrupt)
         with pytest.raises(RuntimeError, match='synthetic interrupted'):
             migrate.migrate(empty_mysql)
-    assert migrate.migrate(empty_mysql) == ['032']
+    assert migrate.migrate(empty_mysql) == ['032', '033']
     assert migrate.migrate(empty_mysql) == []
     assert rows(empty_mysql, 'SELECT id,event_time,event_hash,raw_message,host_id,source_id,collector_id,source_scope '
                             'FROM auth_events ORDER BY id') == before
@@ -222,3 +222,116 @@ def test_migration_preserves_old_rows_checkpoints_and_evidence_and_resumes(empty
         collect_auth_events(empty_mysql, path, collector_id='legacy-reader')
     assert rows(empty_mysql, 'SELECT collector_id,file_device,file_inode,logfile,last_position,position_hash,source_scope '
                             'FROM auth_ingestion_state') == checkpoint
+
+
+@pytest.mark.parametrize('already_applied', [False, True])
+def test_approved_upgrade_preserves_legacy_auth_checkpoint_and_resumes(
+        empty_mysql, tmp_path, monkeypatch, already_applied):
+    import json
+    import pwd
+    from unittest.mock import Mock
+
+    from config import auth_checkpoint_upgrade as auth
+    from config import installation_backup as backup
+    from database.local_identity import database_key
+
+    connection = empty_mysql
+    if already_applied:
+        migrate.migrate(connection)
+    else:
+        previous = []
+        for migration in migrate.MIGRATIONS:
+            if migration[0] < '032':
+                previous.append(migration)
+        with monkeypatch.context() as old:
+            old.setattr(migrate, 'MIGRATIONS', tuple(previous))
+            migrate.migrate(connection)
+
+    identity = register(connection, 'checkpoint-recovery')
+    configure(monkeypatch, identity)
+    project = tmp_path / 'project'
+    config = project / 'config'
+    config.mkdir(parents=True)
+    identity_file = config / 'identity.env'
+    identity_file.write_text(f'SIEM_COLLECTOR_ID={identity.collector_id}\nSIEM_AUTH_SOURCE_ID={identity.source_id}\n')
+    identity_file.chmod(0o600)
+    logfile = tmp_path / 'auth.log'
+    ssh_file = config / 'ssh.env'
+    ssh_file.write_text(f'SSH_AUTH_LOGFILE={logfile}\nSSH_AUTH_COLLECTOR_ID=reader\n')
+    ssh_file.chmod(0o600)
+    user = pwd.getpwuid(ssh_file.stat().st_uid).pw_name
+    state = tmp_path / 'state'
+    state.mkdir(mode=0o700)
+    folder = tmp_path / 'backup'
+    folder.mkdir(mode=0o700)
+    monkeypatch.setattr(auth.journal, 'trusted_state', Mock())
+    monkeypatch.setattr(auth.journal, 'require_maintenance', Mock())
+
+    history = LINE.replace(b'alice', b'original-user')
+    original_log = tmp_path / 'paired-backup.log'
+    original_log.write_bytes(history)
+    logfile.write_bytes(history)
+    info = logfile.stat()
+    with logfile.open('rb') as infile:
+        fingerprint = position_hash(infile, len(history))
+    with connection.cursor() as cursor:
+        assert save_event(cursor, parse_auth_line(history.decode()), identity=identity) == 1
+        cursor.execute('INSERT INTO auth_ingestion_state '
+                       '(collector_id,file_device,file_inode,logfile,last_position,position_hash,source_scope) '
+                       'VALUES (%s,%s,%s,%s,%s,%s,%s)',
+                       ('reader', info.st_dev, info.st_ino, str(logfile), len(history), fingerprint, identity.source_id))
+    connection.commit()
+
+    checkpoint_sql = ('SELECT collector_id,file_device,file_inode,logfile,last_position,position_hash,source_scope '
+                      'FROM auth_ingestion_state')
+    events_sql = 'SELECT id,event_hash,raw_message FROM auth_events ORDER BY id'
+    original_checkpoint = rows(connection, checkpoint_sql)
+    original_events = rows(connection, events_sql)
+    tables = backup.snapshot_rows(connection, folder)
+    connection.commit()
+
+    rotated = logfile.rename(tmp_path / 'auth.log.1')
+    with rotated.open('ab') as infile:
+        infile.write(LINE)
+    logfile.write_bytes(LINE.replace(b'alice', b'another-user'))
+
+    with pytest.raises(AuthCollectionError, match='Legacy Auth checkpoint'):
+        auth.verify_checkpoints(connection, project, user, state=state, allow_approval=True)
+    assert rows(connection, checkpoint_sql) == original_checkpoint
+
+    database, server = database_key(connection)
+    evidence = [identity.source_id, 'reader', info.st_dev, info.st_ino, len(history), fingerprint,
+                info.st_size, info.st_mtime_ns, hashlib.sha256(original_log.read_bytes()).hexdigest()]
+    approval = state / auth.APPROVAL
+    approval.write_text(json.dumps({'database': database, 'server': server, 'approve': auth.ACKNOWLEDGEMENT,
+                                    'checkpoints': [evidence]}))
+    approval.chmod(0o600)
+    assert len(auth.verify_checkpoints(connection, project, user, state=state, allow_approval=True)) == 1
+    assert rows(connection, checkpoint_sql) == original_checkpoint
+    if not already_applied:
+        assert migrate.migrate(connection) == ['032', '033']
+
+    # Interrupt after UPDATE and preservation verification, before COMMIT.
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as failure:
+        failure.setattr(connection, 'commit', interrupt)
+        with pytest.raises(KeyboardInterrupt):
+            backup.migrate_auth_checkpoints(connection, project, user, state, folder, tables)
+    assert rows(connection, 'SELECT generation_key FROM auth_ingestion_state') == ((None,),)
+    backup.verify_rows(connection, folder, tables)
+
+    backup.migrate_auth_checkpoints(connection, project, user, state, folder, tables)
+    preserved = rows(connection, 'SELECT * FROM auth_ingestion_state')
+    assert rows(connection, checkpoint_sql) == original_checkpoint
+    assert rows(connection, events_sql) == original_events
+    approval.unlink()
+    backup.verify_rows(connection, folder, tables)
+    backup.migrate_auth_checkpoints(connection, project, user, state, folder, tables)
+    assert rows(connection, 'SELECT * FROM auth_ingestion_state') == preserved
+    assert auth.verify_checkpoints(connection, project, user, state=state) == []
+
+    assert collect_auth_events(connection, logfile, collector_id='reader')['inserted'] == 2
+    assert collect_auth_events(connection, logfile, collector_id='reader')['inserted'] == 0
+    assert rows(connection, events_sql)[:1] == original_events

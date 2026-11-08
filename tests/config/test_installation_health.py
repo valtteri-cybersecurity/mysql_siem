@@ -40,6 +40,7 @@ def installed(tmp_path, monkeypatch):
     monkeypatch.setattr(health, 'database_key', lambda connection: ('mysql_siem', 'server'))
     monkeypatch.setattr(health, 'validate_bindings', Mock(return_value=3))
     monkeypatch.setattr(health, 'verify_schema', Mock())
+    monkeypatch.setattr(health, 'verify_checkpoints', Mock())
     monkeypatch.setattr(health, 'read_crontab', Mock(return_value=cron))
     return SimpleNamespace(project=project, state=state, record=record, receipt=receipt,
                            stable=stable, version=version)
@@ -112,3 +113,13 @@ def test_schema_health_requires_every_migration_applied(monkeypatch, state):
     connection = MagicMock()
     with pytest.raises(health.HealthError, match='incomplete'):
         health.verify_schema(connection)
+
+
+def test_health_rejects_unusable_auth_checkpoint(installed):
+    from ingestion.auth.identity import AuthCollectionError
+
+    health.verify_checkpoints.side_effect = AuthCollectionError('Active legacy Auth checkpoint')
+    with pytest.raises(AuthCollectionError, match='Active legacy Auth checkpoint'):
+        verify(installed)
+    health.verify_checkpoints.assert_called_once()
+    assert 'allow_approval' not in health.verify_checkpoints.call_args.kwargs

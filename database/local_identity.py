@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -374,7 +375,7 @@ def checkpoint_files(paths):
     base = Path(paths[-1])
     if not checkpoint_path_matches(str(base), base):
         raise IdentityError('Configured checkpoint path must be absolute.')
-    expected = set(get_logfiles(str(base)))
+    expected = set(get_logfiles(str(base), include_gzip=False))
     supplied = set()
     for path in paths:
         if not checkpoint_path_matches(str(path), base):
@@ -408,7 +409,7 @@ def unchanged_checkpoint_files(base, files):
         for attribute in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns'):
             if getattr(after, attribute) != getattr(before, attribute):
                 raise IdentityError('A log changed during checkpoint validation; keep collection paused and retry.')
-    if set(get_logfiles(str(base))) != expected:
+    if set(get_logfiles(str(base), include_gzip=False)) != expected:
         raise IdentityError('Log rotation occurred during checkpoint validation; keep collection paused and retry.')
 
 
@@ -554,7 +555,23 @@ def copy_checkpoints(cursor, settings, *, auth_reader, ufw_paths, auth_paths):
             cursor.execute(f'SELECT {fields} FROM {table} WHERE {filter_sql} FOR UPDATE', parameters)
             existing = cursor.fetchone()
             if existing is not None:
-                if existing[1:] != row[1:] or not checkpoint_path_matches(existing[0], base):
+                same = existing[1:] == row[1:]
+                if (source_type == 'auth' and existing[1:6] == row[1:6]
+                        and row[6:] == (None,) * 5 and existing[6] is not None):
+                    # An interrupted installation can still have the legacy copy.
+                    # Recheck the registered copy's origin without updating either row.
+                    from config.auth_checkpoint_upgrade import verify_file
+                    from ingestion.auth.identity import AuthCollectionError
+
+                    key = (auth_reader, device, inode, source_id)
+                    checkpoint = (offset, digest) + existing[6:]
+                    try:
+                        verify_file(cursor.connection, STATE_DIR, matched, key, checkpoint,
+                                    time.monotonic() + 30, allow_approval=False)
+                    except (AuthCollectionError, OSError) as error:
+                        raise IdentityError('Cannot verify the recovered registered Auth checkpoint.') from error
+                    same = True
+                if not same or not checkpoint_path_matches(existing[0], base):
                     raise IdentityError('Registered and legacy checkpoints conflict; manual recovery required.')
                 continue
             copies.append((table, fields, row + (source_id,)))
@@ -957,7 +974,7 @@ def main(argv=None):
         from ingestion.auth.collector import get_logfiles
         from ingestion.ufw_to_mysql import get_logfiles as ufw_logfiles
         reader, logfile = ssh_settings(args.project, args.user)
-        options = {'auth_reader': reader, 'ufw_paths': ufw_logfiles(), 'auth_paths': get_logfiles(logfile)}
+        options = {'auth_reader': reader, 'ufw_paths': ufw_logfiles(), 'auth_paths': get_logfiles(logfile, include_gzip=False)}
         if args.action == 'finish':
             finish_maintenance(STATE_DIR, path, connection, user=args.user, installed=args.installed, **options)
         else:

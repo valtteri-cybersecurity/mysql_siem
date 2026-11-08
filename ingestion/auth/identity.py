@@ -11,6 +11,22 @@ class AuthCollectionError(RuntimeError):
     """An unverified source or checkpoint prevents safe progress."""
 
 
+class AuthVerificationTimeout(AuthCollectionError):
+    """A source exceeded its verification budget."""
+
+
+class AuthOccurrenceConflict(AuthCollectionError):
+    """An occurrence cannot safely be reconciled with existing events."""
+
+
+class AuthSourceError(AuthCollectionError):
+    """The source file is unsafe to open."""
+
+
+class AuthRecordError(AuthCollectionError):
+    """The file does not contain a readable complete Auth record."""
+
+
 def hashes(infile, boundaries, deadline):
     infile.seek(0)
     digest = hashlib.sha256()
@@ -21,7 +37,7 @@ def hashes(infile, boundaries, deadline):
             raise AuthCollectionError('Invalid Auth verification boundary.')
         while position < end:
             if deadline is not None and time.monotonic() >= deadline:
-                raise AuthCollectionError('Auth verification time budget exhausted; checkpoint retained.')
+                raise AuthVerificationTimeout('Auth verification time budget exhausted; checkpoint retained.')
             block = infile.read(min(CHUNK, end - position))
             if not block:
                 raise AuthCollectionError('Auth source was truncated during verification.')

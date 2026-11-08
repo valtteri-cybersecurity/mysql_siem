@@ -97,12 +97,20 @@ def main(argv=None):
         report(logger, f"New auth events: {result['inserted']}; skipped lines: {result['skipped']}")
         report(logger, "Collection state updated: YES")
         if stats.get("coverage_gaps"):
-            report(logger, "Auth coverage gap: compressed or missing rotations or a source reset prevent verification of complete history.", error=True)
+            report(logger, "Auth continuity could not be verified after missing or changed plain rotations.", error=True)
+        if stats.get("unsupported_rotations"):
+            report(logger, "Unsupported Auth archive formats: .xz, .bz2, .zst.", error=True)
+        if (stats.get("coverage_gaps") or stats.get("unsupported_rotations")
+                or stats.get("archives_unverified") or stats.get("archives_failed")):
             report(logger, "Status: PARTIAL - available records committed; historical coverage is unverified.")
+        elif stats.get("archives_pending"):
+            report(logger, "Status: PARTIAL - gzip work remains pending.")
         elif stats.get("budget_exhausted"):
             report(logger, "Status: PARTIAL - collection budget reached; remaining work retained.")
         else:
             report(logger, "Status: SUCCESS")
+        if stats.get("archives_failed"):
+            return 1
         return 0
     except AuthCollectionBusy:
         report(logger, "Status: SKIPPED - another auth collector holds the writer lock.")
@@ -135,6 +143,8 @@ def main(argv=None):
                 connection.close()
         finally:
             if stats:
+                for archive, reason in stats.get("archive_diagnostics", ()):
+                    report(logger, f"Auth archive {archive!r}: {reason}", error=True)
                 report(logger, f"Log lines read: {stats.get('lines_read', 0)}")
                 report(logger, f"SSH successes recognized: {stats.get('successes_recognized', 0)}")
                 report(logger, f"SSH failures recognized: {stats.get('failures_recognized', 0)}")
@@ -147,6 +157,11 @@ def main(argv=None):
                 else:
                     report(logger, f"Remaining observed bytes: {stats.get('remaining_bytes', 0)}; uninspected files: {stats.get('files_pending', 0)}")
                 report(logger, f"Coverage gaps: {stats.get('coverage_gaps', 0)}; compressed rotations: {stats.get('compressed_rotations', 0)}; vanished rotations: {stats.get('vanished_rotations', 0)}; source resets: {stats.get('source_resets', 0)}")
+                report(logger, f"Auth gzip archives complete: {stats.get('archives_complete', 0)}; "
+                               f"pending: {stats.get('archives_pending', 0)}; "
+                               f"unverified origin: {stats.get('archives_unverified', 0)}; "
+                               f"read failures: {stats.get('archives_failed', 0)}; "
+                               f"unsupported format: {stats.get('unsupported_rotations', 0)}")
                 report(logger, f"Waiting for complete line: {stats.get('waiting_for_line', False)}")
             report(logger, f"Finished: {datetime.now().isoformat(timespec='seconds')}")
             close_log(logger, handler)

@@ -207,7 +207,8 @@ def test_compressed_history_reports_partial(monkeypatch, tmp_path, connection, c
     assert main.main(["--logfile", str(logfile)]) == 0
     captured = capsys.readouterr()
     assert "Status: PARTIAL" in captured.out
-    assert "Auth coverage gap:" in captured.err
+    assert "lineage receipt required" in captured.err
+    assert "Coverage gaps: 0" in captured.out
     assert "compressed rotations: 1" in captured.out
     assert "Status: SUCCESS" not in captured.out
 
@@ -252,3 +253,18 @@ def test_source_preflight_is_bounded(monkeypatch, tmp_path, capsys):
     assert main.main(["--check-source", "--logfile", str(logfile)]) == 0
     assert "100 complete lines" in capsys.readouterr().out
     main.get_connection.assert_not_called()
+
+
+def test_archive_read_failure_reports_partial_commit_and_returns_error(monkeypatch, connection, capsys):
+    def collect(*_args, **options):
+        options["stats"].update(state_updated="YES", archives_failed=1,
+                                archive_diagnostics=[("auth.log.1.gz", "invalid gzip CRC")])
+        return {"inserted": 1, "skipped": 0}
+
+    monkeypatch.setattr(main, "get_connection", Mock(return_value=connection))
+    monkeypatch.setattr(main, "collect_auth_events", collect)
+    assert main.main([]) == 1
+    captured = capsys.readouterr()
+    assert "Status: PARTIAL" in captured.out
+    assert "Collection state updated: YES" in captured.out
+    assert "invalid gzip CRC" in captured.err

@@ -745,3 +745,21 @@ def test_enrollment_keeps_verified_auth_origin_and_resumes_without_duplicates(my
         assert cursor.fetchall() == events
         cursor.execute('SELECT generation_key FROM auth_ingestion_state WHERE source_scope=%s', (source_id,))
         assert cursor.fetchone() == (original[2],)
+
+
+def test_pending_enrollment_accepts_verified_auth_copy_without_touching_legacy_row(mysql, tmp_path, monkeypatch):
+    apply_environment(monkeypatch, {})
+    auth = tmp_path / 'auth.log'
+    auth.write_text(ssh_line(0))
+    auth_paths = [str(auth)]
+    collect_auth_events(mysql, auth, collector_id='reader')
+    settings = enroll(mysql, tmp_path / 'receipt.json', ufw_paths=[], auth_paths=auth_paths)
+    with mysql.cursor() as cursor:
+        cursor.execute('UPDATE auth_ingestion_state SET generation_key=NULL,prefix_sha=NULL,observed_size=NULL,'
+                       'observed_sha=NULL,file_mtime_ns=NULL WHERE source_scope=0')
+    mysql.commit()
+    before = checkpoint_snapshot(mysql)
+    with mysql.cursor() as cursor:
+        local.copy_checkpoints(cursor, settings, auth_reader='reader', ufw_paths=[], auth_paths=auth_paths)
+    assert checkpoint_snapshot(mysql) == before
+    mysql.rollback()

@@ -863,6 +863,17 @@ def main(arguments):
             if target.exists() or target.is_symlink():
                 trusted_directory(target)
             validate_role_sources(source, target, arguments[3])
+        elif action == 'auth-preflight':
+            source, project, stable = Path(arguments[1]), Path(arguments[2]), Path(arguments[3])
+            # The bootstrap has already verified this checkout in its private download directory.
+            validate_virtualenv(stable, stable=True)
+            python = stable / 'bin/python'
+            if not python.is_file():
+                raise InstallationError('The existing managed Python is required for early Auth checkpoint verification.')
+            command = ('import sys; sys.path.insert(0, sys.argv[1]); '
+                       'from config.reset_installation import main; raise SystemExit(main(sys.argv[2:]))')
+            os.execv(python, [str(python), '-I', '-B', '-c', command, str(source), 'auth-check',
+                              '--project', str(project), '--user', arguments[4]])
         elif action == 'recovery-check':
             from config.installation_state import STATE_DIR
             check_unpublished_recovery(Path(arguments[1]), Path('/opt/mysql_siem-venv'), arguments[2], STATE_DIR)

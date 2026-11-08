@@ -13,6 +13,7 @@ from unittest.mock import MagicMock
 import pymysql
 import pytest
 
+from database.auth_archive_schema import upgrade as upgrade_archives
 from database.auth_migrations import upgrade_auth_events
 from database.auth_occurrence_schema import upgrade as upgrade_occurrences
 from detection.ssh_brute_force.detector import detect_ssh_brute_force
@@ -106,6 +107,7 @@ def mysql(private_server, apply_migration):
             cursor.execute('ALTER TABLE auth_ingestion_state DROP PRIMARY KEY, '
                            'ADD PRIMARY KEY (collector_id,file_device,file_inode,source_scope)')
         upgrade_occurrences(connection)
+        upgrade_archives(connection)
         connection.commit()
         yield connection
     finally:

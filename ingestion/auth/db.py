@@ -3,7 +3,7 @@
 import pymysql
 
 from database.identity import identity_schema_enabled
-from ingestion.auth.identity import AuthCollectionError
+from ingestion.auth.identity import AuthCollectionError, AuthOccurrenceConflict
 
 
 def _save_legacy_event(cursor, event, *, identity=None):
@@ -71,13 +71,13 @@ def save_event(cursor, event, *, identity=None, generation=None, position=None):
     stored = cursor.fetchone()
     if stored is not None:
         if stored != expected:
-            raise AuthCollectionError('Auth occurrence content changed; checkpoint retained.')
+            raise AuthOccurrenceConflict('Auth occurrence content changed; checkpoint retained.')
         return 0
     cursor.execute('SELECT 1 FROM auth_events WHERE source_scope=%s AND event_hash=%s '
                    'AND (file_generation IS NULL OR file_generation<>%s) LIMIT 1 FOR SHARE',
                    (scope, event['event_hash'], generation))
     if cursor.fetchone() is not None:
-        raise AuthCollectionError('Ambiguous Auth occurrence origin; checkpoint retained.')
+        raise AuthOccurrenceConflict('Ambiguous Auth occurrence origin; checkpoint retained.')
     fields += ('file_generation', 'file_position')
     values.extend((generation, position))
     if identity is not None:

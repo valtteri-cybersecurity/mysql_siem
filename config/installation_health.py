@@ -9,6 +9,7 @@ from pathlib import Path
 import pymysql
 
 from config import installation_state as journal
+from config.auth_checkpoint_upgrade import verify_checkpoints
 from config.installation_role_setup import read_owned_role
 from config.service_installation import (
     InstallationError,
@@ -20,6 +21,7 @@ from config.service_installation import (
 )
 from database import migrate
 from database.connection import get_connection
+from database.identity import IdentityError
 from database.local_identity import (
     database_key,
     read_crontab,
@@ -27,6 +29,7 @@ from database.local_identity import (
     read_settings,
     validate_bindings,
 )
+from ingestion.auth.identity import AuthCollectionError
 
 
 class HealthError(RuntimeError):
@@ -89,6 +92,7 @@ def verify_health(connection, project, *, state=journal.STATE_DIR, during_mainte
         if validate_bindings(cursor, settings) != receipt['host_id']:
             raise HealthError('Installed host identity changed.')
     verify_schema(connection)
+    verify_checkpoints(connection, project, record['user'], state=state)
     text = read_crontab(record['user'])
     if hashlib.sha256(text.encode('utf-8')).hexdigest() != record['cron_digest']:
         raise HealthError('Scheduled jobs differ from the verified deployment.')
@@ -112,6 +116,9 @@ def main(argv=None):
                                  revision=args.revision)
         print('Status: HEALTHY - approved commit ' + revision + '; schema, identities and jobs verified.')
         return 0
+    except (AuthCollectionError, IdentityError) as error:
+        print('Status: FAILED - ' + str(error), file=sys.stderr)
+        return 1
     except (HealthError, InstallationError, migrate.MigrationError, journal.InstallationStateError,
             OSError, ValueError, pymysql.MySQLError):
         print('Status: FAILED - deployment, runtime connection, migration, identity or scheduler '

@@ -709,6 +709,8 @@ for path in \
     config/ssh.env.example \
     ingestion/auth/main.py \
     ingestion/auth/identity.py \
+    ingestion/auth/archives.py \
+    database/auth_archive_schema.py \
     database/auth_occurrence_schema.py \
     detection/ssh_brute_force/main.py \
     config/port_scan.env.example \
@@ -799,6 +801,11 @@ fi
 trap cleanup_prepared_installation EXIT
 trap 'warn "Installation interrupted; preserve maintenance, backups and recovery files. Retry the same operation and approved revision."; exit 130' INT
 trap 'warn "Installation terminated; preserve maintenance, backups and recovery files. Retry the same operation and approved revision."; exit 143' TERM
+
+# Validate existing Auth checkpoints before changing packages, permissions or staging.
+if [[ "$INSTALL_OPERATION" == upgrade && "$STAGING_RECOVERY" != 1 ]]; then
+    service_installation auth-preflight "$SOURCE_DIR" "$SERVICE_DIR" "$VENV_DIR" "$INSTALL_USER"
+fi
 
 detect_distribution
 select_mysql_package
@@ -1033,6 +1040,8 @@ try:
                 "auth_events": "SELECT, INSERT",
                 "auth_ingestion_state": "SELECT, INSERT, UPDATE",
             })
+        if "auth_archive_checkpoints" in actual:
+            grants["auth_archive_checkpoints"] = "SELECT, INSERT, UPDATE"
         if "analysis_source_ips" in actual:
             grants["analysis_source_ips"] = "SELECT, INSERT, DELETE"
         for table, privileges in grants.items():

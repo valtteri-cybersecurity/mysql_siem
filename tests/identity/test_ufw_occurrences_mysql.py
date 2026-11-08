@@ -236,7 +236,7 @@ def test_migration_preserves_history_and_resumes_after_ddl(empty_mysql, monkeypa
         with pytest.raises(RuntimeError, match='after occurrence DDL'):
             migrate.migrate(connection)
     assert rows(connection, "SELECT status FROM schema_migrations WHERE version='029'") == (('FAILED',),)
-    assert migrate.migrate(connection) == ['029', '030', '031', '032']
+    assert migrate.migrate(connection) == ['029', '030', '031', '032', '033']
     assert migrate.migrate(connection) == []
     for table, fields in projections.items():
         assert rows(connection, 'SELECT ' + fields + ' FROM ' + table) == original[table]

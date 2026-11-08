@@ -68,14 +68,17 @@ def test_mysql_failure_never_starts_services_or_changes_database(mysql, fault):
         mysql.connection.close.assert_called_once()
 
 
-def test_upgrade_preflight_reuses_history_checks_without_migrating(mysql, monkeypatch):
+def test_upgrade_preflight_reuses_history_checks_without_migrating(mysql, monkeypatch, tmp_path):
     mysql.cursor.fetchone.side_effect = [(1,), ('8.0.46',), ('',), (1,), None]
     mysql.cursor.fetchall.return_value = [('GRANT SELECT ON `mysql_siem`.`hosts` TO `pythonuser`@`localhost`',)]
     history = Mock()
     apply = Mock()
     monkeypatch.setattr(reset, 'check_ufw_before_upgrade', history)
+    auth = Mock()
+    monkeypatch.setattr(reset, 'verify_checkpoints', auth)
     monkeypatch.setattr(migrate, 'migrate', apply)
-    reset.database_preflight('upgrade')
+    reset.database_preflight('upgrade', project=tmp_path)
+    auth.assert_called_once_with(mysql.connection, tmp_path, 'mysql_siem', allow_approval=True)
     history.assert_called_once_with(mysql.connection)
     apply.assert_not_called()
     mysql.connection.commit.assert_not_called()
@@ -84,12 +87,12 @@ def test_upgrade_preflight_reuses_history_checks_without_migrating(mysql, monkey
         assert call.args[0].startswith(('SELECT ', 'SHOW '))
 
 
-def test_upgrade_history_failure_blocks_preflight_and_closes_connection(mysql, monkeypatch):
+def test_upgrade_history_failure_blocks_preflight_and_closes_connection(mysql, monkeypatch, tmp_path):
     mysql.cursor.fetchone.side_effect = [(1,), ('8.0.46',), ('',), (1,), None]
     mysql.cursor.fetchall.return_value = [('GRANT USAGE ON *.* TO `pythonuser`@`localhost`',)]
     monkeypatch.setattr(reset, 'check_ufw_before_upgrade', Mock(side_effect=reset.ResetError('unverified UTC history')))
     with pytest.raises(reset.ResetError, match='UTC history'):
-        reset.database_preflight('upgrade')
+        reset.database_preflight('upgrade', project=tmp_path)
     mysql.connection.close.assert_called_once()
     mysql.connection.commit.assert_not_called()
 
@@ -377,11 +380,14 @@ def test_migration_conflicts_stop_read_only_preflight_before_maintenance(mysql, 
 @pytest.mark.parametrize('status', ['APPLIED', 'RUNNING', 'FAILED'])
 def test_migration_history_preflight_accepts_original_sources_using_select_only(mysql, status, monkeypatch):
     from database import (
+        auth_archive_schema,
         auth_occurrence_schema,
         ufw_archive_lineage_schema,
         ufw_archive_retry_schema,
         ufw_occurrence_schema,
     )
+    archives_guard = Mock()
+    monkeypatch.setattr(auth_archive_schema, "verify", archives_guard)
     auth_guard = Mock()
     monkeypatch.setattr(auth_occurrence_schema, "verify", auth_guard)
     retry_guard = Mock()
@@ -408,12 +414,14 @@ def test_migration_history_preflight_accepts_original_sources_using_select_only(
         lineage_guard.assert_called_once_with(mysql.connection)
         retry_guard.assert_called_once_with(mysql.connection)
         auth_guard.assert_called_once_with(mysql.connection)
+        archives_guard.assert_called_once_with(mysql.connection)
     else:
         guard.assert_not_called()
         occurrence_guard.assert_not_called()
         lineage_guard.assert_not_called()
         retry_guard.assert_not_called()
         auth_guard.assert_not_called()
+        archives_guard.assert_not_called()
     mysql.connection.commit.assert_not_called()
     for call in mysql.cursor.execute.call_args_list:
         assert call.args[0].startswith('SELECT ')
@@ -537,3 +545,28 @@ grant_probe() { return 17; }
                             input='', capture_output=True, text=True, timeout=5, check=False)
     assert result.returncode == 17
     assert 'UNEXPECTED' not in result.stdout
+
+
+def test_early_auth_preflight_blocks_before_service_or_database_changes(mysql, monkeypatch, tmp_path, capsys):
+    from ingestion.auth.identity import AuthCollectionError
+
+    monkeypatch.setattr(reset.os, 'geteuid', Mock(return_value=0))
+    monkeypatch.setattr(reset, 'trusted_directory', Mock())
+    monkeypatch.setattr(reset.journal, 'require_install_lock', Mock())
+    maintenance = Mock(side_effect=AssertionError('Unexpected maintenance'))
+    monkeypatch.setattr(reset.journal, 'require_maintenance', maintenance)
+    failure = Mock(side_effect=AuthCollectionError('Unverified Auth source'))
+    monkeypatch.setattr(reset, 'verify_checkpoints', failure)
+
+    assert reset.main(['auth-check', '--project', str(tmp_path)]) == 1
+    assert 'Unverified Auth source' in capsys.readouterr().err
+    failure.assert_called_once_with(mysql.connection, tmp_path, 'mysql_siem', allow_approval=True)
+    maintenance.assert_not_called()
+    mysql.connection.commit.assert_not_called()
+    mysql.connection.close.assert_called_once()
+
+    installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
+    early = installer.index('service_installation auth-preflight ')
+    assert installer.index('flock -n 9') < early < installer.index('\nensure_application_user\n')
+    assert early < installer.index('\ninstall_dependencies\n')
+    assert early < installer.index('local_identity_setup begin')

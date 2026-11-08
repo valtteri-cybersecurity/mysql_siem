@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from database.identity import configured_identity
+from ingestion.auth import archives
 from ingestion.auth import identity as origin
 from ingestion.auth.db import load_position, save_event, save_position
 from ingestion.auth.identity import AuthCollectionError
@@ -31,22 +32,30 @@ class AuthCollectionBusy(RuntimeError):
     """Another run holds the auth writer lock."""
 
 
-def get_logfiles(logfile, *, stats=None):
-    """Read numbered, uncompressed rotations oldest first, then the active log."""
+def get_logfiles(logfile, *, stats=None, include_gzip=True):
+    """List numbered rotations oldest first, then the active log."""
     if stats is not None:
         stats.setdefault("compressed_rotations", 0)
-        stats.setdefault("coverage_gaps", 0)
+        stats.setdefault("unsupported_rotations", 0)
     rotations = []
     for filename in glob.glob(glob.escape(logfile) + ".*"):
         suffix = filename[len(logfile) + 1:]
-        if suffix.isascii() and suffix.isdigit():
-            rotations.append((int(suffix), filename))
-        elif suffix.endswith((".gz", ".xz", ".bz2", ".zst")) and stats is not None:
-            stats["compressed_rotations"] += 1
-            stats["coverage_gaps"] += 1
+        number, _, extension = suffix.partition(".")
+        if not number.isascii() or not number.isdigit():
+            continue
+        if not extension and suffix == number:
+            rotations.append((int(number), True, filename))
+        elif extension in ("gz", "xz", "bz2", "zst"):
+            if stats is not None:
+                stats["compressed_rotations"] += 1
+            if extension == "gz":
+                if include_gzip:
+                    rotations.append((int(number), False, filename))
+            elif stats is not None:
+                stats["unsupported_rotations"] += 1
     rotations.sort(reverse=True)
     filenames = []
-    for _, filename in rotations:
+    for _, _plain, filename in rotations:
         filenames.append(filename)
     filenames.append(logfile)
     return filenames
@@ -59,7 +68,7 @@ def open_logfile(filename):
     info = os.fstat(infile.fileno())
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         infile.close()
-        raise AuthCollectionError("The auth source must be a regular file.")
+        raise origin.AuthSourceError("The auth source must be a regular file.")
     return infile
 
 
@@ -70,7 +79,7 @@ def check_source_format(logfile, *, syslog_start=None, syslog_end=None, syslog_t
     active = str(Path(logfile).resolve())
     with open_logfile(active):
         pass
-    for filename in get_logfiles(active):
+    for filename in get_logfiles(active, include_gzip=False):
         if checked >= 100:
             break
         try:
@@ -114,12 +123,7 @@ def position_hash(infile, position):
     return digest
 
 
-def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_LINES,
-                 identity=None, deadline=None, syslog_start=None, syslog_end=None,
-                 syslog_timezone=None):
-    inserted = skipped = lines_read = 0
-    if stats is None:
-        stats = {}
+def record_defaults(stats):
     for key in ("lines_read", "failures_recognized", "successes_recognized",
                 "local_logins_recognized", "unrecognized_lines", "invalid_lines",
                 "duplicates", "remaining_bytes", "files_processed"):
@@ -128,6 +132,69 @@ def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_L
     stats.setdefault("waiting_for_line", False)
     stats.setdefault("coverage_gaps", 0)
     stats.setdefault("source_resets", 0)
+
+
+def read_records(cursor, infile, size, generation, stats, *, identity, prefix=None,
+                 line_limit, deadline, syslog_start, syslog_end, syslog_timezone):
+    """Parse bounded complete records at logical byte positions."""
+    inserted = skipped = lines_read = 0
+    # Bound memory as well as lines; never consume an unfinished log record.
+    while infile.tell() < size:
+        if lines_read >= line_limit:
+            stats["budget_exhausted"] = True
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            stats["budget_exhausted"] = True
+            break
+        start = infile.tell()
+        raw_line = infile.readline(min(size - start, MAX_LINE_BYTES))
+        if not raw_line:
+            raise origin.AuthRecordError("Auth source was truncated during collection.")
+        if not raw_line.endswith(b"\n"):
+            infile.seek(start)
+            if len(raw_line) == MAX_LINE_BYTES:
+                stats["invalid_lines"] += 1
+                raise origin.AuthRecordError("Auth line exceeds the safe size limit.")
+            stats["waiting_for_line"] = True
+            break
+        if prefix is not None:
+            prefix.update(raw_line)
+        lines_read += 1
+        stats["lines_read"] += 1
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            stats["invalid_lines"] += 1
+            raise origin.AuthRecordError("Invalid UTF-8 in auth source; checkpoint retained.") from None
+        try:
+            event = parse_auth_line(line, syslog_start=syslog_start,
+                                    syslog_end=syslog_end, syslog_timezone=syslog_timezone)
+        except AuthParseError:
+            stats["invalid_lines"] += 1
+            raise
+        if event is None:
+            skipped += 1
+            stats["unrecognized_lines"] += 1
+            continue
+        if event["event_type"] == "SSH_AUTH_FAILURE":
+            stats["failures_recognized"] += 1
+        elif event["event_type"] == "SSH_LOGIN_SUCCESS":
+            stats["successes_recognized"] += 1
+        else:
+            stats["local_logins_recognized"] += 1
+        saved = save_event(cursor, event, identity=identity, generation=generation, position=start)
+        inserted += saved
+        stats["duplicates"] += 1 - saved
+
+    return inserted, skipped
+
+
+def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_LINES,
+                 identity=None, deadline=None, syslog_start=None, syslog_end=None,
+                 syslog_timezone=None):
+    if stats is None:
+        stats = {}
+    record_defaults(stats)
     with open_logfile(filename) as infile:
         info = os.fstat(infile.fileno())
         source_scope = 0
@@ -145,52 +212,11 @@ def process_file(cursor, filename, collector_id, *, stats=None, line_limit=MAX_L
             reserve = min(reserve, remaining * 0.9)
             read_deadline = now + max(0, remaining - reserve)
 
-        # Bound memory as well as lines; never consume an unfinished log record.
-        while infile.tell() < info.st_size:
-            if lines_read >= line_limit:
-                stats["budget_exhausted"] = True
-                break
-            if read_deadline is not None and time.monotonic() >= read_deadline:
-                stats["budget_exhausted"] = True
-                break
-            start = infile.tell()
-            raw_line = infile.readline(min(info.st_size - start, MAX_LINE_BYTES))
-            if not raw_line:
-                raise AuthCollectionError("Auth source was truncated during collection.")
-            if not raw_line.endswith(b"\n"):
-                infile.seek(start)
-                if len(raw_line) == MAX_LINE_BYTES:
-                    stats["invalid_lines"] += 1
-                    raise AuthCollectionError("Auth line exceeds the safe size limit.")
-                stats["waiting_for_line"] = True
-                break
-            prefix.update(raw_line)
-            lines_read += 1
-            stats["lines_read"] += 1
-            try:
-                line = raw_line.decode("utf-8")
-            except UnicodeDecodeError:
-                stats["invalid_lines"] += 1
-                raise AuthCollectionError("Invalid UTF-8 in auth source; checkpoint retained.") from None
-            try:
-                event = parse_auth_line(line, syslog_start=syslog_start,
-                                        syslog_end=syslog_end, syslog_timezone=syslog_timezone)
-            except AuthParseError:
-                stats["invalid_lines"] += 1
-                raise
-            if event is None:
-                skipped += 1
-                stats["unrecognized_lines"] += 1
-                continue
-            if event["event_type"] == "SSH_AUTH_FAILURE":
-                stats["failures_recognized"] += 1
-            elif event["event_type"] == "SSH_LOGIN_SUCCESS":
-                stats["successes_recognized"] += 1
-            else:
-                stats["local_logins_recognized"] += 1
-            saved = save_event(cursor, event, identity=identity, generation=generation, position=start)
-            inserted += saved
-            stats["duplicates"] += 1 - saved
+        inserted, skipped = read_records(
+            cursor, infile, info.st_size, generation, stats, identity=identity, prefix=prefix,
+            line_limit=line_limit, deadline=read_deadline, syslog_start=syslog_start,
+            syslog_end=syslog_end, syslog_timezone=syslog_timezone,
+        )
 
         position = infile.tell()
         digest = position_hash(infile, position)
@@ -231,9 +257,12 @@ def collect_auth_events(connection, logfile="/var/log/auth.log", *, collector_id
                  duplicates=0, remaining_bytes=0, files_processed=0,
                  files_pending=0, budget_exhausted=False, waiting_for_line=False,
                  elapsed_seconds=0.0, state_updated="NO", coverage_gaps=0,
-                 compressed_rotations=0, vanished_rotations=0, source_resets=0)
+                 compressed_rotations=0, unsupported_rotations=0, vanished_rotations=0, source_resets=0,
+                 archives_complete=0, archives_unverified=0, archives_failed=0, archives_pending=0,
+                 archive_diagnostics=[])
     started = time.monotonic()
     deadline = started + max_seconds
+    archive_deadline = started + max_seconds * 0.6
     logfile = str(Path(logfile).resolve())
     cursor = connection.cursor()
     locked = False
@@ -259,10 +288,17 @@ def collect_auth_events(connection, logfile="/var/log/auth.log", *, collector_id
                 break
             remaining = max_lines - stats["lines_read"]
             try:
-                new, ignored = process_file(cursor, filename, collector_id,
-                                            stats=stats, line_limit=remaining, identity=identity,
-                                            deadline=deadline, syslog_start=syslog_start,
-                                            syslog_end=syslog_end, syslog_timezone=syslog_timezone)
+                if filename != logfile and filename.endswith(".gz"):
+                    new, ignored = archives.process(
+                        cursor, logfile, filename, collector_id, stats, identity=identity,
+                        line_limit=remaining, deadline=archive_deadline, syslog_start=syslog_start,
+                        syslog_end=syslog_end, syslog_timezone=syslog_timezone,
+                    )
+                else:
+                    new, ignored = process_file(cursor, filename, collector_id,
+                                                stats=stats, line_limit=remaining, identity=identity,
+                                                deadline=deadline, syslog_start=syslog_start,
+                                                syslog_end=syslog_end, syslog_timezone=syslog_timezone)
             except FileNotFoundError:
                 if filename == logfile:
                     raise
@@ -276,8 +312,10 @@ def collect_auth_events(connection, logfile="/var/log/auth.log", *, collector_id
         connection.commit()
         stats["state_updated"] = "YES"
         return {"inserted": inserted, "skipped": skipped}
-    except Exception:
-        # Transaction cleanup only: programming errors are re-raised, never hidden.
+    except BaseException:
+        # A failed or interrupted commit cannot confirm any new completion.
+        if stats["state_updated"] != "YES":
+            stats["archives_complete"] = 0
         connection.rollback()
         raise
     finally:

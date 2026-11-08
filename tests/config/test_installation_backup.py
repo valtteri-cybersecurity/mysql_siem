@@ -203,10 +203,16 @@ def test_upgrade_orders_backup_before_ddl_and_never_runs_reset(monkeypatch, tmp_
         return tmp_path, {'tables': {}}
 
     monkeypatch.setattr(reset, 'check_upgrade_database', Mock())
+    monkeypatch.setattr(reset, 'verify_checkpoints', Mock())
+    monkeypatch.setattr(reset, 'require_stopped_legacy_jobs', Mock())
+    monkeypatch.setattr(journal, 'require_maintenance', Mock())
+    monkeypatch.setattr(journal, 'require_stage', Mock(return_value={'target': str(tmp_path), 'user': 'mysql_siem'}))
     monkeypatch.setattr(backup, 'create_verified_backup', make_backup)
     monkeypatch.setattr(backup, 'mark_upgrade_phase', Mock())
     monkeypatch.setattr(migrate, 'migrate', lambda connection: step('migration'))
     monkeypatch.setattr(migrate, 'check_ufw_utc_readiness', Mock())
+    from config import auth_checkpoint_upgrade
+    monkeypatch.setattr(auth_checkpoint_upgrade, 'verify_checkpoints', Mock(return_value=[]))
     monkeypatch.setattr(backup, 'verify_rows', lambda *args: step('preservation'))
     settings = {'DB_HOST': 'localhost', 'DB_NAME': 'mysql_siem', 'DB_USER': 'pythonuser', 'DB_PASSWORD': 'synthetic'}
     if fault is not None:
@@ -323,8 +329,8 @@ def test_successful_mysql_command_leaves_no_diagnostics(
 def test_mysql_restore_path_must_be_private_and_mysql_owned(
     tmp_path, monkeypatch
 ):
-    from types import SimpleNamespace as Namespace
     import os
+    from types import SimpleNamespace as Namespace
 
     parent = tmp_path / 'mysql'
     parent.mkdir(mode=0o700)
@@ -532,3 +538,17 @@ def test_partial_022_proof_requires_verified_ledger(monkeypatch):
     ) is None
 
     preflight.assert_not_called()
+
+
+def test_auth_checkpoint_transition_refuses_concurrent_collector(tmp_path, monkeypatch):
+    from ingestion.auth.identity import AuthCollectionError
+
+    connection = MagicMock()
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.return_value = (0,)
+    monkeypatch.setattr(journal, 'require_maintenance', Mock())
+    with pytest.raises(AuthCollectionError, match='Auth collector is still running'):
+        backup.migrate_auth_checkpoints(connection, tmp_path, 'mysql_siem', tmp_path, tmp_path, {})
+    journal.require_maintenance.assert_called_once_with(tmp_path)
+    connection.begin.assert_not_called()
+    connection.commit.assert_not_called()

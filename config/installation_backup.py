@@ -5,6 +5,7 @@ import json
 import os
 import pwd
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -323,10 +324,16 @@ def _allowed_022_classification_change(
 
 
 def verify_rows(connection, folder, tables, *, exact=False):
-    """Preserve original rows; permit only proven 022 reclassification."""
+    """Preserve original rows except verified UFW and Auth metadata transitions."""
     baseline_022 = _verified_022_baseline(
         connection, tables, exact=exact
     )
+    auth_transitions = {}
+    proof = folder / 'auth-checkpoint-transitions.json'
+    if not exact and (proof.exists() or proof.is_symlink()):
+        auth_transitions = json.loads(journal.read_file(proof))
+        if not isinstance(auth_transitions, dict):
+            raise BackupError('Invalid verified Auth checkpoint transition record.')
     deadline = time.monotonic() + TIMEOUT
     for name, layout in tables.items():
         if not exact and name == 'schema_migrations':
@@ -359,17 +366,13 @@ def verify_rows(connection, folder, tables, *, exact=False):
                             raise BackupError('Restored database contains unexpected rows.')
                         continue
                     digest = hashlib.sha256(encode_row(row).encode('ascii')).hexdigest()
-                    if digest != expected[1]:
-                        if (
-                            exact
-                            or name != "ufw_log"
-                            or not _allowed_022_classification_change(
-                                row, layout, expected[1], baseline_022
-                            )
-                        ):
-                            raise BackupError(
-                                'Historical database values changed; keep collection paused.'
-                            )
+                    auth_change = name == 'auth_ingestion_state' and auth_transitions.get(expected[1]) == digest
+                    if digest != expected[1] and not auth_change and (
+                        exact
+                        or name != "ufw_log"
+                        or not _allowed_022_classification_change(row, layout, expected[1], baseline_022)
+                    ):
+                        raise BackupError('Historical database values changed; keep collection paused.')
                     matched += 1
                     line = original.readline()
                     expected = None
@@ -377,6 +380,63 @@ def verify_rows(connection, folder, tables, *, exact=False):
                         expected = json.loads(line)
             if expected is not None or matched != layout['count'] or exact and count != layout['count']:
                 raise BackupError('Historical database rows are missing; keep collection paused.')
+
+
+def migrate_auth_checkpoints(connection, project, user, state, folder, tables):
+    """Apply approved origins in one transaction after backup and schema verification."""
+    from config.auth_checkpoint_upgrade import (
+        ORIGIN,
+        TABLE,
+        save_origin,
+        verify_checkpoints,
+    )
+    from ingestion.auth.collector import AUTH_WRITER_LOCK
+    from ingestion.auth.identity import AuthCollectionError
+
+    journal.require_maintenance(state)
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT GET_LOCK(%s, 0)', (AUTH_WRITER_LOCK,))
+        if cursor.fetchone() != (1,):
+            raise AuthCollectionError('An Auth collector is still running; keep collection paused and retry.')
+        try:
+            connection.begin()
+            changes = verify_checkpoints(connection, project, user, state=state, allow_approval=True)
+            proof = {}
+            if changes:
+                layout = tables[TABLE]
+                fields = []
+                for column in layout['columns']:
+                    fields.append(identifier(column))
+                select = ('SELECT ' + ','.join(fields) + ' FROM auth_ingestion_state WHERE '
+                          'collector_id=%s AND file_device=%s AND file_inode=%s AND source_scope=%s')
+                for key, checkpoint, snapshot in changes:
+                    cursor.execute(select + ' FOR UPDATE', key)
+                    before = cursor.fetchone()
+                    if before is None:
+                        raise AuthCollectionError('Auth checkpoint disappeared during recovery.')
+                    # The verified file generation needs a new opaque occurrence namespace.
+                    origin = (secrets.token_bytes(32), *snapshot)
+                    save_origin(cursor, key, checkpoint, origin)
+                    expected = list(before)
+                    for column, value in zip(ORIGIN, origin, strict=True):
+                        if column in layout['columns']:
+                            expected[layout['columns'].index(column)] = value
+                    original = hashlib.sha256(encode_row(before).encode('ascii')).hexdigest()
+                    updated = hashlib.sha256(encode_row(expected).encode('ascii')).hexdigest()
+                    if original != updated:
+                        proof[original] = updated
+            if proof:
+                # Durable before COMMIT so either outcome can be checked after interruption.
+                journal.write_file(folder / 'auth-checkpoint-transitions.json', json.dumps(proof) + '\n')
+            verify_rows(connection, folder, tables)
+            if changes:
+                verify_checkpoints(connection, project, user, state=state)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            cursor.execute('SELECT RELEASE_LOCK(%s)', (AUTH_WRITER_LOCK,))
 
 
 def private_environment():

@@ -54,6 +54,7 @@ MIGRATIONS = (
     ("030", "ufw_archive_lineage", ROOT / "ufw_archive_lineage_schema.py"),
     ("031", "ufw_archive_retries", ROOT / "ufw_archive_retry_schema.py"),
     ("032", "auth_occurrences", ROOT / "auth_occurrence_schema.py"),
+    ("033", "auth_gzip_checkpoints", ROOT / "auth_archive_schema.py"),
 )
 
 
@@ -74,7 +75,7 @@ HISTORY_TABLES = EVENT_TABLES + ANALYSIS_TABLES + (
     "ufw_state", "ufw_archive_failures", "ufw_quarantine", "ufw_quarantine_origins", "ufw_archives",
     "ufw_file_checkpoints", "ufw_collection_gaps", "ufw_archive_proofs", "ufw_collection_health",
     "ufw_filter_rules", "ufw_filter_audit", "ufw_filter_seen", "ufw_filter_stats",
-    "auth_ingestion_state",
+    "auth_ingestion_state", "auth_archive_checkpoints",
     "process_events", "process_state", "service_events", "service_state", "collector_snapshots",
     "audit_events", "audit_checkpoints", "audit_targets",
 )
@@ -211,6 +212,9 @@ def check_migration_history(connection):
         verify(connection)
     if records.get('032', (None, None))[1] == 'APPLIED':
         from database.auth_occurrence_schema import verify
+        verify(connection)
+    if records.get('033', (None, None))[1] == 'APPLIED':
+        from database.auth_archive_schema import verify
         verify(connection)
     return records
 
@@ -570,6 +574,10 @@ def apply_one(connection, version):
     elif version == "020":
         from database.audit_migrations import upgrade_audit
         upgrade_audit(connection, ROOT / "migrations/020_audit.sql")
+
+    elif version == "033":
+        from database.auth_archive_schema import upgrade
+        upgrade(connection)
 
     elif version == "032":
         from database.auth_occurrence_schema import upgrade

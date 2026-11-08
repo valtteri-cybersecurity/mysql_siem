@@ -80,11 +80,12 @@ def test_resumes_position_and_reads_only_new_complete_lines(tmp_path):
     assert cursor.execute.call_args_list[-1].args[1][4] == len(LINE) * 2
 
 
-def test_rotations_are_read_oldest_first_and_compressed_files_excluded(tmp_path):
+def test_rotations_are_read_oldest_first_and_gzip_can_be_excluded(tmp_path):
     logfile = tmp_path / "auth.log"
     for suffix in ("", ".1", ".2", ".10", ".3.gz", ".backup"):
         (tmp_path / ("auth.log" + suffix)).touch()
-    assert get_logfiles(str(logfile)) == [str(logfile) + suffix for suffix in (".10", ".2", ".1", "")]
+    assert get_logfiles(str(logfile)) == [str(logfile) + suffix for suffix in (".10", ".3.gz", ".2", ".1", "")]
+    assert get_logfiles(str(logfile), include_gzip=False) == [str(logfile) + suffix for suffix in (".10", ".2", ".1", "")]
 
 
 def test_unrecognized_lines_do_not_stop_collection(tmp_path):
@@ -408,7 +409,7 @@ def test_duplicate_lookup_uses_trusted_source_scope(monkeypatch):
     assert parameters == (event["event_hash"], 2)
 
 
-def test_compressed_rotation_is_reported_without_decompression(tmp_path):
+def test_unapproved_gzip_is_reported_without_assuming_loss(tmp_path):
     logfile = tmp_path / "auth.log"
     logfile.write_bytes(LINE)
     (tmp_path / "auth.log.2.gz").write_bytes(b"not opened or decompressed")
@@ -418,7 +419,8 @@ def test_compressed_rotation_is_reported_without_decompression(tmp_path):
     result = collect_auth_events(connection, logfile, collector_id="test", stats=stats)
     assert result["inserted"] == 1
     assert stats["compressed_rotations"] == 1
-    assert stats["coverage_gaps"] == 1
+    assert stats["archives_unverified"] == 1
+    assert stats["coverage_gaps"] == 0
     assert stats["state_updated"] == "YES"
     connection.commit.assert_called_once()
 

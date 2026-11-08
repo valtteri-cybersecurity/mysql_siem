@@ -15,10 +15,14 @@ from pathlib import Path
 import pymysql
 
 from config import installation_state as journal
+from config.auth_checkpoint_upgrade import verify_checkpoints
 from config.installation_backup import BackupError
 from config.installation_role import RoleConfigurationError, get_installation_role
 from config.service_installation import InstallationError, trusted_directory
+from database.identity import IdentityError
+from database.local_identity import require_stopped_legacy_jobs
 from database.migrate import LOCK_NAME, MigrationError
+from ingestion.auth.identity import AuthCollectionError
 
 DATABASE = 'mysql_siem'
 ACCOUNT = 'pythonuser'
@@ -267,6 +271,7 @@ RUNTIME_TABLE_PRIVILEGES = {
     'detection_state': 'SELECT, INSERT, UPDATE',
     'auth_events': 'SELECT, INSERT',
     'auth_ingestion_state': 'SELECT, INSERT, UPDATE',
+    'auth_archive_checkpoints': 'SELECT, INSERT, UPDATE',
 }
 
 
@@ -531,7 +536,7 @@ def upgrade_database(connection, settings, *, project, state=None):
     from config.installation_backup import (
         create_verified_backup,
         mark_upgrade_phase,
-        verify_rows,
+        migrate_auth_checkpoints,
     )
     from database.migrate import check_ufw_utc_readiness, migrate
 
@@ -539,6 +544,10 @@ def upgrade_database(connection, settings, *, project, state=None):
     check_upgrade_database(connection)
     if state is None:
         state = journal.STATE_DIR
+    journal.require_maintenance(state)
+    record = journal.require_stage(state, project)
+    require_stopped_legacy_jobs(Path(record['target']), record['user'])
+    verify_checkpoints(connection, project, record['user'], state=state, allow_approval=True)
     with connection.cursor() as cursor:
         cursor.execute('SELECT GET_LOCK(%s, 0)', (LOCK_NAME,))
         if cursor.fetchone() != (1,):
@@ -550,7 +559,7 @@ def upgrade_database(connection, settings, *, project, state=None):
         try:
             migrate(connection)
             check_ufw_utc_readiness(connection)
-            verify_rows(connection, folder, manifest['tables'])
+            migrate_auth_checkpoints(connection, project, record['user'], state, folder, manifest['tables'])
         except BaseException:
             mark_upgrade_phase(folder, state, 'FAILED')
             raise
@@ -561,22 +570,29 @@ def upgrade_database(connection, settings, *, project, state=None):
 
 
 
-def database_preflight(operation, *, allow_legacy=False):
-    """Check the running local server using SELECT/SHOW only; never start it."""
-    if operation not in ('reset', 'upgrade'):
-        raise ResetError('Unknown database preflight operation.')
-    if allow_legacy and operation != 'reset':
-        raise ResetError('Legacy grant preparation requires an explicit RESET installation.')
+def preflight_connection():
+    """Connect to the already running local server without changing services."""
     result = run_command(['/usr/bin/systemctl', 'is-active', '--quiet', 'mysql.service'])
     if result.returncode:
         raise ResetError('MySQL must already be running; preflight does not start services.')
     if not stat.S_ISSOCK(Path(SOCKET).lstat().st_mode):
         raise ResetError('The local MySQL endpoint must be a socket, not a file or symbolic link.')
-    connection = pymysql.connect(unix_socket=SOCKET, user='root', charset='utf8mb4', autocommit=True,
-                                 connect_timeout=5, read_timeout=15, write_timeout=15)
+    return pymysql.connect(unix_socket=SOCKET, user='root', charset='utf8mb4', autocommit=True,
+                           connect_timeout=5, read_timeout=15, write_timeout=15)
+
+
+def database_preflight(operation, *, allow_legacy=False, project=None, user='mysql_siem'):
+    if operation not in ('reset', 'upgrade'):
+        raise ResetError('Unknown database preflight operation.')
+    if operation == 'upgrade' and project is None:
+        raise ResetError('Upgrade preflight requires the prepared project settings.')
+    if allow_legacy and operation != 'reset':
+        raise ResetError('Legacy grant preparation requires an explicit RESET installation.')
+    connection = preflight_connection()
     try:
         if operation == 'upgrade':
             check_upgrade_database(connection)
+            verify_checkpoints(connection, project, user, allow_approval=True)
         else:
             check_server_version(connection)
             if allow_legacy:
@@ -620,10 +636,11 @@ def stop_installation(signum, frame):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('check', 'reset', 'upgrade', 'verify-upgrade', 'recovery-check', 'resume'))
+    parser.add_argument('action', choices=('auth-check', 'check', 'reset', 'upgrade', 'verify-upgrade', 'recovery-check', 'resume'))
     parser.add_argument('--operation', choices=('reset', 'upgrade'), default='upgrade')
     parser.add_argument('--project', type=Path, required=True)
     parser.add_argument('--allow-legacy-grants', action='store_true')
+    parser.add_argument('--user', default='mysql_siem')
     args = parser.parse_args(argv)
     connection = None
     previous_handler = signal.signal(signal.SIGTERM, stop_installation)
@@ -639,6 +656,15 @@ def main(argv=None):
             print(int(recovered) if args.action == 'recovery-check' else
                   'Completed RESET database verified; database and local identities preserved.')
             return 0
+        if args.action == 'auth-check':
+            if os.geteuid() != 0:
+                raise ResetError('Auth checkpoint preflight requires administrator privileges.')
+            journal.require_install_lock()
+            trusted_directory(args.project / 'config')
+            connection = preflight_connection()
+            connection.select_db(DATABASE)
+            verify_checkpoints(connection, args.project, args.user, allow_approval=True)
+            return 0
         if args.action == 'check':
             if os.geteuid() != 0:
                 raise ResetError('Database preflight requires administrator privileges.')
@@ -647,7 +673,7 @@ def main(argv=None):
             if args.allow_legacy_grants:
                 database_preflight(args.operation, allow_legacy=True)
             else:
-                database_preflight(args.operation)
+                database_preflight(args.operation, project=args.project, user=args.user)
             if args.operation == 'reset':
                 check_system_cron()
             if args.operation == 'upgrade':
@@ -672,7 +698,9 @@ def main(argv=None):
             from config.installation_backup import verify_final_backup
 
             connection.select_db(DATABASE)
-            verify_final_backup(connection, args.project, journal.read_deployment(journal.STATE_DIR))
+            record = journal.read_deployment(journal.STATE_DIR)
+            verify_final_backup(connection, args.project, record)
+            verify_checkpoints(connection, args.project, record['user'])
             print('Original database values and settings verified before releasing collection.')
             return 0
         if args.action == 'upgrade':
@@ -692,19 +720,19 @@ def main(argv=None):
                        prepare=lambda: clear_old_identity(journal.STATE_DIR, args.project))
         print('Fresh mysql_siem database initialized; migrations and UTC readiness verified.')
         return 0
-    except (ResetError, RoleConfigurationError, BackupError) as error:
+    except (ResetError, RoleConfigurationError, BackupError, AuthCollectionError, IdentityError) as error:
         print(str(error), file=sys.stderr)
         return 1
     except (OSError, ValueError, EOFError, subprocess.SubprocessError, InstallationError,
             journal.InstallationStateError):
-        if args.action == 'check':
+        if args.action in ('check', 'auth-check'):
             print('Database preflight failed: filesystem or service validation failed; no database changes were made.', file=sys.stderr)
         else:
             print('Database setup stopped: filesystem, scheduler or maintenance validation failed. Collection remains paused.', file=sys.stderr)
         return 1
     except (pymysql.MySQLError, MigrationError) as error:
         # SQL/driver messages can contain credentials. Report the failed operation safely.
-        if args.action == 'check':
+        if args.action in ('check', 'auth-check'):
             print('Database preflight failed (' + type(error).__name__
                   + '); check the local socket and administrator connection. No database changes were made.', file=sys.stderr)
         else:

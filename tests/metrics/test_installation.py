@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from config import auth_checkpoint_upgrade as auth
 from config import installation_backup as backup
 from config import reset_installation as setup
 from database import migrate, ufw_history
@@ -62,11 +63,18 @@ def test_upgrade_never_resets_database_registry_passwords_or_checkpoints(monkeyp
     monkeypatch.setattr(backup, 'create_verified_backup', lambda *args, **kwargs: (tmp_path, {'tables': {}}))
     monkeypatch.setattr(backup, 'mark_upgrade_phase', MagicMock())
     monkeypatch.setattr(backup, 'verify_rows', MagicMock())
+    monkeypatch.setattr(setup.journal, 'require_maintenance', MagicMock())
+    monkeypatch.setattr(setup.journal, 'require_stage',
+                        MagicMock(return_value={'target': str(tmp_path), 'user': 'mysql_siem'}))
+    monkeypatch.setattr(setup, 'require_stopped_legacy_jobs', MagicMock())
+    monkeypatch.setattr(setup, 'verify_checkpoints', MagicMock())
+    monkeypatch.setattr(auth, 'verify_checkpoints', MagicMock(return_value=[]))
+    cursor = connection.cursor.return_value.__enter__.return_value
+    cursor.fetchone.side_effect = [*cursor.fetchone.side_effect, (1,)]
     setup.upgrade_database(connection, settings, project=tmp_path)
     backup.verify_rows.assert_called_once_with(connection, tmp_path, {})
     assert calls == ['preflight', 'migrate', 'utc']
     connection.select_db.assert_called_once_with('mysql_siem')
-    cursor = connection.cursor.return_value.__enter__.return_value
     assert all(call.args[0].startswith(('SELECT', 'SHOW')) for call in cursor.execute.call_args_list)
 
 
