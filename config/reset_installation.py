@@ -77,7 +77,7 @@ def collection_command(command):
                       'metrics/system/', 'metrics/filesystem/', 'metrics/security/',
                       'metrics/processes/', 'metrics/services/', 'ingestion/audit/', 'config/audit_launcher.py',
                       'analysis/ufw/', 'analysis/daily_counts/', 'detection/port_scan/',
-                      'detection/ssh_brute_force/', '-m ingestion.', '-m metrics.',
+                      'detection/ssh_brute_force/', 'detection/filesystem/', '-m ingestion.', '-m metrics.',
                       '-m analysis.ufw', '-m detection.'):
         if signature in command:
             component = True
@@ -200,7 +200,7 @@ def wait_for_legacy_jobs(processes=Path('/proc'), timeout=30):
                 command = (process / 'cmdline').read_bytes().replace(b'\0', b' ').decode('utf-8', errors='replace')
             except (FileNotFoundError, ProcessLookupError):
                 continue
-            module_job = re.search(r'-m (?:ingestion\.(?:auth|dns|audit)|metrics\.(?:system|filesystem|security|processes|services)|analysis\.ufw|detection\.(?:port_scan|ssh_brute_force))(?:[.\s]|$)', command)
+            module_job = re.search(r'-m (?:ingestion\.(?:auth|dns|audit)|metrics\.(?:system|filesystem|security|processes|services)|analysis\.ufw|detection\.(?:port_scan|ssh_brute_force|filesystem))(?:[.\s]|$)', command)
             try:
                 directory = os.readlink(process / 'cwd')
             except (FileNotFoundError, ProcessLookupError):
@@ -217,7 +217,14 @@ def wait_for_legacy_jobs(processes=Path('/proc'), timeout=30):
 
 # Maximum approved rights, matching the installer table grants. Missing rights
 # are allowed here: the normal installer grants them after schema preparation.
+FILESYSTEM_RUNTIME_PRIVILEGES = {
+    'filesystem_mount_metrics': 'SELECT, INSERT',
+    'filesystem_file_state': 'SELECT, INSERT, DELETE',
+    'filesystem_file_events': 'SELECT, INSERT',
+    'filesystem_scan_state': 'SELECT, INSERT, UPDATE',
+}
 RUNTIME_TABLE_PRIVILEGES = {
+    **FILESYSTEM_RUNTIME_PRIVILEGES,
     'filesystem_metrics': 'SELECT, INSERT, UPDATE',
     'security_metrics': 'SELECT, INSERT, UPDATE',
     'system_metrics': 'SELECT, INSERT',
@@ -414,7 +421,7 @@ def validate_reset_database(connection):
     A matching database name is not ownership evidence. Ledgerless historical
     databases require an administrator's separate review, never a blind reset.
     """
-    from database.migrate import check_migration_history
+    from database.migrate import FILESYSTEM_TABLES, check_migration_history
 
     connection.select_db(DATABASE)
     try:
@@ -424,6 +431,9 @@ def validate_reset_database(connection):
     if records.get('013', (None, None))[1] != 'APPLIED':
         raise ResetError('Cannot prove this mysql_siem database belongs to the application; '
                          'a verified baseline migration is required. Database was preserved.')
+    known_tables = set(RUNTIME_TABLE_PRIVILEGES)
+    if records.get('034', (None, None))[1] != 'APPLIED':
+        known_tables.difference_update(FILESYSTEM_TABLES)
     required = {
         'ufw_log': {'id', 'event_time', 'raw_line', 'event_hash'},
         'auth_events': {'id', 'event_time', 'event_type', 'raw_message', 'event_hash'},
@@ -437,7 +447,7 @@ def validate_reset_database(connection):
                        'WHERE table_schema = DATABASE()')
         existing = set()
         for name, engine, kind in cursor.fetchall():
-            if name not in RUNTIME_TABLE_PRIVILEGES:
+            if name not in known_tables:
                 raise ResetError('Unknown tables share the application database; database was preserved.')
             if engine != 'InnoDB' or kind != 'BASE TABLE':
                 raise ResetError('Unexpected application table type; database was preserved.')

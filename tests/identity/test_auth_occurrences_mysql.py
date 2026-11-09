@@ -208,7 +208,7 @@ def test_migration_preserves_old_rows_checkpoints_and_evidence_and_resumes(empty
         failure.setattr(auth_occurrence_schema, 'add_column', interrupt)
         with pytest.raises(RuntimeError, match='synthetic interrupted'):
             migrate.migrate(empty_mysql)
-    assert migrate.migrate(empty_mysql) == ['032', '033']
+    assert migrate.migrate(empty_mysql) == ['032', '033', '034', '035']
     assert migrate.migrate(empty_mysql) == []
     assert rows(empty_mysql, 'SELECT id,event_time,event_hash,raw_message,host_id,source_id,collector_id,source_scope '
                             'FROM auth_events ORDER BY id') == before
@@ -309,7 +309,7 @@ def test_approved_upgrade_preserves_legacy_auth_checkpoint_and_resumes(
     assert len(auth.verify_checkpoints(connection, project, user, state=state, allow_approval=True)) == 1
     assert rows(connection, checkpoint_sql) == original_checkpoint
     if not already_applied:
-        assert migrate.migrate(connection) == ['032', '033']
+        assert migrate.migrate(connection) == ['032', '033', '034', '035']
 
     # Interrupt after UPDATE and preservation verification, before COMMIT.
     def interrupt(*args, **kwargs):

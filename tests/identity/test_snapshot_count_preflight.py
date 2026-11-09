@@ -3,8 +3,8 @@
 import pytest
 
 from database.migrate import (
-    MigrationError,
     SNAPSHOT_STATE_TABLES,
+    MigrationError,
     requires_monotonic_history_count,
 )
 from database.ufw_history import check_counts
@@ -17,6 +17,8 @@ from database.ufw_history import check_counts
         ("process_state", 10, 0),
         ("service_state", 18, 7),
         ("service_state", 5, 0),
+        ("filesystem_file_state", 20, 0),
+        ("filesystem_scan_state", 2, 1),
     ],
 )
 def test_snapshot_state_may_shrink(table, previous, current):
@@ -36,6 +38,8 @@ def test_snapshot_state_may_shrink(table, previous, current):
         "ufw_log",
         "process_events",
         "service_events",
+        "filesystem_mount_metrics",
+        "filesystem_file_events",
         "auth_events",
         "audit_events",
         "detection_alerts",
@@ -58,7 +62,7 @@ def test_historical_event_loss_still_blocked(table):
 
 @pytest.mark.parametrize(
     "table",
-    ["process_state", "service_state"],
+    ["process_state", "service_state", "filesystem_file_state", "filesystem_scan_state"],
 )
 def test_missing_snapshot_table_is_rejected(table):
     with pytest.raises(
@@ -88,6 +92,8 @@ def test_snapshot_event_tables_are_not_exempt():
     assert SNAPSHOT_STATE_TABLES == frozenset({
         "process_state",
         "service_state",
+        "filesystem_file_state",
+        "filesystem_scan_state",
     })
 
     assert requires_monotonic_history_count(

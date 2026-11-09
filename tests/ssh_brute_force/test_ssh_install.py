@@ -186,6 +186,7 @@ crontab() {
         "SSH_DETECTION_CRON": detection,
         "PORT_SCAN_CRON": "* * * * * echo port-scan-kept",
         "DNS_CRON": "*/5 * * * * echo dns-kept",
+        "FILESYSTEM_CRON": "*/5 * * * * echo filesystem-job",
     }
 
     for attempt in range(2):
@@ -210,6 +211,7 @@ crontab() {
         "external-job",
         "port-scan-kept",
         "dns-kept",
+        "filesystem-job",
         "ufw_to_mysql.py",
         "metrics.security.main",
     ):

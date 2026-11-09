@@ -10,7 +10,10 @@ import pymysql
 
 from config import installation_state as journal
 from config.auth_checkpoint_upgrade import verify_checkpoints
+from config.filesystem_runtime import FilesystemSetupError
+from config.filesystem_runtime import verify as verify_filesystem
 from config.installation_role_setup import read_owned_role
+from config.reset_installation import ResetError
 from config.service_installation import (
     InstallationError,
     preserved,
@@ -96,6 +99,7 @@ def verify_health(connection, project, *, state=journal.STATE_DIR, during_mainte
     text = read_crontab(record['user'])
     if hashlib.sha256(text.encode('utf-8')).hexdigest() != record['cron_digest']:
         raise HealthError('Scheduled jobs differ from the verified deployment.')
+    verify_filesystem(connection, project, record['user'], stable / 'bin/python', settings, text)
     return installed
 
 
@@ -116,11 +120,11 @@ def main(argv=None):
                                  revision=args.revision)
         print('Status: HEALTHY - approved commit ' + revision + '; schema, identities and jobs verified.')
         return 0
-    except (AuthCollectionError, IdentityError) as error:
+    except (AuthCollectionError, FilesystemSetupError, IdentityError) as error:
         print('Status: FAILED - ' + str(error), file=sys.stderr)
         return 1
-    except (HealthError, InstallationError, migrate.MigrationError, journal.InstallationStateError,
-            OSError, ValueError, pymysql.MySQLError):
+    except (HealthError, InstallationError, migrate.MigrationError, journal.InstallationStateError, ResetError,
+            OSError, ValueError, TypeError, KeyError, pymysql.MySQLError):
         print('Status: FAILED - deployment, runtime connection, migration, identity or scheduler '
               'verification failed. Preserve recovery files; do not RESET.', file=sys.stderr)
         return 1

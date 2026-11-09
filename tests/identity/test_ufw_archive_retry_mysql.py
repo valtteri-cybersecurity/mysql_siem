@@ -198,7 +198,7 @@ def test_retry_migration_resumes_and_preserves_legacy_failure(empty_mysql, monke
         failure.setattr(ufw_archive_retry_schema, 'add_column', interrupt)
         with pytest.raises(RuntimeError, match='synthetic interruption'):
             migrate.migrate(empty_mysql)
-    assert migrate.migrate(empty_mysql) == ['031', '032', '033']
+    assert migrate.migrate(empty_mysql) == ['031', '032', '033', '034', '035']
     assert rows(empty_mysql, 'SELECT source_scope,source_key,filename,reason,detected_at FROM ufw_archive_failures') == before
     assert rows(empty_mysql, 'SELECT archive_sha,retryable,resolved_at FROM ufw_archive_failures') == ((None, 0, None),)
     assert migrate.migrate(empty_mysql) == []

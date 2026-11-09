@@ -5,7 +5,7 @@ from datetime import datetime
 import pymysql
 
 
-def get_connection(*, require_tls=False, quiet=False):
+def get_connection(*, require_tls=False, quiet=False, binary_parameters=False):
     """Shared connection; existing no-argument calls remain supported.
 
     Remote hosts always require verified TLS. Local loopback remains compatible
@@ -48,6 +48,10 @@ def get_connection(*, require_tls=False, quiet=False):
 
         if tls_required:
             settings["ssl"] = ssl.create_default_context(cafile=ca_file)
+
+        # Before 1.2.1 the driver needs this option to preserve raw bytes.
+        if binary_parameters and pymysql.VERSION[:3] < (1, 2, 1):
+            settings["binary_prefix"] = True
 
         connection = pymysql.connect(
             host=required["DB_HOST"],

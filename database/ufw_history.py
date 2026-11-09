@@ -161,13 +161,17 @@ def check_legacy_port_state(connection):
         raise MigrationError('Legacy port scan checkpoint exceeds the UFW tail or is invalid.')
 
 
-def check_detection(connection, *, allow_port=False):
+def check_detection(connection, *, allow_port=False, allow_fim=False):
     from database.migrate import MigrationError
+    from detection.filesystem.detector import EVIDENCE_TYPE, RULE_KEYS
     from detection.ssh_brute_force.state import load_state
 
     allowed = ['SSH_BRUTE_FORCE_001']
     if allow_port:
         allowed.append('PORT_SCAN_001')
+    if allow_fim:
+        allowed.extend(RULE_KEYS)
+    fim_alerts = False
     with connection.cursor() as cursor:
         for table, query in (
             ('detection_state', ('SELECT DISTINCT r.rule_key FROM detection_state '
@@ -182,14 +186,28 @@ def check_detection(connection, *, allow_port=False):
                     continue
                 if row[0] not in allowed:
                     raise MigrationError('Unisolated UFW or unknown detection history blocks upgrade.')
+                if table == 'detection_alerts' and row[0] in RULE_KEYS:
+                    fim_alerts = True
         cursor.execute("SELECT COUNT(*) FROM alert_evidence e LEFT JOIN detection_alerts a ON a.id=e.alert_id "
                        "LEFT JOIN detection_rules r ON r.id=a.rule_id LEFT JOIN auth_events h ON h.id=e.event_id "
                        "WHERE NOT (r.rule_key <=> 'PORT_SCAN_001') AND "
+                       "(%s = FALSE OR r.rule_key IS NULL OR r.rule_key NOT IN %s) AND "
                        "(NOT (r.rule_key <=> 'SSH_BRUTE_FORCE_001') OR NOT (e.event_type <=> 'AUTH') "
                        "OR h.id IS NULL OR NOT (h.event_type <=> 'SSH_AUTH_FAILURE') "
-                       "OR NOT (h.service <=> 'sshd'))")
+                       "OR NOT (h.service <=> 'sshd'))", (fim_alerts, RULE_KEYS))
         if cursor.fetchone()[0]:
             raise MigrationError('Unknown or contradictory evidence binding blocks upgrade.')
+        if fim_alerts:
+            cursor.execute("SELECT COUNT(*) FROM detection_alerts a JOIN detection_rules r ON r.id=a.rule_id "
+                           "LEFT JOIN alert_evidence e ON e.alert_id=a.id "
+                           "LEFT JOIN filesystem_file_events f ON f.id=e.event_id "
+                           "WHERE r.rule_key IN %s AND (NOT (e.event_type <=> %s) OR f.id IS NULL "
+                           "OR NOT (a.host_id <=> f.host_id) "
+                           "OR NOT (JSON_UNQUOTE(JSON_EXTRACT(a.details, '$.source_id')) <=> CAST(f.source_id AS CHAR)) "
+                           "OR NOT (JSON_UNQUOTE(JSON_EXTRACT(a.details, '$.path_hex')) <=> LOWER(HEX(f.file_path))))",
+                           (RULE_KEYS, EVIDENCE_TYPE))
+            if cursor.fetchone()[0]:
+                raise MigrationError('Invalid FIM evidence binding blocks upgrade.')
         if allow_port:
             cursor.execute("SELECT COUNT(*) FROM alert_evidence e JOIN detection_alerts a ON a.id=e.alert_id "
                            "JOIN detection_rules r ON r.id=a.rule_id LEFT JOIN ufw_log u ON u.id=e.event_id "
@@ -317,7 +335,8 @@ def preflight(connection):
         verify(connection, analysis_saved[ANALYSIS_KEY], final=analysis_state == 'APPLIED')
     from database.ufw_analysis_keys import preflight as parallel_preflight
     parallel_preflight(connection)
-    check_detection(connection, allow_port=modern)
+    fim_ready = records.get('035', (None, None))[1] == 'APPLIED'
+    check_detection(connection, allow_port=modern, allow_fim=fim_ready)
     if modern:
         from database.migrate import ufw_timestamp_schema
         if ufw_timestamp_schema(connection) != ('datetime', 6, 'YES', None):

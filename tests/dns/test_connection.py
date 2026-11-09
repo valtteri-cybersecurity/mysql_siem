@@ -115,3 +115,10 @@ def test_old_driver_is_rejected_before_remote_authentication(connect, monkeypatc
 def test_old_driver_keeps_local_api_compatibility(connect, monkeypatch):
     monkeypatch.setattr(pymysql, "VERSION", (1, 0, 2, None))
     assert get_connection() is connect.return_value
+
+
+@pytest.mark.parametrize("version,needs_prefix", [((1, 2, 0), True), ((1, 2, 1), False)])
+def test_binary_parameters_use_legacy_driver_option_only_when_needed(connect, monkeypatch, version, needs_prefix):
+    monkeypatch.setattr(pymysql, "VERSION", version)
+    assert get_connection(quiet=True, binary_parameters=True) is connect.return_value
+    assert ("binary_prefix" in connect.call_args.kwargs) is needs_prefix

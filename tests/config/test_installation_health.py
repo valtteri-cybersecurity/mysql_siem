@@ -41,6 +41,7 @@ def installed(tmp_path, monkeypatch):
     monkeypatch.setattr(health, 'validate_bindings', Mock(return_value=3))
     monkeypatch.setattr(health, 'verify_schema', Mock())
     monkeypatch.setattr(health, 'verify_checkpoints', Mock())
+    monkeypatch.setattr(health, 'verify_filesystem', Mock())
     monkeypatch.setattr(health, 'read_crontab', Mock(return_value=cron))
     return SimpleNamespace(project=project, state=state, record=record, receipt=receipt,
                            stable=stable, version=version)
@@ -55,6 +56,7 @@ def test_completed_installation_health_is_read_only(installed):
     assert verify(installed, revision='a' * 40) == 'a' * 40
     assert installed.version.read_bytes() == before
     health.journal.require_maintenance.assert_not_called()
+    health.verify_filesystem.assert_called_once()
 
 
 @pytest.mark.parametrize('fault', ['maintenance', 'unfinished', 'revision', 'python', 'receipt', 'host', 'cron', 'role'])

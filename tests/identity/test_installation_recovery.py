@@ -437,7 +437,8 @@ die() { echo "$*" >&2; exit 1; }
 '''
     values = {'INSTALL_USER': 'synthetic', 'PROJECT_DIR': str(tmp_path),
               'APP_PYTHON': '/synthetic/python/bin/python', 'CRON_BEGIN': local.BEGIN, 'CRON_END': local.END,
-              'TEST_CRON': str(cron), 'FINISH_MARKER': str(marker), 'PORT_SCAN_CRON': '', 'DNS_CRON': ''}
+              'TEST_CRON': str(cron), 'FINISH_MARKER': str(marker), 'PORT_SCAN_CRON': '', 'DNS_CRON': '',
+              'FILESYSTEM_CRON': '*/5 * * * * echo filesystem-job'}
     for name, value in values.items():
         script += name + '=' + shlex.quote(value) + '\n'
     result = subprocess.run(['bash', '-c', script + block], capture_output=True, text=True, timeout=10, check=False)

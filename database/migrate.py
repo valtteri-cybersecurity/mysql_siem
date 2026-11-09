@@ -31,6 +31,8 @@ ROOT = Path(__file__).parent
 BASELINE = ROOT / "schema.sql"
 REGISTRY = ROOT / "migrations/014_host_registry.sql"
 UFW_TIME_MIGRATION = ROOT / "migrations/017_ufw_datetime_precision.sql"
+FILESYSTEM_MIGRATION = ROOT / "migrations/034_filesystem_metrics.sql"
+FIM_DETECTION_MIGRATION = ROOT / "migrations/035_filesystem_detection.sql"
 LOCK_NAME = "mysql_siem_schema_migrations"
 
 MIGRATIONS = (
@@ -55,11 +57,21 @@ MIGRATIONS = (
     ("031", "ufw_archive_retries", ROOT / "ufw_archive_retry_schema.py"),
     ("032", "auth_occurrences", ROOT / "auth_occurrence_schema.py"),
     ("033", "auth_gzip_checkpoints", ROOT / "auth_archive_schema.py"),
+    ("034", "filesystem_metrics", FILESYSTEM_MIGRATION),
+    ("035", "filesystem_detection", FIM_DETECTION_MIGRATION),
 )
 
 
 class MigrationError(RuntimeError):
     """A migration needs attention before runtime jobs can resume."""
+
+
+FILESYSTEM_TABLES = (
+    "filesystem_mount_metrics",
+    "filesystem_file_state",
+    "filesystem_file_events",
+    "filesystem_scan_state",
+)
 
 
 HISTORY_TABLES = EVENT_TABLES + ANALYSIS_TABLES + (
@@ -78,7 +90,7 @@ HISTORY_TABLES = EVENT_TABLES + ANALYSIS_TABLES + (
     "auth_ingestion_state", "auth_archive_checkpoints",
     "process_events", "process_state", "service_events", "service_state", "collector_snapshots",
     "audit_events", "audit_checkpoints", "audit_targets",
-)
+) + FILESYSTEM_TABLES
 
 
 # These tables contain the latest observation, not immutable history.
@@ -86,6 +98,8 @@ HISTORY_TABLES = EVENT_TABLES + ANALYSIS_TABLES + (
 SNAPSHOT_STATE_TABLES = frozenset((
     "process_state",
     "service_state",
+    "filesystem_file_state",
+    "filesystem_scan_state",
 ))
 
 
@@ -575,6 +589,17 @@ def apply_one(connection, version):
         from database.audit_migrations import upgrade_audit
         upgrade_audit(connection, ROOT / "migrations/020_audit.sql")
 
+    elif version == "034":
+        # The fixed SQL file contains only CREATE TABLE IF NOT EXISTS statements.
+        with connection.cursor() as cursor:
+            for statement in FILESYSTEM_MIGRATION.read_text().split(";"):
+                if statement.strip():
+                    cursor.execute(statement)
+
+    elif version == "035":
+        with connection.cursor() as cursor:
+            cursor.execute(FIM_DETECTION_MIGRATION.read_text())
+
     elif version == "033":
         from database.auth_archive_schema import upgrade
         upgrade(connection)
@@ -710,6 +735,11 @@ def migrate(connection):
                 )
 
                 previous = cursor.fetchone()
+
+                if version == "034" and previous is None and counts.keys() & FILESYSTEM_TABLES:
+                    raise MigrationError(
+                        "034: filesystem tables exist without migration history; inspect the database."
+                    )
 
                 if previous is not None:
                     counts = json.loads(previous[0])

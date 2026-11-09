@@ -136,7 +136,9 @@ runuser() { printf '%s\\n' "$@"; cat >/dev/null; }
 @pytest.mark.parametrize('role', ['server', 'collector'])
 def test_role_cron_selection_and_repeatable_managed_block(tmp_path, role):
     cron = tmp_path / 'crontab'
-    cron.write_text('MAILTO=keep\n17 * * * * echo external-job\n')
+    cron.write_text('MAILTO=keep\n17 * * * * echo external-job\n'
+                    '# BEGIN mysql_siem managed jobs\n*/5 * * * * metrics/filesystem/main.py\n'
+                    '# END mysql_siem managed jobs\n')
     block = INSTALLER.split("# Update only this installation's marked cron block.", 1)[1].split('log "Installation steps completed.', 1)[0]
     extra = '''
 verify_installation_health() { :; }
@@ -153,6 +155,9 @@ PORT_SCAN_CRON='port-detection-job'
 SSH_DETECTION_CRON='ssh-detection-job'
 SSH_AUTH_CRON='auth-collection-job'
 DNS_CRON='dns-collection-job'
+FILESYSTEM_CRON='mount-collection-job
+fim-inventory-job
+fim-detection-job'
 APP_PYTHON='/opt/mysql_siem-venv/bin/python'
 INSTALL_ROLE=''' + role + '\nselect_role_cron_jobs\n'
     previous = None
@@ -163,8 +168,10 @@ INSTALL_ROLE=''' + role + '\nselect_role_cron_jobs\n'
         if previous is not None:
             assert current == previous
         previous = current
-    for job in ('analysis-job', 'port-detection-job', 'ssh-detection-job'):
+    for job in ('analysis-job', 'port-detection-job', 'ssh-detection-job',
+                'mount-collection-job', 'fim-inventory-job', 'fim-detection-job'):
         assert (job in current) == (role == 'server')
+    assert 'metrics/filesystem/main.py' not in current
     for job in ('auth-collection-job', 'dns-collection-job', 'ufw_to_mysql.py', 'metrics.security.main', 'external-job', 'MAILTO=keep'):
         assert job in current
 

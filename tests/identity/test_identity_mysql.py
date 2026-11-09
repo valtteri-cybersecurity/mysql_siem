@@ -60,6 +60,7 @@ def test_empty_database_and_repeat_run(empty_mysql):
     assert migrations.migrate(empty_mysql) == [
         "013", "014", "015", "016", "017", "018", "019", "020",
         "021", "022", "023", "024", "025", "026", "027", "028",
+        "029", "030", "031", "032", "033", "034", "035",
     ]
     assert migrations.migrate(empty_mysql) == []
     assert {state for _, state in migrations.migration_status(empty_mysql).values()} == {"APPLIED"}

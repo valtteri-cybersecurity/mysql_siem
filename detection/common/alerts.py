@@ -16,9 +16,12 @@ def link_alert_hosts(cursor, alert_id, hosts):
         validate_text(role, maximum=32)
         if not role.isascii():
             raise ValueError("Alert host roles must use ASCII characters.")
-        cursor.execute("""INSERT INTO alert_hosts (alert_id, host_id, host_role)
-            VALUES (%s, %s, %s) ON DUPLICATE KEY UPDATE host_role = alert_hosts.host_role""",
-                       (alert_id, host_id, role))
+        try:
+            cursor.execute('INSERT INTO alert_hosts (alert_id, host_id, host_role) VALUES (%s, %s, %s)',
+                           (alert_id, host_id, role))
+        except pymysql.IntegrityError as error:
+            if error.args[0] != 1062:
+                raise
 
 
 class AlertStorageError(RuntimeError):

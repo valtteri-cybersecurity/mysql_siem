@@ -241,7 +241,9 @@ def test_runtime_and_cron_use_absolute_virtualenv_python():
         'cat >> "$CRON_TMP" <<CRON', 1
     )[1].split("\nCRON", 1)[0]
 
-    assert cron.count('"$APP_PYTHON"') == 6
+    assert cron.count('"$APP_PYTHON"') == 5
+    assert '$FILESYSTEM_CRON' in cron
+    assert '"$APP_PYTHON" -m config.filesystem_runtime' in runtime
 
     assert (
         'runuser -u "$INSTALL_USER" -- /usr/bin/python3 -B'

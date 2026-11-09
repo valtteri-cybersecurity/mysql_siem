@@ -132,7 +132,7 @@ def test_final_permissions_access_and_repeat_do_not_depend_on_umask(logs, mask):
         assert logfile.read_bytes() == b''
     service.os.fchown.assert_not_called()
     service.os.fchmod.assert_not_called()
-    assert service.subprocess.run.call_count == 6
+    assert service.subprocess.run.call_count == 2 * len(service.LOG_COMPONENTS)
     for call in service.subprocess.run.call_args_list:
         assert call.args[0][:8] == ['/usr/sbin/runuser', '-u', 'mysql_siem', '--', '/usr/bin/head', '-c', '0', '--']
 

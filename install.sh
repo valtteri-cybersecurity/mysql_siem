@@ -177,6 +177,7 @@ select_role_cron_jobs() {
             UFW_ANALYSIS_CRON=""
             PORT_SCAN_CRON=""
             SSH_DETECTION_CRON=""
+            FILESYSTEM_CRON=""
             ;;
         *) die "Invalid cron installation role." ;;
     esac
@@ -704,6 +705,7 @@ for path in \
     config/systemd/mysql-siem-audit.timer \
     metrics/snapshot.py \
     config/run_with_env.sh \
+    config/filesystem_runtime.py \
     config/installation_role.py \
     config/installation_role_setup.py \
     config/ssh.env.example \
@@ -734,12 +736,27 @@ for path in \
     database/migrations/026_ufw_filtering.sql \
     database/migrations/027_ufw_analysis_parallel_time_basis.sql \
     database/migrations/028_ufw_analysis_time_basis_indexes.sql \
+    database/migrations/034_filesystem_metrics.sql \
+    database/migrations/035_filesystem_detection.sql \
     database/ufw_analysis_keys.py \
     database/migrations/025_ufw_continuity.sql \
     database/migrations/024_ufw_quarantine_archives.sql \
     database/ufw_collection_schema.py \
     metrics/system/main.py \
     metrics/filesystem/main.py \
+    metrics/filesystem/mount_main.py \
+    metrics/filesystem/mounts.py \
+    metrics/filesystem/mount_db.py \
+    metrics/filesystem/fim_main.py \
+    metrics/filesystem/fim_db.py \
+    metrics/filesystem/fim.py \
+    metrics/filesystem/inventory.py \
+    metrics/filesystem/file_integrity.py \
+    metrics/filesystem/permissions.py \
+    metrics/filesystem/runtime.py \
+    detection/filesystem/main.py \
+    detection/filesystem/runner.py \
+    detection/filesystem/detector.py \
     metrics/security/main.py \
     metrics/processes/main.py \
     metrics/processes/get.py \
@@ -961,9 +978,11 @@ SSH_READY=1
 
 # Grant privileges only after the tables have been created.
 # Do not grant global privileges to the database user.
-"$APP_PYTHON" - <<'PY'
+PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" - <<'PY'
 import os
 import pymysql
+
+from config.reset_installation import FILESYSTEM_RUNTIME_PRIVILEGES
 
 db_name = os.environ["DB_NAME"]
 db_user = os.environ["DB_USER"]
@@ -1000,6 +1019,7 @@ grants = {
     'ufw_filter_seen': 'SELECT, INSERT',
     'ufw_filter_stats': 'SELECT, INSERT, UPDATE',
 }
+grants.update(FILESYSTEM_RUNTIME_PRIVILEGES)
 
 conn = pymysql.connect(unix_socket="/run/mysqld/mysqld.sock", user="root")
 try:
@@ -1069,6 +1089,10 @@ verify_local_identity
 # Use the shipped environment loader; keep one implementation of DNS loading.
 
 chmod 750 "$PROJECT_DIR/config/run_with_env.sh"
+FILESYSTEM_CRON="$("$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" -m config.filesystem_runtime \
+    "$PROJECT_DIR" "$INSTALL_USER" "$APP_PYTHON")"
+runuser -u "$INSTALL_USER" -- /usr/bin/test -r "$PROJECT_DIR/config/filesystem.env" ||
+    die "The service account cannot read the filesystem configuration."
 
 # Schedule one bounded detection pass; the application holds a database lock.
 PORT_SCAN_CRON=""
@@ -1159,7 +1183,6 @@ fi
 # Cron output files must remain writable after the source tree is locked down.
 prepare_runtime_log "$PROJECT_DIR/ingestion/cron.log"
 prepare_runtime_log "$PROJECT_DIR/metrics/system/cron.log"
-prepare_runtime_log "$PROJECT_DIR/metrics/filesystem/cron.log"
 prepare_runtime_log "$PROJECT_DIR/metrics/security/cron.log"
 log "Checking Python syntax."
 while IFS= read -r -d '' pyfile; do
@@ -1214,7 +1237,7 @@ cat >> "$CRON_TMP" <<CRON
 $CRON_BEGIN
 * * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" "$PROJECT_DIR/ingestion/ufw_to_mysql.py" >> "$PROJECT_DIR/ingestion/cron.log" 2>&1
 */5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" "$PROJECT_DIR/metrics/system/main.py" >> "$PROJECT_DIR/metrics/system/cron.log" 2>&1
-*/5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" "$PROJECT_DIR/metrics/filesystem/main.py" >> "$PROJECT_DIR/metrics/filesystem/cron.log" 2>&1
+$FILESYSTEM_CRON
 */5 * * * * cd "$PROJECT_DIR" && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" -m metrics.security.main >> "$PROJECT_DIR/metrics/security/cron.log" 2>&1
 * * * * * cd "$PROJECT_DIR" && umask 077 && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" -m metrics.processes.main --log-file "/var/log/mysql_siem/processes/cron.log"
 * * * * * cd "$PROJECT_DIR" && umask 077 && PYTHONPATH="$PROJECT_DIR" "$PROJECT_DIR/config/run_with_env.sh" "$APP_PYTHON" -m metrics.services.main --log-file "/var/log/mysql_siem/services/cron.log"

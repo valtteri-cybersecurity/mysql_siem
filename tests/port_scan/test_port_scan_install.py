@@ -125,6 +125,7 @@ crontab() {
         "CRON_BEGIN": "# BEGIN mysql_siem managed jobs",
         "CRON_END": "# END mysql_siem managed jobs",
         "PORT_SCAN_CRON": command,
+        "FILESYSTEM_CRON": "*/5 * * * * echo filesystem-job",
         "DNS_CRON": "*/5 * * * * echo existing-dns",
         "UFW_ANALYSIS_CRON": "*/5 * * * * /usr/bin/python3 -m analysis.ufw.main --all --recent-hours 3",
         "TEST_CRONTAB": str(cron_file),
@@ -139,13 +140,14 @@ crontab() {
     for job in (
         "ingestion/ufw_to_mysql.py",
         "metrics/system/main.py",
-        "metrics/filesystem/main.py",
+        "filesystem-job",
         "metrics.security.main",
         "analysis.ufw.main",
         "existing-dns",
     ):
         assert job in first
     assert "old managed job" not in first
+    assert "metrics/filesystem/main.py" not in first
     assert "analysis/daily_counts" not in first
 
 

@@ -24,7 +24,7 @@ EXCLUDED = {'.git', '.venv', 'venv', '__pycache__', '.pytest_cache', '.ruff_cach
             '.mypy_cache', '.idea', '.vscode', 'tests', 'docs'}
 ENVIRONMENTS = Path('/opt/.mysql_siem-environments')
 LOG_PARENT = Path('/var/log')
-LOG_COMPONENTS = ('processes', 'services', 'audit')
+LOG_COMPONENTS = ('processes', 'services', 'audit', 'filesystem-mounts', 'filesystem-fim', 'filesystem-detection')
 
 
 def trusted_directory(path):

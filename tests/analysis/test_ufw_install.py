@@ -97,6 +97,7 @@ crontab() {
     env = {**os.environ, "PROJECT_DIR": str(tmp_path), "INSTALL_USER": "test-user",
            "CRON_BEGIN": "# BEGIN mysql_siem managed jobs", "CRON_END": "# END mysql_siem managed jobs",
            "TEST_CRONTAB": str(cron), "APP_PYTHON": "/opt/mysql_siem-venv/bin/python",
+           "FILESYSTEM_CRON": "*/5 * * * * echo filesystem-job",
            "UFW_ANALYSIS_CRON": cron_command(tmp_path, ports_ready="1"),
            "PORT_SCAN_CRON": "* * * * * echo keep-portscan", "DNS_CRON": "*/5 * * * * echo keep-dns",
            "SSH_AUTH_CRON": "* * * * * echo keep-auth", "SSH_DETECTION_CRON": "* * * * * echo keep-ssh"}
@@ -110,7 +111,7 @@ crontab() {
     assert "analysis/targeted_ports" not in first
     assert "analysis/daily_counts" not in first
     for item in ("MAILTO=test-user", "17 * * * * echo keep-external", "keep-portscan", "keep-dns",
-                 "keep-auth", "keep-ssh"):
+                 "keep-auth", "keep-ssh", "filesystem-job"):
         assert item in first
 
 
@@ -196,7 +197,7 @@ crontab() {
     env = {**os.environ, "PROJECT_DIR": str(project), "INSTALL_USER": "test-user",
            "CRON_BEGIN": "# BEGIN mysql_siem managed jobs", "CRON_END": "# END mysql_siem managed jobs",
            "TEST_CRONTAB": str(cron), "APP_PYTHON": "/opt/mysql_siem-venv/bin/python",
-           "PORT_SCAN_CRON": "", "DNS_CRON": ""}
+           "PORT_SCAN_CRON": "", "DNS_CRON": "", "FILESYSTEM_CRON": "*/5 * * * * echo filesystem-job"}
     for _ in range(2):
         subprocess.run(["bash", "-c", script], env=env, check=True, capture_output=True)
         result = cron.read_text()
