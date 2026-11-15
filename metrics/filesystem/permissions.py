@@ -238,11 +238,11 @@ def analyze_permissions(inventory, *, previous=None, identity=None, rules=DEFAUL
             continue
         current = _permission_state(entry.metadata)
         before = None
-        if previous is not None and not directory and path in previous:
+        if previous is not None and path in previous:
             state = previous[path]
             if not isinstance(state, FileState):
                 raise ValueError('Invalid verified FIM file state.')
-            if state.file_type == 'regular':
+            if state.file_type == entry.file_type:
                 before = _permission_state(state)
         allowed = exceptions.get((rule.rule_id, path), 0)
         for kind, severity, reason in permission_risks(rule, current, before, directory=directory,

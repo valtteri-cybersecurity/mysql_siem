@@ -37,8 +37,9 @@ def writer(monkeypatch):
     connection = MagicMock()
     connection.open = True
     cursor = connection.cursor.return_value.__enter__.return_value
-    cursor.fetchone.side_effect = [('APPLIED',), ('test_schema',), (1,), ('APPLIED',), (1,)]
-    cursor.fetchall.return_value = ()
+    cursor.fetchone.side_effect = [('test_schema',), (1,), (1,)]
+    versions = (('034',), ('039',))
+    cursor.fetchall.side_effect = [versions, versions, ()]
     connect = Mock(return_value=connection)
     resolve = Mock(return_value=EventIdentity(1, 2, 3, 4))
     monkeypatch.setattr(mount_db, 'get_connection', connect)
@@ -59,8 +60,9 @@ def test_save_all_rows_and_commit_once(writer, count):
     writer.connection.begin.assert_called_once()
     writer.cursor.executemany.assert_called_once()
     sql, rows = writer.cursor.executemany.call_args.args
-    assert sql.count('%s') == 13
-    assert rows[0] == (1, 2, 3, 4, STAMP.replace(tzinfo=None), b'/', 'ext4', TOTAL, 75, TOTAL, 25, False, 'rw,nosuid')
+    assert sql.count('%s') == 15
+    assert rows[0] == (1, 2, 3, 4, STAMP.replace(tzinfo=None), b'/', 'ext4', TOTAL, 75, TOTAL, 25, False,
+                       'rw,nosuid', 100, b'UUID=local')
     assert len(rows) == count and commit_count == [0]
     writer.connection.commit.assert_called_once()
     assert writer.connection.rollback.call_count == 1  # End the identity lookup transaction.
@@ -89,8 +91,8 @@ def test_missing_or_invalid_identity_stops_before_insert(writer, failure):
 
 
 def test_unapplied_migration_stops_before_insert(writer):
-    writer.cursor.fetchone.side_effect = [('FAILED',)]
-    with pytest.raises(mount_db.MountStorageError, match='migration 034'):
+    writer.cursor.fetchall.side_effect = [(('034',),)]
+    with pytest.raises(mount_db.MountStorageError, match='migration.*039'):
         mount_db.save_mount_metrics(MountCollection((measurement(),), ()))
     writer.resolve.assert_not_called()
     writer.cursor.executemany.assert_not_called()
@@ -103,6 +105,8 @@ def test_unapplied_migration_stops_before_insert(writer):
     MountCollection((measurement(),), (MountFailure(b'/gone', 'Mount disappeared'),)),
     MountCollection((measurement(), measurement()), ()),
     MountCollection((measurement(b'/bad\0path'),), ()),
+    MountCollection((replace(measurement(), mount_source=b''),), ()),
+    MountCollection((replace(measurement(), mount_source=b'bad\0source'),), ()),
     MountCollection((replace(measurement(), available_bytes=-1),), ()),
     MountCollection((replace(measurement(), available_bytes=101),), ()),
     MountCollection((replace(measurement(), total_bytes=2**64),), ()),
@@ -198,7 +202,9 @@ def test_private_mysql_history_atomicity_and_retries(mysql, identity_server, mon
     configure(monkeypatch, first)
     root = measurement()
     path = b'/disk-\xff'
-    collection = MountCollection((root, measurement(path, STAMP + timedelta(microseconds=1))), ())
+    second_stamp = STAMP + timedelta(microseconds=1)
+    other = replace(measurement(path, second_stamp), mount_source=b'/dev/disk-\xff')
+    collection = MountCollection((root, other), ())
     assert mount_db.save_mount_metrics(collection) == 2
     saved = history(mysql)
     stamp = STAMP.replace(tzinfo=None)
@@ -208,9 +214,10 @@ def test_private_mysql_history_atomicity_and_retries(mysql, identity_server, mon
     )
     assert mount_db.save_mount_metrics(collection) == 0
     assert history(mysql) == saved
-    conflict = MountCollection((replace(root, available_bytes=50),), ())
-    with pytest.raises(mount_db.MountStorageError, match='Conflicting'):
-        mount_db.save_mount_metrics(conflict)
+    different_capacity = replace(root, free_bytes=90, used_bytes=TOTAL - 90)
+    for conflicting in (different_capacity, replace(root, available_bytes=50), replace(root, mount_source=b'other')):
+        with pytest.raises(mount_db.MountStorageError, match='Conflicting'):
+            mount_db.save_mount_metrics(MountCollection((conflicting,), ()))
     incomplete_replay = MountCollection((root, measurement(b'/new')), ())
     with pytest.raises(mount_db.MountStorageError, match='Only part'):
         mount_db.save_mount_metrics(incomplete_replay)
@@ -232,7 +239,7 @@ def test_private_mysql_history_atomicity_and_retries(mysql, identity_server, mon
 
     configure(monkeypatch, first)
     later = STAMP + timedelta(minutes=5)
-    next_collection = MountCollection((measurement(stamp=later), measurement(b'/reject', later)), ())
+    next_collection = MountCollection((replace(different_capacity, measured_at=later), measurement(b'/reject', later)), ())
     before = history(mysql)
     with mysql.cursor() as cursor:
         cursor.execute('CREATE TRIGGER reject_mount BEFORE INSERT ON filesystem_mount_metrics FOR EACH ROW '
@@ -266,3 +273,12 @@ def test_private_mysql_history_atomicity_and_retries(mysql, identity_server, mon
         first.values() + (later_stamp, b'/', TOTAL, TOTAL),
         first.values() + (later_stamp, b'/reject', TOTAL, TOTAL),
     )
+    with mysql.cursor() as cursor:
+        cursor.execute('SELECT mount_source, available_bytes, free_bytes, total_bytes - free_bytes '
+                       'FROM filesystem_mount_metrics WHERE host_id=%s AND mount_point IN %s ORDER BY id',
+                       (first.host_id, (b'/', path)))
+        assert cursor.fetchall() == (
+            (b'UUID=local', 75, 100, TOTAL - 100),
+            (other.mount_source, 75, 100, TOTAL - 100),
+            (b'UUID=local', 75, 90, TOTAL - 90),
+        )

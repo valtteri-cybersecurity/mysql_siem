@@ -42,7 +42,10 @@ def _file_state(entry, observed_at):
     if not isinstance(metadata, FileMetadata):
         raise FimError('Invalid file metadata.')
     content_sha256 = None
-    if entry.status == 'SYMLINK':
+    if entry.status == 'SCANNED':
+        if entry.file_type != 'directory' or digest is not None:
+            raise FimError('Invalid directory observation.')
+    elif entry.status == 'SYMLINK':
         if entry.file_type != 'symlink' or digest is not None:
             raise FimError('Invalid symlink observation.')
     else:
@@ -81,7 +84,8 @@ def prepare_inventory(inventory):
             raise FimError('A file observation is newer than its inventory checkpoint.')
         first_observed = min(first_observed, observed_at)
         coverage[path] = entry.status
-        if entry.status in ('FOUND', 'SYMLINK'):
+        scanned_directory = entry.status == 'SCANNED' and entry.metadata is not None
+        if entry.status in ('FOUND', 'SYMLINK') or scanned_directory:
             current[path] = _file_state(entry, observed_at)
     return current, coverage, scan_at, first_observed
 
@@ -105,6 +109,17 @@ def detect_changes(previous, current, coverage):
     for path in sorted(previous.keys() | current.keys()):
         before = previous.get(path)
         after = current.get(path)
+        # Directories contribute metadata transitions, not lifecycle events.
+        if before is not None and before.file_type == 'directory':
+            if after is None:
+                if coverage.get(path) == 'SCANNED':
+                    raise FimError('Missing metadata for a previously monitored directory.')
+                continue
+            if after.file_type != 'directory':
+                before = None
+        if after is not None and after.file_type == 'directory' and before is None:
+            # The first directory observation establishes its permission baseline.
+            continue
         if before is None:
             changes.append((path, 'CREATED', None, after))
             continue
@@ -114,6 +129,8 @@ def detect_changes(previous, current, coverage):
             changes.append((path, 'DELETED', before, None))
             continue
         if before.file_type != after.file_type:
+            if after.file_type == 'directory':
+                raise FimError('A previously monitored path has no verified absence.')
             changes.append((path, 'TYPE_CHANGED', before, after))
             continue
         if after.file_type == 'symlink':

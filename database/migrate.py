@@ -61,6 +61,8 @@ MIGRATIONS = (
     ("035", "filesystem_detection", FIM_DETECTION_MIGRATION),
     ("036", "filesystem_file_types", ROOT / "filesystem_type_schema.py"),
     ("037", "filesystem_retained_digest", ROOT / "filesystem_digest_schema.py"),
+    ("038", "filesystem_directory_metadata", ROOT / "filesystem_directory_schema.py"),
+    ("039", "filesystem_mount_history", ROOT / "filesystem_mount_history_schema.py"),
 )
 
 
@@ -608,6 +610,14 @@ def apply_one(connection, version):
 
     elif version == "037":
         from database.filesystem_digest_schema import upgrade
+        upgrade(connection)
+
+    elif version == "038":
+        from database.filesystem_directory_schema import upgrade
+        upgrade(connection)
+
+    elif version == "039":
+        from database.filesystem_mount_history_schema import upgrade
         upgrade(connection)
 
     elif version == "033":

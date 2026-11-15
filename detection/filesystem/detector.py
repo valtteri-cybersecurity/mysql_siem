@@ -42,12 +42,12 @@ def _state(raw, observed_at):
     if not isinstance(data, dict) or data.keys() - {'file_type', 'retained_sha256'} != fields:
         raise ValueError('Unexpected FIM state fields.')
     file_type = data.get('file_type', 'regular')
-    if file_type not in ('regular', 'symlink'):
+    if file_type not in ('regular', 'symlink', 'directory'):
         raise ValueError('Invalid FIM file type.')
     digest = _digest(data['content_sha256'])
     retained = _digest(data.get('retained_sha256'))
-    if file_type == 'symlink' and (digest is not None or retained is not None):
-        raise ValueError('Invalid FIM symlink digest.')
+    if file_type != 'regular' and (digest is not None or retained is not None):
+        raise ValueError('Invalid FIM digest for this file type.')
     if digest is not None and retained is not None:
         raise ValueError('A FIM state cannot contain both current and retained digests.')
     for key, maximum in (('size_bytes', 2**64 - 1), ('owner_uid', 2**32 - 1),
@@ -81,22 +81,23 @@ def confirm_event(row):
 
 
 def _significant_risks(path, kind, before, after, policy):
-    if kind not in ('CREATED', 'PERMISSION_CHANGED', 'OWNER_CHANGED', 'TYPE_CHANGED') or after.file_type != 'regular':
+    if kind not in ('CREATED', 'PERMISSION_CHANGED', 'OWNER_CHANGED', 'TYPE_CHANGED') or after.file_type == 'symlink':
         return []
     exact, trees, exceptions = policy
     rule = matching_rule(path, exact, trees)
     if rule is None or not rule.enabled:
         return []
     allowed = exceptions.get((rule.rule_id, path), 0)
+    directory = after.file_type == 'directory'
     current = PermissionState(after.mode, after.owner_uid, after.group_gid)
     previous = None
     previous_kinds = set()
-    if before is not None and before.file_type == 'regular':
+    if before is not None and before.file_type == after.file_type:
         previous = PermissionState(before.mode, before.owner_uid, before.group_gid)
-        for risk, _, _ in permission_risks(rule, previous, None, directory=False, baseline_known=False, allowed=allowed):
+        for risk, _, _ in permission_risks(rule, previous, None, directory=directory, baseline_known=False, allowed=allowed):
             previous_kinds.add(risk)
     findings = []
-    for risk, severity, reason in permission_risks(rule, current, previous, directory=False,
+    for risk, severity, reason in permission_risks(rule, current, previous, directory=directory,
                                                    baseline_known=True, allowed=allowed):
         if severity not in ('HIGH', 'CRITICAL'):
             continue
@@ -115,6 +116,8 @@ def build_alert(rule_key, event, critical_files, critical_directories, policy):
     details = {'host_id': identity.host_id, 'source_id': identity.source_id, 'path': path.decode('utf-8', 'backslashreplace'),
                'path_hex': path.hex(), 'event_type': kind, 'previous_state': old, 'current_state': new}
     if rule_key == CRITICAL_RULE:
+        if after is not None and after.file_type == 'directory':
+            return None
         critical = path in critical_files
         for directory in critical_directories:
             if path.startswith(directory + b'/'):
