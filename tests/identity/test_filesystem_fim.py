@@ -22,8 +22,10 @@ from metrics.filesystem.file_integrity import FileDigest
 from metrics.filesystem.inventory import (
     DEFAULT_CONFIG,
     FileMetadata,
+    InventoryConfig,
     InventoryEntry,
     InventoryResult,
+    collect_inventory,
 )
 from metrics.filesystem.permissions import PermissionRule
 from metrics.snapshot import CollectionBusy
@@ -80,6 +82,43 @@ def test_created_and_confirmed_deleted_have_correct_null_sides():
     assert fim.detect_changes(earlier, newer, coverage) == [
         (ADDED, 'CREATED', None, newer[ADDED]),
         (REMOVED, 'DELETED', earlier[REMOVED], None),
+    ]
+
+
+@pytest.mark.parametrize('directory_target', [False, True])
+def test_replacing_a_file_with_symlink_keeps_other_changes(tmp_path, directory_target):
+    directory = tmp_path / 'monitored'
+    directory.mkdir()
+    tracked = directory / 'tracked'
+    tracked.write_bytes(b'original')
+    other = directory / 'other'
+    other.write_bytes(b'old')
+    if directory_target:
+        config = InventoryConfig(files=(), directories=(str(directory),))
+    else:
+        config = InventoryConfig(files=(str(tracked), str(other)))
+    previous, _, _, _ = fim.prepare_inventory(collect_inventory(config))
+
+    tracked.unlink()
+    tracked.symlink_to('missing-target')
+    other.write_bytes(b'new')
+    current, coverage, _, _ = fim.prepare_inventory(collect_inventory(config))
+    tracked_path = os.fsencode(tracked)
+    other_path = os.fsencode(other)
+    assert coverage[tracked_path] == 'SYMLINK'
+    assert current[tracked_path].file_type == 'symlink'
+    assert current[tracked_path].content_sha256 is None
+    assert fim.detect_changes(previous, current, coverage) == [
+        (other_path, 'CONTENT_CHANGED', previous[other_path], current[other_path]),
+        (tracked_path, 'TYPE_CHANGED', previous[tracked_path], current[tracked_path]),
+    ]
+    assert fim.detect_changes(current, current, coverage) == []
+
+    tracked.unlink()
+    tracked.write_bytes(b'restored')
+    restored, coverage, _, _ = fim.prepare_inventory(collect_inventory(config))
+    assert fim.detect_changes(current, restored, coverage) == [
+        (tracked_path, 'TYPE_CHANGED', current[tracked_path], restored[tracked_path]),
     ]
 
 
@@ -261,7 +300,7 @@ def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysq
     admin = empty_mysql
     with monkeypatch.context() as before:
         before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-1])
-        assert migrate.migrate(admin)[-1] == '034'
+        assert migrate.migrate(admin)[-1] == '035'
     with admin.cursor() as cursor:
         cursor.execute('SELECT DATABASE()')
         database = cursor.fetchone()[0]
@@ -288,8 +327,17 @@ def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysq
         monkeypatch.setattr(fim_db, 'get_connection', connect)
         digest = filesystem_runtime._digest(DEFAULT_CONFIG)
         file_path = b'/etc/ssh/sshd_config'
-        baseline = scan(START, found(file_path, START, uid=0, gid=0), config=digest)
-        assert fim_db.save_fim_inventory(baseline) == 0
+        other_path = b'/etc/group'
+        with admin.cursor() as cursor:
+            for tracked in (file_path, other_path):
+                cursor.execute('INSERT INTO filesystem_file_state '
+                               '(host_id, source_id, file_path, content_sha256, size_bytes, owner_uid, group_gid, mode, observed_at) '
+                               'VALUES (%s,%s,%s,UNHEX(%s),10,0,0,416,%s)',
+                               identity[:2] + (tracked, FIRST_HASH.hex(), START.replace(tzinfo=None)))
+            cursor.execute('INSERT INTO filesystem_scan_state '
+                           '(host_id, source_id, last_successful_scan_at, config_sha256, baseline_complete) '
+                           'VALUES (%s,%s,%s,UNHEX(%s),TRUE)', identity[:2] + (START.replace(tzinfo=None), digest.hex()))
+        admin.commit()
         original = stored_rows(admin)
         config = tmp_path / 'config'
         config.mkdir()
@@ -305,7 +353,8 @@ def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysq
             filesystem_runtime.prepare(runtime, tmp_path, user, python)
         assert not path.exists()
 
-        assert migrate.migrate(admin) == ['035']
+        assert migrate.migrate(admin) == ['036']
+        migrate.apply_one(admin, '036')
         with admin.cursor() as cursor:
             for table, privileges in filesystem_runtime.REQUIRED_GRANTS.items():
                 if table != 'alert_hosts':
@@ -335,12 +384,35 @@ def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysq
             assert runner.run_automatic(runtime) == 0
         assert stored_rows(admin) == original
         modified = found(file_path, next_at, digest=SECOND_HASH, mode=0o666, uid=0, gid=0)
-        complete = scan(next_at, modified, config=digest)
+        complete = scan(next_at, modified, found(other_path, next_at, uid=0, gid=0), config=digest)
         monkeypatch.setattr(fim_db, 'collect_inventory', lambda config: complete)
         assert fim_main.main(['--config', str(path), '--log-file', str(log)]) == 0
         assert 'changes=2 risks=' in log.read_text()
         with connect() as runtime:
             assert runner.run_automatic(runtime) == 3
+        next_at += timedelta(seconds=1)
+        replacement = InventoryEntry(file_path, 'SYMLINK', next_at, 'symlink', FileMetadata(7, 0, 0, 0o777, 1))
+        untracked = replace(replacement, path=b'/etc/sudoers')
+        other_modified = found(other_path, next_at, digest=SECOND_HASH, uid=0, gid=0)
+        link_scan = scan(next_at, replacement, untracked, other_modified, config=digest)
+        assert fim_db.save_fim_inventory(link_scan) == 2
+        assert fim_db.save_fim_inventory(link_scan) == 0
+        _, events, _ = stored_rows(admin)
+        with admin.cursor() as cursor:
+            cursor.execute('SELECT file_path, file_type, content_sha256 FROM filesystem_file_state ORDER BY file_path')
+            assert cursor.fetchall() == ((other_path, 'regular', SECOND_HASH), (file_path, 'symlink', None))
+        assert len(events) == 4 and events[-2][3:5] == (other_path, 'CONTENT_CHANGED')
+        assert events[-1][3:5] == (file_path, 'TYPE_CHANGED')
+        assert json.loads(events[-1][5])['file_type'] == 'regular'
+        assert json.loads(events[-1][6])['file_type'] == 'symlink'
+        with connect() as runtime:
+            assert runner.run_automatic(runtime) == 1
+        next_at += timedelta(seconds=1)
+        restored = scan(next_at, replace(modified, observed_at=next_at),
+                        replace(other_modified, observed_at=next_at), config=digest)
+        assert fim_db.save_fim_inventory(restored) == 1
+        with connect() as runtime:
+            assert runner.run_automatic(runtime) == 2
         with admin.cursor() as cursor:
             cursor.execute('DROP TABLE filesystem_mount_metrics')
         with connect() as runtime, pytest.raises(filesystem_runtime.FilesystemSetupError, match='transactional'):

@@ -59,6 +59,7 @@ MIGRATIONS = (
     ("033", "auth_gzip_checkpoints", ROOT / "auth_archive_schema.py"),
     ("034", "filesystem_metrics", FILESYSTEM_MIGRATION),
     ("035", "filesystem_detection", FIM_DETECTION_MIGRATION),
+    ("036", "filesystem_file_types", ROOT / "filesystem_type_schema.py"),
 )
 
 
@@ -599,6 +600,10 @@ def apply_one(connection, version):
     elif version == "035":
         with connection.cursor() as cursor:
             cursor.execute(FIM_DETECTION_MIGRATION.read_text())
+
+    elif version == "036":
+        from database.filesystem_type_schema import upgrade
+        upgrade(connection)
 
     elif version == "033":
         from database.auth_archive_schema import upgrade

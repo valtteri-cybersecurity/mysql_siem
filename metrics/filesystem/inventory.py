@@ -24,7 +24,7 @@ DEFAULT_FILES = (
 )
 MAX_TARGETS = 128
 MAX_DIRECTORY_ENTRIES = 4096
-RELIABLE = {'FOUND', 'MISSING', 'SCANNED'}
+RELIABLE = {'FOUND', 'MISSING', 'SCANNED', 'SYMLINK'}
 EXCLUDED = {'SKIPPED_TYPE', 'DEPTH_LIMIT'}
 
 
@@ -155,6 +155,10 @@ class _Inventory:
     def record(self, path, status, kind=None, metadata=None, digest=None):
         self.entries[path] = InventoryEntry(path, status, datetime.now(timezone.utc), kind, metadata, digest)
 
+    def observe_symlink(self, parent, name, path, info):
+        verify_version(info, os.stat(name, dir_fd=parent, follow_symlinks=False))
+        self.record(path, 'SYMLINK', 'symlink', _metadata(info))
+
     def observe_file(self, parent, name, path, info):
         if self.files == self.config.max_files:
             raise ScanLimit('FILE_LIMIT')
@@ -203,6 +207,8 @@ class _Inventory:
             kind = file_type(info)
             if kind == 'regular':
                 self.observe_file(parent, name, path, info)
+            elif kind == 'symlink':
+                self.observe_symlink(parent, name, path, info)
             elif kind != 'directory':
                 self.record(path, 'SKIPPED_TYPE', kind)
             elif depth == self.config.max_depth:
@@ -220,10 +226,12 @@ class _Inventory:
                 info = os.stat(name, dir_fd=parent, follow_symlinks=False)
                 seen = True
                 kind = file_type(info)
-                if kind != required_type:
+                if kind == 'symlink' and required_type == 'regular':
+                    self.observe_symlink(parent, name, path, info)
+                elif kind != required_type:
                     self.record(path, 'UNSUPPORTED', kind)
                     return
-                if kind == 'regular':
+                elif kind == 'regular':
                     self.observe_file(parent, name, path, info)
                 else:
                     self.scan_directory(parent, name, path, info, 0)

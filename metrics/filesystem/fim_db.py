@@ -31,16 +31,17 @@ INSERT_EVENT = '''INSERT INTO filesystem_file_events
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)'''
 
 INSERT_STATE = '''INSERT INTO filesystem_file_state
-    (host_id, source_id, file_path, content_sha256, size_bytes, owner_uid, group_gid, mode, observed_at)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)'''
+    (host_id, source_id, file_path, content_sha256, size_bytes, owner_uid, group_gid, mode, observed_at, file_type)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)'''
 
 
 def _get_identity(connection, cursor):
     if not identity_schema_enabled(connection):
         raise IdentityError('FIM requires registered identities.')
-    cursor.execute("SELECT status FROM schema_migrations WHERE version = '034'")
-    if cursor.fetchone() != ('APPLIED',):
-        raise FimError('Filesystem migration 034 is incomplete.')
+    cursor.execute("SELECT version FROM schema_migrations WHERE version IN ('034','036') "
+                   "AND status='APPLIED' ORDER BY version")
+    if cursor.fetchall() != (('034',), ('036',)):
+        raise FimError('Filesystem migrations 034 and 036 are required.')
     identity = configured_identity(cursor, 'filesystem')
     if identity is None:
         raise IdentityError('A registered filesystem source is required.')
@@ -57,18 +58,19 @@ def _event_state(state):
     if state is None:
         return None
     return json.dumps({'content_sha256': _digest_hex(state), 'size_bytes': state.size_bytes,
-                       'owner_uid': state.owner_uid, 'group_gid': state.group_gid, 'mode': state.mode})
+                       'owner_uid': state.owner_uid, 'group_gid': state.group_gid, 'mode': state.mode,
+                       'file_type': state.file_type})
 
 
 def _read_baseline(cursor, scope, config_sha256):
     cursor.execute('SELECT last_successful_scan_at, config_sha256, baseline_complete FROM filesystem_scan_state '
                    'WHERE host_id = %s AND source_id = %s', scope)
     checkpoint = cursor.fetchone()
-    cursor.execute('SELECT file_path, content_sha256, size_bytes, owner_uid, group_gid, mode, observed_at '
+    cursor.execute('SELECT file_path, content_sha256, size_bytes, owner_uid, group_gid, mode, observed_at, file_type '
                    'FROM filesystem_file_state WHERE host_id = %s AND source_id = %s', scope)
     previous = {}
-    for path, digest, size, uid, gid, mode, stamp in cursor.fetchall():
-        previous[path] = FileState(digest, size, uid, gid, mode, stamp)
+    for path, digest, size, uid, gid, mode, stamp, file_type in cursor.fetchall():
+        previous[path] = FileState(digest, size, uid, gid, mode, stamp, file_type)
 
     if checkpoint is None:
         if previous:
@@ -86,6 +88,10 @@ def _write_inventory(cursor, identity, inventory, prepared, *, report=False):
     current, coverage, scan_at, first_observed = prepared
     scope = (identity.host_id, identity.source_id)
     checkpoint, previous = _read_baseline(cursor, scope, inventory.config_sha256)
+    # Existing symlinks that were never tracked must not create events on upgrade.
+    for path, status in coverage.items():
+        if status == 'SYMLINK' and path not in previous:
+            del current[path]
     changes = []
     if checkpoint is not None:
         last_scan = checkpoint[0]
@@ -109,7 +115,7 @@ def _write_inventory(cursor, identity, inventory, prepared, *, report=False):
         states = []
         for path, state in current.items():
             states.append(scope + (path, state.content_sha256, state.size_bytes, state.owner_uid,
-                                   state.group_gid, state.mode, state.observed_at))
+                                   state.group_gid, state.mode, state.observed_at, state.file_type))
         cursor.executemany(INSERT_STATE, states)
 
     if checkpoint is None:
@@ -130,6 +136,7 @@ def _inventory_report(inventory, changes, previous=None):
     files = 0
     unhashed = 0
     missing = 0
+    symlinks = 0
     uncovered = 0
     for entry in inventory.entries:
         if entry.status == 'FOUND':
@@ -138,9 +145,11 @@ def _inventory_report(inventory, changes, previous=None):
                 unhashed += 1
         elif entry.status == 'MISSING':
             missing += 1
+        elif entry.status == 'SYMLINK':
+            symlinks += 1
         elif entry.status != 'SCANNED':
             uncovered += 1
-    coverage = f'files={files} unhashed={unhashed} missing={missing} uncovered={uncovered}'
+    coverage = f'files={files} unhashed={unhashed} missing={missing} symlinks={symlinks} uncovered={uncovered}'
     if inventory.status != 'SUCCESS':
         return inventory.status, coverage
     assessment = analyze_permissions(inventory, previous=previous)

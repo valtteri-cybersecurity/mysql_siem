@@ -30,18 +30,23 @@ def _state(raw, observed_at):
     if raw is None:
         return None, None
     data = json.loads(raw)
-    if not isinstance(data, dict) or data.keys() != {'content_sha256', 'size_bytes', 'owner_uid', 'group_gid', 'mode'}:
+    fields = {'content_sha256', 'size_bytes', 'owner_uid', 'group_gid', 'mode'}
+    if not isinstance(data, dict) or data.keys() - {'file_type'} != fields:
         raise ValueError('Unexpected FIM state fields.')
+    file_type = data.get('file_type', 'regular')
+    if file_type not in ('regular', 'symlink'):
+        raise ValueError('Invalid FIM file type.')
     digest = data['content_sha256']
     if digest is not None:
-        if not isinstance(digest, str) or re.fullmatch(r'[a-f0-9]{64}', digest) is None:
+        if file_type != 'regular' or not isinstance(digest, str) or re.fullmatch(r'[a-f0-9]{64}', digest) is None:
             raise ValueError('Invalid FIM digest.')
         digest = bytes.fromhex(digest)
     for key, maximum in (('size_bytes', 2**64 - 1), ('owner_uid', 2**32 - 1),
                          ('group_gid', 2**32 - 1), ('mode', 0o7777)):
         if type(data[key]) is not int or not 0 <= data[key] <= maximum:
             raise ValueError('Invalid FIM metadata.')
-    return FileState(digest, data['size_bytes'], data['owner_uid'], data['group_gid'], data['mode'], observed_at), data
+    return FileState(digest, data['size_bytes'], data['owner_uid'], data['group_gid'], data['mode'],
+                     observed_at, file_type), data
 
 
 def confirm_event(row):
@@ -67,7 +72,7 @@ def confirm_event(row):
 
 
 def _significant_risks(path, kind, before, after, policy):
-    if kind not in ('CREATED', 'PERMISSION_CHANGED', 'OWNER_CHANGED'):
+    if kind not in ('CREATED', 'PERMISSION_CHANGED', 'OWNER_CHANGED', 'TYPE_CHANGED') or after.file_type != 'regular':
         return []
     exact, trees, exceptions = policy
     rule = matching_rule(path, exact, trees)
@@ -77,7 +82,7 @@ def _significant_risks(path, kind, before, after, policy):
     current = PermissionState(after.mode, after.owner_uid, after.group_gid)
     previous = None
     previous_kinds = set()
-    if before is not None:
+    if before is not None and before.file_type == 'regular':
         previous = PermissionState(before.mode, before.owner_uid, before.group_gid)
         for risk, _, _ in permission_risks(rule, previous, None, directory=False, baseline_known=False, allowed=allowed):
             previous_kinds.add(risk)

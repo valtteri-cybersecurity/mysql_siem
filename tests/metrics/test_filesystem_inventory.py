@@ -95,9 +95,12 @@ def test_symlinks_in_leaf_or_ancestor_are_never_followed(tmp_path, monkeypatch):
 
     result = scan_files(leaf, ancestor / 'target')
 
-    assert result.status == 'FAILED'
-    assert [item.status for item in result.entries] == ['UNSUPPORTED', 'UNSUPPORTED']
-    assert result.entries[1].file_type == 'symlink'
+    assert result.status == 'PARTIAL'
+    blocked, symlink = result.entries
+    assert blocked.status == 'UNSUPPORTED'
+    assert symlink.status == 'SYMLINK'
+    assert symlink.file_type == 'symlink'
+    assert symlink.digest is None
     read.assert_not_called()
 
 
@@ -143,7 +146,7 @@ def test_file_changed_during_read_has_no_trusted_digest(tmp_path, monkeypatch, c
     assert entry.digest == file_integrity.FileDigest('CHANGED', bytes_read=4)
 
 
-def test_directory_inventory_respects_depth_and_skips_symlinks(tmp_path):
+def test_directory_inventory_respects_depth_and_does_not_follow_symlinks(tmp_path):
     root = tmp_path / 'approved'
     child = root / 'child'
     nested = child / 'nested'
@@ -159,7 +162,7 @@ def test_directory_inventory_respects_depth_and_skips_symlinks(tmp_path):
     for entry in result.entries:
         entries[os.fsdecode(entry.path)] = entry.status
     assert result.status == 'SUCCESS'
-    assert entries == {str(root): 'SCANNED', str(root / 'a'): 'FOUND', str(link): 'SKIPPED_TYPE',
+    assert entries == {str(root): 'SCANNED', str(root / 'a'): 'FOUND', str(link): 'SYMLINK',
                        str(child): 'SCANNED', str(child / 'b'): 'FOUND', str(nested): 'DEPTH_LIMIT'}
 
 
@@ -186,8 +189,10 @@ def test_directory_entry_limit_counts_nonregular_entries(tmp_path, monkeypatch):
 
     result = scan_directory(directory)
 
-    assert result.status == 'FAILED'
-    assert [entry.status for entry in result.entries] == ['SKIPPED_TYPE', 'ENTRY_LIMIT']
+    assert result.status == 'PARTIAL'
+    symlink, scope = result.entries
+    assert symlink.status == 'SYMLINK'
+    assert scope.status == 'ENTRY_LIMIT'
 
 
 def test_total_hash_budget_cannot_be_exceeded(tmp_path, monkeypatch):

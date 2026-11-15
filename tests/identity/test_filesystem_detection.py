@@ -35,6 +35,24 @@ def alert(rule, row, rules=DEFAULT_RULES):
     return detector.build_alert(rule, detector.confirm_event(row), {SSH, SUDO}, (), index_rules(rules))
 
 
+def test_type_change_alert_keeps_types_and_does_not_use_symlink_mode_as_file_permissions():
+    before = json.loads(state())
+    before['file_type'] = 'regular'
+    after = json.loads(state(0o777, digest=None))
+    after['file_type'] = 'symlink'
+    row = evidence(SSH, 'TYPE_CHANGED', json.dumps(before), json.dumps(after))
+    details = alert(detector.CRITICAL_RULE, row)['details']
+    assert details['previous_state']['file_type'] == 'regular'
+    assert details['current_state']['file_type'] == 'symlink'
+    assert alert(detector.PERMISSION_RULE, row) is None
+    before['mode'] = 0o666
+    restored = evidence(SSH, 'TYPE_CHANGED', json.dumps(after), json.dumps(before))
+    risks = alert(detector.PERMISSION_RULE, restored)['details']['risks']
+    assert risks[0]['kind'] == 'WORLD_WRITABLE'
+    with pytest.raises(detector.FimDetectionError):
+        detector.confirm_event(evidence(SSH, 'TYPE_CHANGED', state(), state()))
+
+
 def test_critical_change_and_deletion_are_scoped_and_fingerprinted():
     row = evidence(SSH, 'CONTENT_CHANGED', state(), state(digest=NEW_HASH))
     original = alert(detector.CRITICAL_RULE, row)
@@ -111,7 +129,7 @@ def _granted_runtime(cursor, database):
 def test_private_mysql_detection_and_migration(empty_mysql, identity_server, monkeypatch):
     admin = empty_mysql
     with monkeypatch.context() as before:
-        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-1])
+        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-2])
         assert migrate.migrate(admin)[-1] == '034'
     with admin.cursor() as cursor:
         cursor.execute('SELECT DATABASE()')
@@ -125,7 +143,7 @@ def test_private_mysql_detection_and_migration(empty_mysql, identity_server, mon
                        "VALUES (%s,'HIGH','Legacy alert','Preserved',%s,%s,%s,'{}')", (old_rule[0], STAMP, STAMP, '0' * 64))
         old_alert = cursor.lastrowid
     admin.commit()
-    assert migrate.migrate(admin) == ['035']
+    assert migrate.migrate(admin) == ['035', '036']
     migrate.apply_one(admin, '035')
     admin.commit()
     assert migrate.migrate(admin) == []

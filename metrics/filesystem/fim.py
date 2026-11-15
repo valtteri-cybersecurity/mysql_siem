@@ -23,6 +23,7 @@ class FileState:
     group_gid: int
     mode: int
     observed_at: datetime
+    file_type: str = 'regular'
 
 
 def _utc_stamp(value):
@@ -34,19 +35,27 @@ def _utc_stamp(value):
 def _file_state(entry, observed_at):
     metadata = entry.metadata
     digest = entry.digest
-    if entry.file_type != 'regular' or not isinstance(metadata, FileMetadata) or not isinstance(digest, FileDigest):
-        raise FimError('Invalid regular file observation.')
-    if digest.status == 'HASHED':
-        if not isinstance(digest.sha256, bytes) or len(digest.sha256) != 32:
-            raise FimError('Invalid file digest.')
-    elif digest.status not in ('DISABLED', 'TOO_LARGE') or digest.sha256 is not None:
-        raise FimError('Incomplete file digest observation.')
+    if not isinstance(metadata, FileMetadata):
+        raise FimError('Invalid file metadata.')
+    content_sha256 = None
+    if entry.status == 'SYMLINK':
+        if entry.file_type != 'symlink' or digest is not None:
+            raise FimError('Invalid symlink observation.')
+    else:
+        if entry.file_type != 'regular' or not isinstance(digest, FileDigest):
+            raise FimError('Invalid regular file observation.')
+        if digest.status == 'HASHED':
+            if not isinstance(digest.sha256, bytes) or len(digest.sha256) != 32:
+                raise FimError('Invalid file digest.')
+            content_sha256 = digest.sha256
+        elif digest.status not in ('DISABLED', 'TOO_LARGE') or digest.sha256 is not None:
+            raise FimError('Incomplete file digest observation.')
     for value, maximum in ((metadata.size_bytes, 2**64 - 1), (metadata.owner_uid, 2**32 - 1),
                            (metadata.group_gid, 2**32 - 1), (metadata.mode, 0o7777)):
         if type(value) is not int or not 0 <= value <= maximum:
             raise FimError('Invalid file metadata.')
-    return FileState(digest.sha256, metadata.size_bytes, metadata.owner_uid, metadata.group_gid,
-                     metadata.mode, observed_at)
+    return FileState(content_sha256, metadata.size_bytes, metadata.owner_uid, metadata.group_gid,
+                     metadata.mode, observed_at, entry.file_type)
 
 
 def prepare_inventory(inventory):
@@ -68,7 +77,7 @@ def prepare_inventory(inventory):
             raise FimError('A file observation is newer than its inventory checkpoint.')
         first_observed = min(first_observed, observed_at)
         coverage[path] = entry.status
-        if entry.status == 'FOUND':
+        if entry.status in ('FOUND', 'SYMLINK'):
             current[path] = _file_state(entry, observed_at)
     return current, coverage, scan_at, first_observed
 
@@ -99,6 +108,11 @@ def detect_changes(previous, current, coverage):
             if not _confirmed_missing(path, coverage):
                 raise FimError('A previously monitored path has no verified absence.')
             changes.append((path, 'DELETED', before, None))
+            continue
+        if before.file_type != after.file_type:
+            changes.append((path, 'TYPE_CHANGED', before, after))
+            continue
+        if after.file_type == 'symlink':
             continue
         if (before.content_sha256 is not None and after.content_sha256 is not None
                 and before.content_sha256 != after.content_sha256):
