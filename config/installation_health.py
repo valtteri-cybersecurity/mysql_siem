@@ -48,7 +48,7 @@ def verify_schema(connection):
     from database.ufw_analysis_keys import preflight
     preflight(connection)
     from database.ufw_collection_schema import verify
-    verify(connection, continuity=True, filtering=True)
+    verify(connection, continuity=True, filtering=True, occurrences=True)
     with connection.cursor() as cursor:
         cursor.execute('SELECT auth_method, source_port FROM auth_events LIMIT 0')
         cursor.execute("SELECT is_nullable FROM information_schema.columns "
