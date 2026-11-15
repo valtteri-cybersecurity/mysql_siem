@@ -60,6 +60,7 @@ MIGRATIONS = (
     ("034", "filesystem_metrics", FILESYSTEM_MIGRATION),
     ("035", "filesystem_detection", FIM_DETECTION_MIGRATION),
     ("036", "filesystem_file_types", ROOT / "filesystem_type_schema.py"),
+    ("037", "filesystem_retained_digest", ROOT / "filesystem_digest_schema.py"),
 )
 
 
@@ -603,6 +604,10 @@ def apply_one(connection, version):
 
     elif version == "036":
         from database.filesystem_type_schema import upgrade
+        upgrade(connection)
+
+    elif version == "037":
+        from database.filesystem_digest_schema import upgrade
         upgrade(connection)
 
     elif version == "033":

@@ -35,6 +35,24 @@ def alert(rule, row, rules=DEFAULT_RULES):
     return detector.build_alert(rule, detector.confirm_event(row), {SSH, SUDO}, (), index_rules(rules))
 
 
+def test_content_change_uses_retained_digest_as_evidence():
+    previous = json.loads(state(digest=None))
+    previous['retained_sha256'] = OLD_HASH
+    row = evidence(SSH, 'CONTENT_CHANGED', json.dumps(previous), state(digest=NEW_HASH))
+    details = alert(detector.CRITICAL_RULE, row)['details']
+    assert details['previous_state']['content_sha256'] is None
+    assert details['previous_state']['retained_sha256'] == OLD_HASH
+    assert details['current_state']['content_sha256'] == NEW_HASH
+
+    same = evidence(SSH, 'CONTENT_CHANGED', json.dumps(previous), state())
+    with pytest.raises(detector.FimDetectionError):
+        detector.confirm_event(same)
+    previous['content_sha256'] = OLD_HASH
+    both = evidence(SSH, 'CONTENT_CHANGED', json.dumps(previous), state(digest=NEW_HASH))
+    with pytest.raises(detector.FimDetectionError):
+        detector.confirm_event(both)
+
+
 def test_type_change_alert_keeps_types_and_does_not_use_symlink_mode_as_file_permissions():
     before = json.loads(state())
     before['file_type'] = 'regular'
@@ -129,7 +147,7 @@ def _granted_runtime(cursor, database):
 def test_private_mysql_detection_and_migration(empty_mysql, identity_server, monkeypatch):
     admin = empty_mysql
     with monkeypatch.context() as before:
-        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-2])
+        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-3])
         assert migrate.migrate(admin)[-1] == '034'
     with admin.cursor() as cursor:
         cursor.execute('SELECT DATABASE()')
@@ -143,7 +161,7 @@ def test_private_mysql_detection_and_migration(empty_mysql, identity_server, mon
                        "VALUES (%s,'HIGH','Legacy alert','Preserved',%s,%s,%s,'{}')", (old_rule[0], STAMP, STAMP, '0' * 64))
         old_alert = cursor.lastrowid
     admin.commit()
-    assert migrate.migrate(admin) == ['035', '036']
+    assert migrate.migrate(admin) == ['035', '036', '037']
     migrate.apply_one(admin, '035')
     admin.commit()
     assert migrate.migrate(admin) == []

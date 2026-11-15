@@ -36,7 +36,7 @@ SCAN = '''INSERT INTO filesystem_scan_state (host_id, source_id, config_sha256, 
 @pytest.fixture
 def previous_mysql(empty_mysql, monkeypatch):
     with monkeypatch.context() as old:
-        old.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-3])
+        old.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-4])
         assert migrate.migrate(empty_mysql)[-1] == '033'
     return empty_mysql
 
@@ -99,7 +99,7 @@ def test_upgrade_resume_and_rerun_preserve_rows(previous_mysql, monkeypatch):
     connection.commit()
     saved_mounts = table_rows(connection, 'filesystem_mount_metrics')
 
-    assert migrate.migrate(connection) == ['034', '035', '036']
+    assert migrate.migrate(connection) == ['034', '035', '036', '037']
     assert migrate.migration_status(connection)['034'][1] == 'APPLIED'
     assert table_rows(connection, 'filesystem_mount_metrics') == saved_mounts
     with connection.cursor() as cursor:
@@ -218,7 +218,7 @@ def test_admin_migration_with_dml_only_runtime(previous_mysql, identity_server):
         identity = enroll(cursor, 'runtime')
         cursor.execute("CREATE USER 'filesystem_test'@'localhost' IDENTIFIED BY 'private-test'")
     try:
-        assert migrate.migrate(previous_mysql) == ['034', '035', '036']
+        assert migrate.migrate(previous_mysql) == ['034', '035', '036', '037']
         with previous_mysql.cursor() as cursor:
             for table in migrate.FILESYSTEM_TABLES:
                 cursor.execute(f"GRANT SELECT, INSERT ON `{database}`.`{table}` TO 'filesystem_test'@'localhost'")

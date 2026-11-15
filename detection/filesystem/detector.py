@@ -26,27 +26,36 @@ class FimDetectionError(RuntimeError):
     """Detection cannot safely advance its checkpoint."""
 
 
+def _digest(value):
+    if value is None:
+        return None
+    if not isinstance(value, str) or re.fullmatch(r'[a-f0-9]{64}', value) is None:
+        raise ValueError('Invalid FIM digest.')
+    return bytes.fromhex(value)
+
+
 def _state(raw, observed_at):
     if raw is None:
         return None, None
     data = json.loads(raw)
     fields = {'content_sha256', 'size_bytes', 'owner_uid', 'group_gid', 'mode'}
-    if not isinstance(data, dict) or data.keys() - {'file_type'} != fields:
+    if not isinstance(data, dict) or data.keys() - {'file_type', 'retained_sha256'} != fields:
         raise ValueError('Unexpected FIM state fields.')
     file_type = data.get('file_type', 'regular')
     if file_type not in ('regular', 'symlink'):
         raise ValueError('Invalid FIM file type.')
-    digest = data['content_sha256']
-    if digest is not None:
-        if file_type != 'regular' or not isinstance(digest, str) or re.fullmatch(r'[a-f0-9]{64}', digest) is None:
-            raise ValueError('Invalid FIM digest.')
-        digest = bytes.fromhex(digest)
+    digest = _digest(data['content_sha256'])
+    retained = _digest(data.get('retained_sha256'))
+    if file_type == 'symlink' and (digest is not None or retained is not None):
+        raise ValueError('Invalid FIM symlink digest.')
+    if digest is not None and retained is not None:
+        raise ValueError('A FIM state cannot contain both current and retained digests.')
     for key, maximum in (('size_bytes', 2**64 - 1), ('owner_uid', 2**32 - 1),
                          ('group_gid', 2**32 - 1), ('mode', 0o7777)):
         if type(data[key]) is not int or not 0 <= data[key] <= maximum:
             raise ValueError('Invalid FIM metadata.')
     return FileState(digest, data['size_bytes'], data['owner_uid'], data['group_gid'], data['mode'],
-                     observed_at, file_type), data
+                     observed_at, file_type, retained), data
 
 
 def confirm_event(row):

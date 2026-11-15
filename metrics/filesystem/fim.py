@@ -24,6 +24,10 @@ class FileState:
     mode: int
     observed_at: datetime
     file_type: str = 'regular'
+    retained_sha256: bytes | None = None
+
+    def last_verified_sha256(self):
+        return self.content_sha256 or self.retained_sha256
 
 
 def _utc_stamp(value):
@@ -114,8 +118,9 @@ def detect_changes(previous, current, coverage):
             continue
         if after.file_type == 'symlink':
             continue
-        if (before.content_sha256 is not None and after.content_sha256 is not None
-                and before.content_sha256 != after.content_sha256):
+        previous_digest = before.last_verified_sha256()
+        if (previous_digest is not None and after.content_sha256 is not None
+                and previous_digest != after.content_sha256):
             changes.append((path, 'CONTENT_CHANGED', before, after))
         if before.mode != after.mode:
             changes.append((path, 'PERMISSION_CHANGED', before, after))

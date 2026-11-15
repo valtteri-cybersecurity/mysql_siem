@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from dataclasses import replace
 
 from database.connection import get_connection
 from database.identity import (
@@ -9,6 +10,7 @@ from database.identity import (
     configured_identity,
     identity_schema_enabled,
 )
+from metrics.filesystem.file_integrity import approved_path
 from metrics.filesystem.fim import (
     FileState,
     FimError,
@@ -31,46 +33,46 @@ INSERT_EVENT = '''INSERT INTO filesystem_file_events
     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)'''
 
 INSERT_STATE = '''INSERT INTO filesystem_file_state
-    (host_id, source_id, file_path, content_sha256, size_bytes, owner_uid, group_gid, mode, observed_at, file_type)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)'''
+    (host_id, source_id, file_path, content_sha256, size_bytes, owner_uid, group_gid, mode, observed_at, file_type,
+     retained_sha256)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)'''
 
 
 def _get_identity(connection, cursor):
     if not identity_schema_enabled(connection):
         raise IdentityError('FIM requires registered identities.')
-    cursor.execute("SELECT version FROM schema_migrations WHERE version IN ('034','036') "
+    cursor.execute("SELECT version FROM schema_migrations WHERE version IN ('034','036','037') "
                    "AND status='APPLIED' ORDER BY version")
-    if cursor.fetchall() != (('034',), ('036',)):
-        raise FimError('Filesystem migrations 034 and 036 are required.')
+    if cursor.fetchall() != (('034',), ('036',), ('037',)):
+        raise FimError('Filesystem migrations 034, 036 and 037 are required.')
     identity = configured_identity(cursor, 'filesystem')
     if identity is None:
         raise IdentityError('A registered filesystem source is required.')
     return identity
 
 
-def _digest_hex(state):
-    if state.content_sha256 is None:
-        return None
-    return state.content_sha256.hex()
-
-
 def _event_state(state):
     if state is None:
         return None
-    return json.dumps({'content_sha256': _digest_hex(state), 'size_bytes': state.size_bytes,
-                       'owner_uid': state.owner_uid, 'group_gid': state.group_gid, 'mode': state.mode,
-                       'file_type': state.file_type})
+    data = {'content_sha256': None, 'size_bytes': state.size_bytes, 'owner_uid': state.owner_uid,
+            'group_gid': state.group_gid, 'mode': state.mode, 'file_type': state.file_type}
+    if state.content_sha256 is not None:
+        data['content_sha256'] = state.content_sha256.hex()
+    if state.retained_sha256 is not None:
+        data['retained_sha256'] = state.retained_sha256.hex()
+    return json.dumps(data)
 
 
 def _read_baseline(cursor, scope, config_sha256):
     cursor.execute('SELECT last_successful_scan_at, config_sha256, baseline_complete FROM filesystem_scan_state '
                    'WHERE host_id = %s AND source_id = %s', scope)
     checkpoint = cursor.fetchone()
-    cursor.execute('SELECT file_path, content_sha256, size_bytes, owner_uid, group_gid, mode, observed_at, file_type '
+    cursor.execute('SELECT file_path, content_sha256, size_bytes, owner_uid, group_gid, mode, observed_at, file_type, '
+                   'retained_sha256 '
                    'FROM filesystem_file_state WHERE host_id = %s AND source_id = %s', scope)
     previous = {}
-    for path, digest, size, uid, gid, mode, stamp, file_type in cursor.fetchall():
-        previous[path] = FileState(digest, size, uid, gid, mode, stamp, file_type)
+    for path, digest, size, uid, gid, mode, stamp, file_type, retained in cursor.fetchall():
+        previous[path] = FileState(digest, size, uid, gid, mode, stamp, file_type, retained)
 
     if checkpoint is None:
         if previous:
@@ -92,6 +94,13 @@ def _write_inventory(cursor, identity, inventory, prepared, *, report=False):
     for path, status in coverage.items():
         if status == 'SYMLINK' and path not in previous:
             del current[path]
+    for entry in inventory.entries:
+        if entry.status != 'FOUND' or entry.digest.status != 'TOO_LARGE':
+            continue
+        path = approved_path(entry.path)
+        before = previous.get(path)
+        if before is not None:
+            current[path] = replace(current[path], retained_sha256=before.last_verified_sha256())
     changes = []
     if checkpoint is not None:
         last_scan = checkpoint[0]
@@ -115,7 +124,7 @@ def _write_inventory(cursor, identity, inventory, prepared, *, report=False):
         states = []
         for path, state in current.items():
             states.append(scope + (path, state.content_sha256, state.size_bytes, state.owner_uid,
-                                   state.group_gid, state.mode, state.observed_at, state.file_type))
+                                   state.group_gid, state.mode, state.observed_at, state.file_type, state.retained_sha256))
         cursor.executemany(INSERT_STATE, states)
 
     if checkpoint is None:

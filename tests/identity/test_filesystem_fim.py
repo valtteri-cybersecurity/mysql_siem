@@ -299,7 +299,7 @@ def test_private_mysql_fim_is_atomic_scoped_and_retry_safe(mysql, identity_serve
 def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysql, identity_server, monkeypatch, tmp_path):
     admin = empty_mysql
     with monkeypatch.context() as before:
-        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-1])
+        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-2])
         assert migrate.migrate(admin)[-1] == '035'
     with admin.cursor() as cursor:
         cursor.execute('SELECT DATABASE()')
@@ -353,8 +353,9 @@ def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysq
             filesystem_runtime.prepare(runtime, tmp_path, user, python)
         assert not path.exists()
 
-        assert migrate.migrate(admin) == ['036']
+        assert migrate.migrate(admin) == ['036', '037']
         migrate.apply_one(admin, '036')
+        migrate.apply_one(admin, '037')
         with admin.cursor() as cursor:
             for table, privileges in filesystem_runtime.REQUIRED_GRANTS.items():
                 if table != 'alert_hosts':
@@ -413,6 +414,37 @@ def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysq
         assert fim_db.save_fim_inventory(restored) == 1
         with connect() as runtime:
             assert runner.run_automatic(runtime) == 2
+
+        oversized = replace(modified, digest=FileDigest('TOO_LARGE'),
+                            metadata=replace(modified.metadata, size_bytes=DEFAULT_CONFIG.max_file_bytes + 1))
+        for observation in (oversized, oversized, modified, oversized, replace(modified, digest=FileDigest('HASHED', FIRST_HASH))):
+            next_at += timedelta(seconds=1)
+            inventory = scan(next_at, replace(observation, observed_at=next_at),
+                             replace(other_modified, observed_at=next_at), config=digest)
+            changes = fim_db.save_fim_inventory(inventory)
+            if observation.digest.status == 'TOO_LARGE':
+                assert changes == 0
+                expected_hashes = (None, SECOND_HASH)
+            else:
+                expected_hashes = (observation.digest.sha256, None)
+                if observation.digest.sha256 == SECOND_HASH:
+                    assert changes == 0
+                else:
+                    assert changes == 1
+            assert fim_db.save_fim_inventory(inventory) == 0
+            admin.rollback()
+            with admin.cursor() as cursor:
+                cursor.execute('SELECT content_sha256, retained_sha256 FROM filesystem_file_state WHERE file_path = %s',
+                               (file_path,))
+                assert cursor.fetchone() == expected_hashes
+        _, events, _ = stored_rows(admin)
+        assert len(events) == 6 and events[-1][3:5] == (file_path, 'CONTENT_CHANGED')
+        previous = json.loads(events[-1][5])
+        assert previous['content_sha256'] is None and previous['retained_sha256'] == SECOND_HASH.hex()
+        assert json.loads(events[-1][6])['content_sha256'] == FIRST_HASH.hex()
+        with connect() as runtime:
+            assert runner.run_automatic(runtime) == 1
+
         with admin.cursor() as cursor:
             cursor.execute('DROP TABLE filesystem_mount_metrics')
         with connect() as runtime, pytest.raises(filesystem_runtime.FilesystemSetupError, match='transactional'):
