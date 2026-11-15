@@ -91,9 +91,9 @@ def cron_lines(project, python, intervals):
 
 def _checkpoint_config(connection, settings):
     with connection.cursor() as cursor:
-        cursor.execute("SELECT version FROM schema_migrations WHERE version IN ('034','035','036','037') "
+        cursor.execute("SELECT version FROM schema_migrations WHERE version IN ('034','035','036','037','038','039') "
                        "AND status='APPLIED' ORDER BY version")
-        if cursor.fetchall() != (('034',), ('035',), ('036',), ('037',)):
+        if cursor.fetchall() != (('034',), ('035',), ('036',), ('037',), ('038',), ('039',)):
             raise FilesystemSetupError('Filesystem migrations are incomplete.')
         cursor.execute('SHOW GRANTS')
         rows = cursor.fetchall()

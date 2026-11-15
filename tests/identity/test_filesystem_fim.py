@@ -16,7 +16,7 @@ from database.identity import (
     register_host,
     register_source,
 )
-from detection.filesystem import runner
+from detection.filesystem import detector, runner
 from metrics.filesystem import fim, fim_db, fim_main
 from metrics.filesystem.file_integrity import FileDigest
 from metrics.filesystem.inventory import (
@@ -83,6 +83,23 @@ def test_created_and_confirmed_deleted_have_correct_null_sides():
         (ADDED, 'CREATED', None, newer[ADDED]),
         (REMOVED, 'DELETED', earlier[REMOVED], None),
     ]
+
+
+def test_scanned_directory_mode_change_has_before_and_after_metadata(tmp_path):
+    directory = tmp_path / 'monitored'
+    directory.mkdir()
+    directory.chmod(0o755)
+    config = InventoryConfig(files=(), directories=(str(directory),))
+    previous, coverage, _, _ = fim.prepare_inventory(collect_inventory(config))
+    assert fim.detect_changes({}, previous, coverage) == []
+
+    directory.chmod(0o777)
+    current, coverage, _, _ = fim.prepare_inventory(collect_inventory(config))
+    path, kind, before, after = fim.detect_changes(previous, current, coverage)[0]
+    assert path == os.fsencode(directory) and kind == 'PERMISSION_CHANGED'
+    assert before.file_type == after.file_type == 'directory'
+    assert (before.mode, after.mode) == (0o755, 0o777)
+    assert after.content_sha256 is None
 
 
 @pytest.mark.parametrize('directory_target', [False, True])
@@ -299,7 +316,7 @@ def test_private_mysql_fim_is_atomic_scoped_and_retry_safe(mysql, identity_serve
 def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysql, identity_server, monkeypatch, tmp_path):
     admin = empty_mysql
     with monkeypatch.context() as before:
-        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-2])
+        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-4])
         assert migrate.migrate(admin)[-1] == '035'
     with admin.cursor() as cursor:
         cursor.execute('SELECT DATABASE()')
@@ -353,9 +370,10 @@ def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysq
             filesystem_runtime.prepare(runtime, tmp_path, user, python)
         assert not path.exists()
 
-        assert migrate.migrate(admin) == ['036', '037']
+        assert migrate.migrate(admin) == ['036', '037', '038', '039']
         migrate.apply_one(admin, '036')
         migrate.apply_one(admin, '037')
+        migrate.apply_one(admin, '038')
         with admin.cursor() as cursor:
             for table, privileges in filesystem_runtime.REQUIRED_GRANTS.items():
                 if table != 'alert_hosts':
@@ -444,6 +462,30 @@ def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysq
         assert json.loads(events[-1][6])['content_sha256'] == FIRST_HASH.hex()
         with connect() as runtime:
             assert runner.run_automatic(runtime) == 1
+
+        directory_path = b'/etc/sudoers.d'
+        for mode, expected in ((0o755, 0), (0o777, 1), (0o777, 0)):
+            next_at += timedelta(seconds=1)
+            directory = InventoryEntry(directory_path, 'SCANNED', next_at, 'directory', FileMetadata(0, 0, 0, mode, 1))
+            unchanged = found(file_path, next_at, digest=FIRST_HASH, mode=0o666, uid=0, gid=0)
+            inventory = scan(next_at, directory, unchanged, replace(other_modified, observed_at=next_at), config=digest)
+            assert fim_db.save_fim_inventory(inventory) == expected
+            with connect() as runtime:
+                assert runner.run_automatic(runtime) == expected
+
+        admin.rollback()
+        with admin.cursor() as cursor:
+            cursor.execute('SELECT f.event_type, f.previous_state, f.current_state, a.details '
+                           'FROM filesystem_file_events f JOIN alert_evidence e ON e.event_id=f.id '
+                           'JOIN detection_alerts a ON a.id=e.alert_id JOIN detection_rules r ON r.id=a.rule_id '
+                           'WHERE f.file_path=%s AND e.event_type=%s AND r.rule_key=%s',
+                           (directory_path, detector.EVIDENCE_TYPE, detector.PERMISSION_RULE))
+            (kind, old, new, details), = cursor.fetchall()
+        assert kind == 'PERMISSION_CHANGED'
+        assert json.loads(old)['mode'] == 0o755
+        assert json.loads(new)['mode'] == 0o777
+        assert json.loads(new)['file_type'] == 'directory'
+        assert json.loads(details)['risks'][0]['kind'] == 'WORLD_WRITABLE'
 
         with admin.cursor() as cursor:
             cursor.execute('DROP TABLE filesystem_mount_metrics')

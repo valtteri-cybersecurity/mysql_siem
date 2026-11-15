@@ -19,11 +19,11 @@ from metrics.snapshot import release_snapshot_lock
 
 INSERT_MEASUREMENT = '''INSERT INTO filesystem_mount_metrics
     (host_id, source_id, collector_id, sender_id, measured_at, mount_point, filesystem_type,
-     total_bytes, available_bytes, total_inodes, free_inodes, read_only, mount_options)
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)'''
+     total_bytes, available_bytes, total_inodes, free_inodes, read_only, mount_options, free_bytes, mount_source)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)'''
 
 SELECT_MEASUREMENTS = '''SELECT collector_id, sender_id, measured_at, mount_point, filesystem_type,
-    total_bytes, available_bytes, total_inodes, free_inodes, read_only, mount_options
+    total_bytes, available_bytes, total_inodes, free_inodes, read_only, mount_options, free_bytes, mount_source
     FROM filesystem_mount_metrics
     WHERE host_id = %s AND source_id = %s AND measured_at IN %s'''
 
@@ -44,6 +44,8 @@ def _validate_measurement(row):
         raise MountStorageError('Mount measurement requires a UTC timestamp.')
     if not isinstance(row.filesystem_type, str) or row.filesystem_type not in LOCAL_FILESYSTEMS:
         raise MountStorageError('Invalid filesystem type.')
+    if not isinstance(row.mount_source, bytes) or not 0 < len(row.mount_source) <= 65535 or b'\0' in row.mount_source:
+        raise MountStorageError('Invalid mount source.')
     options = row.mount_options
     if not isinstance(options, str) or options.split(',', 1)[0] not in ('ro', 'rw') or '\0' in options:
         raise MountStorageError('Invalid mount options.')
@@ -72,16 +74,18 @@ def _validated_rows(collection):
         paths.add(row.mount_point)
         key = (row.measured_at.replace(tzinfo=None), row.mount_point)
         rows[key] = key + (row.filesystem_type, row.total_bytes, row.available_bytes,
-                           row.total_inodes, row.free_inodes, row.read_only, row.mount_options)
+                           row.total_inodes, row.free_inodes, row.read_only, row.mount_options,
+                           row.free_bytes, row.mount_source)
     return rows
 
 
 def _get_identity(connection, cursor):
     if not identity_schema_enabled(connection):
         raise IdentityError('Mount measurements require registered identities.')
-    cursor.execute("SELECT status FROM schema_migrations WHERE version = '034'")
-    if cursor.fetchone() != ('APPLIED',):
-        raise MountStorageError('Filesystem migration 034 is incomplete.')
+    cursor.execute("SELECT version FROM schema_migrations WHERE version IN ('034','039') "
+                   "AND status='APPLIED' ORDER BY version")
+    if cursor.fetchall() != (('034',), ('039',)):
+        raise MountStorageError('Filesystem migrations 034 and 039 are required.')
     identity = configured_identity(cursor, 'filesystem')
     if identity is None:
         raise IdentityError('A registered filesystem source is required.')

@@ -740,6 +740,8 @@ for path in \
     database/migrations/035_filesystem_detection.sql \
     database/filesystem_type_schema.py \
     database/filesystem_digest_schema.py \
+    database/filesystem_directory_schema.py \
+    database/filesystem_mount_history_schema.py \
     database/ufw_analysis_keys.py \
     database/migrations/025_ufw_continuity.sql \
     database/migrations/024_ufw_quarantine_archives.sql \

@@ -41,10 +41,10 @@ INSERT_STATE = '''INSERT INTO filesystem_file_state
 def _get_identity(connection, cursor):
     if not identity_schema_enabled(connection):
         raise IdentityError('FIM requires registered identities.')
-    cursor.execute("SELECT version FROM schema_migrations WHERE version IN ('034','036','037') "
+    cursor.execute("SELECT version FROM schema_migrations WHERE version IN ('034','036','037','038') "
                    "AND status='APPLIED' ORDER BY version")
-    if cursor.fetchall() != (('034',), ('036',), ('037',)):
-        raise FimError('Filesystem migrations 034, 036 and 037 are required.')
+    if cursor.fetchall() != (('034',), ('036',), ('037',), ('038',)):
+        raise FimError('Filesystem migrations 034, 036, 037 and 038 are required.')
     identity = configured_identity(cursor, 'filesystem')
     if identity is None:
         raise IdentityError('A registered filesystem source is required.')
@@ -92,7 +92,8 @@ def _write_inventory(cursor, identity, inventory, prepared, *, report=False):
     checkpoint, previous = _read_baseline(cursor, scope, inventory.config_sha256)
     # Existing symlinks that were never tracked must not create events on upgrade.
     for path, status in coverage.items():
-        if status == 'SYMLINK' and path not in previous:
+        before = previous.get(path)
+        if status == 'SYMLINK' and (before is None or before.file_type == 'directory'):
             del current[path]
     for entry in inventory.entries:
         if entry.status != 'FOUND' or entry.digest.status != 'TOO_LARGE':

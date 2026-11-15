@@ -35,6 +35,23 @@ def alert(rule, row, rules=DEFAULT_RULES):
     return detector.build_alert(rule, detector.confirm_event(row), {SSH, SUDO}, (), index_rules(rules))
 
 
+def test_directory_permission_risk_requires_a_new_risk_and_no_digest():
+    path = b'/etc/sudoers.d'
+    old = json.loads(state(0o755, digest=None))
+    new = json.loads(state(0o777, digest=None))
+    old['file_type'] = new['file_type'] = 'directory'
+    row = evidence(path, 'PERMISSION_CHANGED', json.dumps(old), json.dumps(new))
+    result = alert(detector.PERMISSION_RULE, row)
+    assert result['details']['risks'][0]['kind'] == 'WORLD_WRITABLE'
+    old['mode'] = 0o776
+    row = evidence(path, 'PERMISSION_CHANGED', json.dumps(old), json.dumps(new))
+    assert alert(detector.PERMISSION_RULE, row) is None
+    new['content_sha256'] = NEW_HASH
+    row = evidence(path, 'PERMISSION_CHANGED', json.dumps(old), json.dumps(new))
+    with pytest.raises(detector.FimDetectionError):
+        detector.confirm_event(row)
+
+
 def test_content_change_uses_retained_digest_as_evidence():
     previous = json.loads(state(digest=None))
     previous['retained_sha256'] = OLD_HASH
@@ -147,7 +164,7 @@ def _granted_runtime(cursor, database):
 def test_private_mysql_detection_and_migration(empty_mysql, identity_server, monkeypatch):
     admin = empty_mysql
     with monkeypatch.context() as before:
-        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-3])
+        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-5])
         assert migrate.migrate(admin)[-1] == '034'
     with admin.cursor() as cursor:
         cursor.execute('SELECT DATABASE()')
@@ -161,7 +178,7 @@ def test_private_mysql_detection_and_migration(empty_mysql, identity_server, mon
                        "VALUES (%s,'HIGH','Legacy alert','Preserved',%s,%s,%s,'{}')", (old_rule[0], STAMP, STAMP, '0' * 64))
         old_alert = cursor.lastrowid
     admin.commit()
-    assert migrate.migrate(admin) == ['035', '036', '037']
+    assert migrate.migrate(admin) == ['035', '036', '037', '038', '039']
     migrate.apply_one(admin, '035')
     admin.commit()
     assert migrate.migrate(admin) == []
