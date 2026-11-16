@@ -1129,6 +1129,7 @@ fi
 # Schedule the SSH jobs independently; missing auth.log is a logged skip.
 SSH_AUTH_CRON=""
 SSH_DETECTION_CRON=""
+SSH_TIMESTAMP_SOURCE=""
 if [[ "${SSH_READY:-0}" == "1" ]]; then
     if [[ ! -f "$PROJECT_DIR/config/ssh.env" ]]; then
         cp "$PROJECT_DIR/config/ssh.env.example" "$PROJECT_DIR/config/ssh.env"
@@ -1146,9 +1147,8 @@ if [[ "${SSH_READY:-0}" == "1" ]]; then
         SSH_LOG_READABLE=0
         warn "SSH log source is unreadable by mysql_siem: $SSH_LOG_SOURCE. SSH collection and detection will NOT be scheduled."
         warn "Check log ACLs, directory permissions and any access controls separately; do not loosen log permissions."
-    elif ! runuser -u "$INSTALL_USER" -- /usr/bin/timeout --kill-after=5s 35s "$PROJECT_DIR/config/run_with_env.sh" --ssh "$APP_PYTHON" -m ingestion.auth.main --check-source --logfile "$SSH_LOG_SOURCE"; then
-        warn "Auth timestamp preflight failed or was inconclusive; collection may report FAILED until the source is configured."
-        warn "Prefer precise ISO 8601 logs or configure a verified SSH_AUTH_SYSLOG_START/END/TIMEZONE interval; rsyslog settings were not changed."
+    else
+        SSH_TIMESTAMP_SOURCE="$SSH_LOG_SOURCE"
     fi
     if [[ "$SSH_LOG_READABLE" == 1 ]]; then
         mkdir -p "$PROJECT_DIR/ingestion/auth" "$PROJECT_DIR/detection/ssh_brute_force"
@@ -1265,6 +1265,15 @@ verify_installation_health
 ufw_rotation commit
 local_identity_setup finish
 unset SIEM_INSTALL_MAINTENANCE
+exec 8<&-
+# The service account can take the normal shared runtime lock after maintenance.
+if [[ -n "${SSH_TIMESTAMP_SOURCE:-}" ]] &&
+    ! runuser -u "$INSTALL_USER" -- /usr/bin/timeout --kill-after=5s 35s \
+        "$PROJECT_DIR/config/run_with_env.sh" --ssh "$APP_PYTHON" \
+        -m ingestion.auth.main --check-source --logfile "$SSH_TIMESTAMP_SOURCE" 9>&-; then
+    warn "Auth timestamp preflight failed or was inconclusive; collection may report FAILED until the source is configured."
+    warn "Prefer precise ISO 8601 logs or configure a verified SSH_AUTH_SYSLOG_START/END/TIMEZONE interval; rsyslog settings were not changed."
+fi
 rm -f "$CRON_TMP"
 trap - EXIT
 
