@@ -18,7 +18,12 @@ from config import installation_state as journal
 from config.auth_checkpoint_upgrade import verify_checkpoints
 from config.installation_backup import BackupError
 from config.installation_role import RoleConfigurationError, get_installation_role
-from config.service_installation import InstallationError, trusted_directory
+from config.service_installation import (
+    InstallationError,
+    check_reset_settings,
+    deployment_paths,
+    trusted_directory,
+)
 from database.identity import IdentityError
 from database.local_identity import require_stopped_legacy_jobs
 from database.migrate import LOCK_NAME, MigrationError
@@ -517,7 +522,7 @@ def check_ufw_before_upgrade(connection):
         raise ResetError('UFW history compatibility check failed: ' + str(error)) from None
 
 
-def check_upgrade_database(connection):
+def check_upgrade_database(connection, *, completed_reset=False):
     """Reuse the existing read-only upgrade requirements before maintenance."""
 
     if not database_exists(connection):
@@ -532,7 +537,15 @@ def check_upgrade_database(connection):
     from database.migrate import check_migration_history
 
     try:
-        check_migration_history(connection)
+        if completed_reset:
+            from config.installation_health import HealthError, verify_schema
+
+            try:
+                verify_schema(connection)
+            except HealthError as error:
+                raise ResetError(str(error)) from None
+        else:
+            check_migration_history(connection)
     except MigrationError as error:
         raise ResetError('Migration history preflight failed: ' + str(error)) from None
 
@@ -617,24 +630,36 @@ def prepared_reset_recovery(project):
     """Prove completed database/identities; a started flag alone is not proof."""
     from database.local_identity import check_staged_receipt, read_receipt
 
-    record = journal.read_deployment(journal.STATE_DIR)
+    state = journal.STATE_DIR
+    journal.require_install_lock()
+    trusted_directory(state)
+    record = journal.read_deployment(state)
     if record is None or record['phase'] != 'staged' or record['stage'] != str(project):
         raise ResetError('RESET recovery requires the protected staging journal.')
-    if not record['identity']:
-        receipt = read_receipt(journal.STATE_DIR / 'receipt.json')
-        if receipt is not None and receipt['phase'] == 'database_ready':
-            raise ResetError('Completed receipt conflicts with missing journal identities; preserve recovery files. No RESET was attempted.')
-        return False
+    target = Path(record['target'])
+    deployment_paths(record, target, Path(record['stable']), record['user'])
+    trusted_directory(project / 'config')
+    receipt = read_receipt(state / 'receipt.json')
     if not record['database_started']:
-        raise ResetError('Conflicting RESET recovery history; no database reset was attempted.')
-    journal.require_stage(journal.STATE_DIR, project)
+        if record['identity'] or (receipt is not None and receipt['phase'] != 'ready'):
+            raise ResetError('Conflicting RESET recovery history; preserve recovery files. No RESET was attempted.')
+        return False
+    journal.require_stage(state, project)
+    if receipt is None or receipt['phase'] == 'prepared':
+        raise ResetError('Started RESET has no completed identity receipt; preserve recovery files for manual recovery.')
+    # clear_old_identity records a fresh registry before RESET creates it.
+    fresh_registry = record['checkpoint_transition'] is False and not receipt['initial']
+    if not record['identity'] and (receipt['phase'] != 'database_ready' or not fresh_registry):
+        raise ResetError('Cannot prove the receipt belongs to the interrupted RESET; preserve recovery files.')
+    check_reset_settings(project, record['user'])
     connection = pymysql.connect(unix_socket=SOCKET, user='root', database=DATABASE,
                                  charset='utf8mb4', autocommit=True,
-                                 connect_timeout=5, read_timeout=15, write_timeout=15)
+                                 connect_timeout=5, read_timeout=15, write_timeout=15,
+                                 init_command="SET time_zone = '+00:00'")
     try:
-        check_staged_receipt(connection, journal.STATE_DIR, project, Path(record['target']), record['user'])
-        # Reuse migration/history/account checks, without applying migrations.
-        check_upgrade_database(connection)
+        check_staged_receipt(connection, state, project, target, record['user'],
+                             require_enrollment_marker=fresh_registry)
+        check_upgrade_database(connection, completed_reset=True)
     finally:
         connection.close()
     return True

@@ -434,7 +434,10 @@ def test_missing_migration_ledger_is_read_only(mysql):
     assert mysql.cursor.execute.call_args.args[0].startswith('SELECT ')
 
 
-@pytest.mark.parametrize('exists,answer,approved', [('1', 'RESET', True), ('1', 'cancel', False), ('0', '', False), ('0', 'RESET', True)])
+@pytest.mark.parametrize('exists,answer,approved', [
+    ('1', 'RESET', True), ('1', 'cancel', False), ('1', 'reset', False), ('1', ' RESET ', False),
+    ('0', '', False), ('0', 'RESET', True),
+])
 def test_fresh_install_requires_explicit_reset_confirmation_for_an_existing_database(exists, answer, approved):
     installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
     start = installer.index('# Final database reset approval')
@@ -482,6 +485,26 @@ database_probe() {
                             input='', capture_output=True, text=True, check=False, timeout=5)
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.strip() == 'resumed without database reset'
+
+
+@pytest.mark.parametrize('recovered,mode', [('0', 'prepared-identity'), ('1', 'recovered-reset')])
+def test_publication_uses_staged_database_settings_only_on_verified_reset(recovered, mode):
+    installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
+    start = installer.index('activate_service_installation() {')
+    end = installer.index('\n}\n', start) + 3
+    prefix = '''set -eu
+RESET_RECOVERY=$1
+STAGED_PROJECT_DIR=/synthetic/stage
+SERVICE_DIR=/synthetic/mysql_siem
+VENV_BUILD_DIR=/synthetic/venv-candidate
+VENV_DIR=/synthetic/venv
+service_installation() { printf '%s\\n' "$*"; }
+cd() { :; }
+'''
+    result = subprocess.run(['bash', '-c', prefix + installer[start:end] + 'activate_service_installation',
+                             'activation-test', recovered], capture_output=True, text=True, check=False, timeout=5)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith(' ' + mode)
 
 
 def test_invalid_reset_recovery_stops_before_any_new_maintenance_or_database_action(tmp_path):

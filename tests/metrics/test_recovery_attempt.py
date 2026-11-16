@@ -17,7 +17,7 @@ def layout(tmp_path, monkeypatch):
     monkeypatch.setattr(journal, 'require_install_lock', lambda: None)
     monkeypatch.setattr(service, 'trusted_directory', lambda path: None)
     monkeypatch.setattr(service, 'deployment_paths', lambda *args: None)
-    monkeypatch.setattr(service, 'restore_missing_staged_settings', lambda *args: None)
+    monkeypatch.setattr(service, 'restore_missing_staged_settings', lambda *args, **kwargs: None)
     root = tmp_path / 'root'
     root.mkdir()
     stage = root / 'stage'
@@ -124,6 +124,14 @@ def test_reset_retry_keeps_historical_marker_but_resets_attempt(layout, monkeypa
     record = journal.read_deployment(layout.state)
     record['database_started_current'] = True
     journal.save_deployment(layout.state, record)
+    journal.write_file(layout.state / 'maintenance', journal.MAINTENANCE_TEXT, mode=0o644)
+    require_lock = Mock()
+    monkeypatch.setattr(journal, 'require_lock', require_lock)
+    config = layout.stage / 'config'
+    config.mkdir()
+    credentials = config / 'mysql.env'
+    credentials.write_text('DB_PASSWORD=synthetic\n')
+    credentials.chmod(0o600)
     next_stage = layout.root / 'next_stage'
     next_stage.mkdir()
     monkeypatch.setattr(service, 'stage_service', lambda *args, **kwargs: next_stage)
@@ -136,6 +144,7 @@ def test_reset_retry_keeps_historical_marker_but_resets_attempt(layout, monkeypa
     assert saved['database_started_current'] is False
     assert saved['stage'] == str(next_stage)
     assert layout.stage.exists()
+    require_lock.assert_called_once_with(layout.state / 'runtime.lock', 8)
 
 
 def test_first_attempt_starts_with_both_flags_false(tmp_path, monkeypatch):

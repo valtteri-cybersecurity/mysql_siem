@@ -88,6 +88,14 @@ def preserved(path):
             or path.name.endswith('.log') or '.log.' in path.name)
 
 
+def preserved_from_live(path, *, prepared_identity, recovered_reset):
+    if prepared_identity and path == Path('config/identity.env'):
+        return False
+    if recovered_reset and path == Path('config/mysql.env'):
+        return False
+    return preserved(path)
+
+
 def raise_walk_error(error):
     raise error
 
@@ -174,7 +182,7 @@ def stage_service(source, target, uid, gid, role=None, *, settings_source=None):
         raise
 
 
-def publish_service(stage, target, *, prepared_identity=False, backup_path=None):
+def publish_service(stage, target, *, prepared_identity=False, recovered_reset=False, backup_path=None):
     """Preserve live settings/log inodes; restore the old tree on publish failure."""
     trusted_directory(target.parent)
     backup = None
@@ -187,9 +195,7 @@ def publish_service(stage, target, *, prepared_identity=False, backup_path=None)
             os.rename(target, backup)
             for original in tree_files(backup):
                 relative = original.relative_to(backup)
-                if preserved(relative):
-                    if prepared_identity and relative == Path('config/identity.env'):
-                        continue
+                if preserved_from_live(relative, prepared_identity=prepared_identity, recovered_reset=recovered_reset):
                     destination = stage / relative
                     make_parents(destination.parent, stage, stage.stat().st_gid)
                     descriptor = os.open(original, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -251,14 +257,16 @@ def new_environment():
     return path
 
 
-def activate(stage, target, candidate, stable, *, prepared_identity=False, backup_path=None, environment_backup=None):
+def activate(stage, target, candidate, stable, *, prepared_identity=False, recovered_reset=False,
+             backup_path=None, environment_backup=None):
     if candidate.is_symlink() or not candidate.is_dir() or candidate.parent != ENVIRONMENTS:
         raise InstallationError('Activation requires a complete managed Python environment.')
     validate_virtualenv(candidate)
     if not (candidate / 'bin/python').is_file() or not (candidate / 'pyvenv.cfg').is_file():
         raise InstallationError('Activation requires a complete managed Python environment.')
     validate_virtualenv(stable, stable=True)
-    backup = publish_service(stage, target, prepared_identity=prepared_identity, backup_path=backup_path)
+    backup = publish_service(stage, target, prepared_identity=prepared_identity,
+                             recovered_reset=recovered_reset, backup_path=backup_path)
     old_environment = None
     link = stable.parent / ('.mysql_siem-link-' + candidate.name)
     try:
@@ -276,8 +284,11 @@ def activate(stage, target, candidate, stable, *, prepared_identity=False, backu
             os.rename(old_environment, stable)
         # Move the current settings/logs back as part of restoring the old version.
         if backup is not None:
-            failed = publish_service(backup, target, prepared_identity=prepared_identity)
-            shutil.rmtree(failed)
+            failed = publish_service(backup, target, prepared_identity=prepared_identity, recovered_reset=recovered_reset)
+            if recovered_reset:
+                os.rename(failed, stage)
+            else:
+                shutil.rmtree(failed)
         else:
             os.rename(target, stage)
         raise
@@ -419,21 +430,46 @@ def recover_publication(state, record):
     journal.save_deployment(state, record)
 
 
-def restore_missing_staged_settings(stage, target):
+def restore_missing_staged_settings(stage, target, *, preserve_staged_identity=False):
     """Rollback returns original inodes to the live tree; restage their copies."""
     if not target.exists():
         return
+    trusted_directory(target)
     for original in tree_files(target):
         relative = original.relative_to(target)
+        if preserve_staged_identity and relative == Path('config/identity.env'):
+            continue
         destination = stage / relative
-        if preserved(relative) and not destination.exists():
+        if preserved(relative) and not destination.exists() and not destination.is_symlink():
             if original.stat().st_nlink != 1:
                 raise InstallationError('Recovered settings and logs must not have hard links.')
+            parent = destination.parent
+            while not parent.exists() and not parent.is_symlink():
+                parent = parent.parent
+            trusted_directory(parent)
             make_parents(destination.parent, stage, stage.stat().st_gid)
             shutil.copy2(original, destination)
             info = original.stat()
             os.chown(destination, info.st_uid, info.st_gid)
             destination.chmod(0o640 if relative == Path('config/identity.env') else 0o600)
+
+
+def check_reset_settings(project, user):
+    """Check ownership before restaging could normalize file permissions."""
+    trusted_directory(project / 'config')
+    identity = project / 'config/identity.env'
+    if identity.exists() or identity.is_symlink():
+        info = identity.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.geteuid() or info.st_mode & 0o027):
+            raise InstallationError('Unsafe staged identity settings; preserve recovery files.')
+    mysql = project / 'config/mysql.env'
+    info = mysql.lstat()
+    account = pwd.getpwnam(user)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or (info.st_uid, info.st_gid) != (account.pw_uid, account.pw_gid)
+            or stat.S_IMODE(info.st_mode) != 0o600):
+        raise InstallationError('Unsafe staged database settings; preserve recovery files.')
 
 
 def check_unpublished_recovery(target, stable, user, state):
@@ -500,43 +536,57 @@ def prepare_deployment(source, target, user, role, stable, state, *, settings_so
     record = journal.read_deployment(state)
     pending_transition = None
     pending_identity = {}
+    maintenance = state / 'maintenance'
+    maintenance_present = maintenance.exists() or maintenance.is_symlink()
+    previous_database_started = False
     if (not reset and record is None and ((state / 'receipt.json').exists() or (state / 'receipt.json').is_symlink())
             and not (target / 'config/mysql.env').is_file()):
         raise InstallationError('An older identity receipt exists without installed database settings or a deployment journal. '
                                 'Keep the receipt and old .mysql_siem-stage-* directories. Recover the original prepared '
                                 'service/settings after administrative review before retrying; do not generate a new password.')
     if record is not None:
-        if (state / 'maintenance').exists():
-            pending_transition = record['checkpoint_transition']
-            if reset and record['phase'] == 'staged' and record['database_started']:
-                pending_identity = dict(record['identity'])
         deployment_paths(record, target, stable, user)
-        if record['phase'] == 'publishing':
+        if maintenance_present:
+            pending_transition = record['checkpoint_transition']
+            previous_database_started = record['database_started']
+            if reset and previous_database_started:
+                journal.require_maintenance(state)
+                pending_identity = dict(record['identity'])
+        elif reset and record['database_started'] and record['phase'] != 'complete':
+            raise InstallationError('Interrupted RESET has no maintenance protection; preserve recovery files.')
+        recovering_publication = record['phase'] == 'publishing'
+        if recovering_publication:
             recover_publication(state, record)
-        if record['phase'] == 'staged' and Path(record['stage']).exists():
-            trusted_directory(Path(record['stage']))
-            restore_missing_staged_settings(Path(record['stage']), target)
+        previous_stage = Path(record['stage'])
+        resuming_reset = reset and previous_database_started
+        if record['phase'] == 'staged' and not previous_stage.exists():
+            if resuming_reset or not target.exists():
+                raise InstallationError('Pending staged settings cannot be located; manual recovery required.')
+        elif record['phase'] == 'staged':
+            trusted_directory(previous_stage / 'config')
+            if resuming_reset and not recovering_publication:
+                check_reset_settings(previous_stage, user)
+            restore_missing_staged_settings(previous_stage, target,
+                                            preserve_staged_identity=resuming_reset)
+            if resuming_reset and recovering_publication:
+                check_reset_settings(previous_stage, user)
             if not reset:
                 account = pwd.getpwnam(user)
                 stage = stage_service(source, target, account.pw_uid, account.pw_gid,
-                                      role=role, settings_source=Path(record['stage']))
+                                      role=role, settings_source=previous_stage)
                 updated = dict(record, stage=str(stage), candidate=None, cron_digest=None,
                                database_started_current=False)
                 # Keep the old directory and durable recovery evidence. Publish
                 # the new code/settings reference only after copying succeeds.
                 journal.save_deployment(state, updated)
                 return stage
-            settings_source = Path(record['stage'])
-        if record['phase'] == 'staged' and not Path(record['stage']).exists() and not target.exists():
-            raise InstallationError('Pending staged settings cannot be located; manual recovery required.')
-        if record['phase'] == 'activated':
+            settings_source = previous_stage
+        if record['phase'] == 'activated' or (record['phase'] == 'complete' and resuming_reset):
             verify_publication(state, record)
+            if resuming_reset:
+                check_reset_settings(target, user)
     account = pwd.getpwnam(user)
-    # Keep database history while resuming an unfinished maintenance period,
-    # including a failure after publication. Completed upgrades start fresh.
-    previous_database_started = bool(record is not None and record['database_started']
-                                     and (reset or (state / 'maintenance').exists()))
-    if reset and target.exists() and not pending_identity:
+    if reset and target.exists() and not previous_database_started:
         settings_source = target
     if settings_source is None or (target.exists() and (record is None or record['phase'] != 'staged')):
         settings_source = target if target.exists() else (settings_source or source)
@@ -572,7 +622,7 @@ def preflight_deployment(project, target, stable, user, state):
         journal.require_maintenance(state)
 
 
-def activate_deployment(stage, target, candidate, stable, state):
+def activate_deployment(stage, target, candidate, stable, state, *, recovered_reset=False):
     from config import installation_state as journal
 
     record = journal.require_stage(state, stage)
@@ -596,7 +646,7 @@ def activate_deployment(stage, target, candidate, stable, state):
     if target_inode is not None:
         for original in tree_files(target):
             relative = original.relative_to(target)
-            if preserved(relative) and relative != Path('config/identity.env'):
+            if preserved_from_live(relative, prepared_identity=True, recovered_reset=recovered_reset):
                 files.append(str(relative))
     record['publication'] = {'stage_inode': stage_inode, 'target_inode': target_inode,
                              'backup': str(backup) if backup is not None else None, 'files': files,
@@ -607,7 +657,7 @@ def activate_deployment(stage, target, candidate, stable, state):
     journal.save_deployment(state, record)
     # Leave the plan in place even if normal exception handling restores the old
     # program. Retry also handles SIGKILL, which cannot execute Python cleanup.
-    activate(stage, target, candidate, stable, prepared_identity=True,
+    activate(stage, target, candidate, stable, prepared_identity=True, recovered_reset=recovered_reset,
              backup_path=backup, environment_backup=old_environment)
     journal.sync_directory(target.parent)
     journal.sync_directory(stable.parent)
@@ -903,7 +953,8 @@ def main(arguments):
             validate_virtualenv(Path(arguments[1]), stable=arguments[2] == 'stable')
         elif action == 'activate':
             from config.installation_state import STATE_DIR
-            activate_deployment(Path(arguments[1]), Path(arguments[2]), Path(arguments[3]), Path(arguments[4]), STATE_DIR)
+            activate_deployment(Path(arguments[1]), Path(arguments[2]), Path(arguments[3]), Path(arguments[4]), STATE_DIR,
+                                recovered_reset=len(arguments) > 5 and arguments[5] == 'recovered-reset')
         elif action == 'database-started':
             from config import installation_state as journal
             journal.require_maintenance(journal.STATE_DIR)

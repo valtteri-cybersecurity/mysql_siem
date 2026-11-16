@@ -890,7 +890,7 @@ def require_administrator():
         raise IdentityError('Local enrollment requires administrator privileges.')
 
 
-def check_staged_receipt(connection, state, project, installed, user):
+def check_staged_receipt(connection, state, project, installed, user, *, require_enrollment_marker=False):
     """Validate a completed receipt using reads only; do not enroll identities."""
     record = installation.require_stage(state, project)
     if record['target'] != str(installed) or record['user'] != user:
@@ -913,6 +913,11 @@ def check_staged_receipt(connection, state, project, installed, user):
     with connection.cursor() as cursor:
         if validate_bindings(cursor, expected) != receipt['host_id']:
             raise IdentityError('Recovery host binding differs from the receipt.')
+        if require_enrollment_marker:
+            cursor.execute('SELECT 1 FROM collectors WHERE collector_id = %s AND collector_name = %s',
+                           (expected[COLLECTOR_KEY], 'local.' + receipt['token']))
+            if cursor.fetchone() != (1,):
+                raise IdentityError('Recovery collector does not match the enrollment marker in the receipt.')
 
 
 def main(argv=None):

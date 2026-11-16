@@ -203,7 +203,9 @@ prepare_service_installation() {
 }
 
 activate_service_installation() {
-    service_installation activate "$STAGED_PROJECT_DIR" "$SERVICE_DIR" "$VENV_BUILD_DIR" "$VENV_DIR" prepared-identity
+    local publication_mode=prepared-identity
+    if [[ "${RESET_RECOVERY:-0}" == 1 ]]; then publication_mode=recovered-reset; fi
+    service_installation activate "$STAGED_PROJECT_DIR" "$SERVICE_DIR" "$VENV_BUILD_DIR" "$VENV_DIR" "$publication_mode"
     SERVICE_PUBLISHED=1
     PROJECT_DIR="$SERVICE_DIR"
     ENV_FILE="$PROJECT_DIR/config/mysql.env"
