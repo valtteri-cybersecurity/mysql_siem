@@ -1,6 +1,11 @@
 """Managed rotation configuration is reversible and preserves custom settings."""
+import gzip
+import json
 import os
+import shutil
 import stat
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -32,7 +37,7 @@ def test_apply_commit_and_repeated_apply_preserve_original_receipt(setup):
     assert 'compresscmd' in path.read_text()
     assert 'delaycompress' in path.read_text()
     assert 'copytruncate' not in path.read_text()
-    assert path.stat().st_mode & 0o777 == 0o644
+    assert path.stat().st_mode & 0o777 == 0o640
     rotation.commit(state)
     before = (state / rotation.RECEIPT).read_bytes()
     assert not rotation.apply(state, path)
@@ -110,3 +115,173 @@ def test_unsafe_configuration_is_rejected(setup, unsafe):
     with pytest.raises((OSError, RuntimeError)):
         rotation.apply(state, path)
     assert not (state / rotation.RECEIPT).exists()
+
+
+@pytest.fixture(params=['ubuntu-noble', 'mint-zena', 'debian-trixie'])
+def packaged_config(request):
+    # Noble and Mint's APT candidate: ufw 0.36.2-6. Trixie: ufw 0.36.2-9.
+    # The installed Mint package independently lists the same conffile checksum.
+    path = Path(__file__).parent / 'fixtures/ufw_rotation' / (request.param + '.conf')
+    return path.read_text()
+
+
+def test_packaged_installation_resume_and_restore(setup, packaged_config):
+    state, path = setup
+    path.write_text(packaged_config)
+    expected = rotation.check(path, state=state)
+    assert path.read_text() == packaged_config
+    assert not (state / rotation.RECEIPT).exists()
+    assert rotation.apply(state, path, expected=expected)
+    managed = path.read_text()
+    assert rotation.configuration_lines(managed)[0].count(rotation.COMPRESSOR_OPTIONS[0]) == 1
+    preserved = []
+    for line in managed.splitlines(keepends=True):
+        if line.strip() not in rotation.COMPRESSOR_OPTIONS:
+            preserved.append(line)
+    assert ''.join(preserved) == packaged_config
+    assert rotation.apply(state, path, expected=rotation.check(path, state=state))
+    rotation.commit(state)
+    assert not rotation.apply(state, path, expected=rotation.check(path, state=state))
+    rotation.rollback(state, path)
+    assert path.read_text() == packaged_config
+
+
+def test_packaged_managed_config_rotates_numbered_archives(setup, packaged_config):
+    executable = shutil.which('logrotate')
+    if executable is None:
+        pytest.skip('Private rotation test requires logrotate.')
+    state, path = setup
+    path.write_text(packaged_config)
+    rotation.apply(state, path)
+    source = path.with_name('ufw.log')
+    source.write_bytes(b'first private UFW log\n')
+    configuration = path.read_text().replace('/var/log/ufw.log', str(source))
+    # Match the packaged global create behavior without changing system files.
+    path.write_text('create\n' + configuration)
+    command = [executable, '--state', str(state / 'logrotate.status')]
+    debug = subprocess.run([*command, '--debug', '--force', str(path)],
+                           check=False, capture_output=True, text=True, timeout=10)
+    assert debug.returncode == 0, debug.stderr
+    assert not (state / 'logrotate.status').exists()
+
+    # Use the same stanza with private stand-ins for the production scripts.
+    hook = state / 'postrotate'
+    configuration = configuration.replace(rotation.COMPRESSOR_OPTIONS[0], 'compresscmd /usr/bin/gzip')
+    configuration = configuration.replace(
+        '[ -x /usr/lib/rsyslog/rsyslog-rotate ] && /usr/lib/rsyslog/rsyslog-rotate || true',
+        f'printf reopened > "{hook}"',
+    )
+    path.write_text('create\n' + configuration)
+    for _ in range(2):
+        result = subprocess.run([*command, '--force', str(path)], check=False,
+                                capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        source.write_bytes(b'next private UFW log\n')
+    assert hook.read_text() == 'reopened'
+    assert source.with_suffix('.log.1').read_bytes() == b'next private UFW log\n'
+    assert gzip.decompress(source.with_suffix('.log.2.gz').read_bytes()) == b'first private UFW log\n'
+
+
+def test_comments_and_indentation_are_preserved(setup):
+    state, path = setup
+    original = '# Packaged defaults\n' + rotation.STOCK.replace('/var/log/ufw.log\n{', '/var/log/ufw.log  {')
+    original = original.replace('    compress\n', '\t# Keep delayed compression\n\tcompress\n')
+    path.write_text(original)
+    assert original.split() != rotation.STOCK.split()
+    assert rotation.apply(state, path, expected=rotation.check(path, state=state))
+    assert '\t# Keep delayed compression\n\tcompress\n\tcompresscmd ' in path.read_text()
+    rotation.rollback(state, path)
+    assert path.read_text() == original
+
+
+@pytest.mark.parametrize('before,after', [
+    ('rotate 4', 'rotate\n    4'),
+    ('compress\n', 'compress\n    compresscmd /usr/bin/gzip\n'),
+    ('delaycompress', 'delaycompress\n    nocompress'),
+    ('delaycompress', 'delaycompress\n    dateext'),
+    ('delaycompress', 'delaycompress\n    olddir /tmp'),
+    ('delaycompress', 'delaycompress\n    copytruncate'),
+    ('delaycompress', 'delaycompress\n    su nobody nogroup'),
+    ('delaycompress', 'delaycompress\n    create 0666 root root'),
+    ('[ -x /usr/lib/rsyslog/rsyslog-rotate ]', '/bin/true'),
+    (' && ', '\n        && '),
+])
+def test_unverified_stanza_is_preserved(setup, before, after):
+    state, path = setup
+    original = rotation.STOCK.replace(before, after)
+    path.write_text(original)
+    with pytest.raises(RuntimeError, match='Custom UFW'):
+        rotation.check(path, state=state)
+    with pytest.raises(RuntimeError, match='Custom UFW'):
+        rotation.apply(state, path)
+    assert path.read_text() == original
+    assert not (state / rotation.RECEIPT).exists()
+
+
+def test_preflight_detects_changes_even_if_still_compatible(setup):
+    state, path = setup
+    expected = rotation.check(path, state=state)
+    updated = '# administrator annotation\n' + path.read_text()
+    path.write_text(updated)
+    with pytest.raises(RuntimeError, match='changed after preflight'):
+        rotation.apply(state, path, expected=expected)
+    assert path.read_text() == updated
+    assert not (state / rotation.RECEIPT).exists()
+
+
+def test_publisher_rechecks_after_receipt_is_written(setup, monkeypatch):
+    state, path = setup
+    original_write = rotation.journal.write_file
+    updated = '# changed just before publication\n' + path.read_text()
+
+    def change_after_receipt(*args):
+        original_write(*args)
+        path.write_text(updated)
+
+    monkeypatch.setattr(rotation.journal, 'write_file', change_after_receipt)
+    with pytest.raises(RuntimeError, match='changed before publication'):
+        rotation.apply(state, path)
+    assert path.read_text() == updated
+    assert rotation.receipt(state)['phase'] == 'pending'
+
+
+@pytest.mark.parametrize('published', [False, True])
+def test_legacy_pending_receipt_resumes_without_replacing_evidence(setup, published):
+    state, path = setup
+    record = {'original': path.read_text(), 'mode': 0o640, 'gid': os.getegid(), 'phase': 'pending',
+              'managed_sha': '526f5b69351a9db656f4d4ffdcb173db1a156bed4c6c09d2f2fe96cde71a6c15'}
+    saved_path = state / rotation.RECEIPT
+    rotation.journal.write_file(saved_path, json.dumps(record))
+    if published:
+        path.write_text(rotation.MANAGED)
+        path.chmod(0o644)
+    assert rotation.apply(state, path, expected=rotation.check(path, state=state))
+    assert json.loads(saved_path.read_bytes()) == record
+    assert path.stat().st_mode & 0o777 == 0o644
+    rotation.commit(state)
+    assert not rotation.apply(state, path)
+    rotation.rollback(state, path)
+    assert path.read_text() == record['original']
+
+
+@pytest.mark.parametrize('fault', ['missing', 'corrupt', 'digest', 'permissions'])
+def test_unverified_recovery_retains_files(setup, fault):
+    state, path = setup
+    rotation.apply(state, path)
+    saved_path = state / rotation.RECEIPT
+    if fault == 'missing':
+        saved_path.unlink()
+    elif fault == 'corrupt':
+        rotation.journal.write_file(saved_path, '{')
+    elif fault == 'digest':
+        record = rotation.receipt(state)
+        record['managed_sha'] = '0' * 64
+        rotation.journal.write_file(saved_path, json.dumps(record))
+    else:
+        path.chmod(0o600)
+    before = path.read_bytes()
+    with pytest.raises((RuntimeError, ValueError)):
+        rotation.check(path, state=state)
+    with pytest.raises((RuntimeError, ValueError)):
+        rotation.apply(state, path)
+    assert path.read_bytes() == before

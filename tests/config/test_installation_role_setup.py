@@ -141,6 +141,8 @@ def test_role_cron_selection_and_repeatable_managed_block(tmp_path, role):
                     '# END mysql_siem managed jobs\n')
     block = INSTALLER.split("# Update only this installation's marked cron block.", 1)[1].split('log "Installation steps completed.', 1)[0]
     extra = '''
+UFW_ROTATION_EXPECTED=synthetic
+cleanup_prepared_installation() { :; }
 verify_installation_health() { :; }
 local_identity_setup() { :; }
 audit_installation() { :; }
@@ -209,6 +211,7 @@ def test_real_python_bridge_reads_only_temporary_configuration(tmp_path, content
 def test_crontab_read_error_does_not_install_replacement(tmp_path):
     block = INSTALLER.split("# Update only this installation's marked cron block.", 1)[1].split('log "Installation steps completed.', 1)[0]
     result = shell(tmp_path, block, extra='''
+cleanup_prepared_installation() { :; }
 crontab() { echo "Unexpected cron access error" >&2; return 1; }
 ''')
     assert result.returncode != 0

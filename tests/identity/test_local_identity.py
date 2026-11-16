@@ -170,7 +170,8 @@ def test_installer_verifies_identity_before_publication_and_cron(operation, fail
         'audit_installation prepare', 'activate_service_installation',
         'local_identity_setup schedule --cron-file "$CRON_TMP"',
         'crontab -u "$INSTALL_USER" "$CRON_TMP"', 'audit_installation activate', 'verify_installation_health', 'local_identity_setup finish',
-        'UFW_ROTATION_STARTED="$(ufw_rotation apply)"', 'ufw_rotation commit',
+        'UFW_ROTATION_STARTED="$(ufw_rotation apply "$UFW_ROTATION_EXPECTED")"', 'ufw_rotation commit',
+        'UFW_ROTATION_STARTED=0',
     )
     positions = {}
     for number, line in enumerate(lines):
@@ -189,7 +190,7 @@ def test_installer_verifies_identity_before_publication_and_cron(operation, fail
     finish = positions['local_identity_setup finish'][0]
     activation = positions['audit_installation activate'][0]
     health = positions['verify_installation_health'][0]
-    rotation_apply = positions['UFW_ROTATION_STARTED="$(ufw_rotation apply)"'][0]
+    rotation_apply = positions['UFW_ROTATION_STARTED="$(ufw_rotation apply "$UFW_ROTATION_EXPECTED")"'][0]
     rotation_commit = positions['ufw_rotation commit'][0]
     assert begin < reset_begin < prepare < verify < publish < published_verify < schedule < cron < activation < rotation_apply < health < rotation_commit < finish
     condition = 'if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then'
@@ -208,6 +209,7 @@ FAILURE=$2
 INSTALL_USER=mysql_siem
 CRON_TMP=/synthetic/cron
 VERIFY_COUNT=0
+UFW_ROTATION_EXPECTED=synthetic
 local_identity_setup() {
     printf 'identity:%s\n' "$*"
     if [[ "$1" == prepare && "$FAILURE" == prepare ]]; then return 23; fi
