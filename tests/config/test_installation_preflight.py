@@ -222,7 +222,7 @@ preflight_python() {
     printf 'mysql\\n'
     [[ "$FAILURE" != mysql ]] || return 17
 }
-ufw_rotation() { printf 'ufw\\n'; [[ "$FAILURE" != ufw ]] || return 17; }
+ufw_rotation() { printf 'ufw\\n' >&2; [[ "$FAILURE" != ufw ]] || return 17; }
 audit_installation() { printf 'audit\\n'; [[ "$FAILURE" != audit ]] || return 17; }
 local_identity_setup() { printf 'UNEXPECTED maintenance\\n'; return 91; }
 systemctl() { printf 'UNEXPECTED service change\\n'; return 91; }
@@ -232,7 +232,62 @@ systemctl() { printf 'UNEXPECTED service change\\n'; return 91; }
                             capture_output=True, text=True, check=False, timeout=5)
     assert result.returncode == 17, result.stdout + result.stderr
     assert 'UNEXPECTED' not in result.stdout
-    assert result.stdout.strip().endswith(failure)
+    if failure == 'ufw':
+        assert result.stderr.strip().endswith(failure)
+    else:
+        assert result.stdout.strip().endswith(failure)
+
+
+@pytest.mark.parametrize('operation', ['reset', 'upgrade'])
+def test_ufw_drift_stops_before_database_changes(operation):
+    installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
+    start = installer.index('UFW_ROTATION_CURRENT="$(ufw_rotation check)"')
+    end = installer.index('# Both schema paths', start)
+    prefix = '''set -euo pipefail
+INSTALL_OPERATION=$1
+UFW_ROTATION_EXPECTED=original
+ufw_rotation() { printf changed; }
+die() { printf '%s\\n' "$*" >&2; exit 23; }
+service_installation() { printf 'UNEXPECTED database operation\\n'; exit 91; }
+'''
+    result = subprocess.run(['bash', '-c', prefix + installer[start:end], 'ufw-drift', operation],
+                            capture_output=True, text=True, timeout=5, check=False)
+    assert result.returncode == 23
+    assert 'database setup was not started' in result.stderr
+    assert not result.stdout
+
+
+@pytest.mark.parametrize('failure', ['health', 'after-commit'])
+def test_installer_rolls_back_only_pending_ufw_publication(tmp_path, failure):
+    installer = (Path(__file__).resolve().parents[2] / 'install.sh').read_text()
+    cleanup_start = installer.index('cleanup_prepared_installation() {')
+    cleanup_end = installer.index('\n}\n', cleanup_start) + 3
+    trap_start = installer.index("trap 'rm -f")
+    trap_end = installer.index('\n', trap_start)
+    activate_start = installer.index('\naudit_installation activate\n')
+    activate_end = installer.index('\nunset SIEM_INSTALL_MAINTENANCE', activate_start)
+    cron = tmp_path / 'cron'
+    cron.touch()
+    prefix = '''set -euo pipefail
+CRON_TMP=$1
+FAILURE=$2
+SERVICE_PUBLISHED=1
+UFW_ROTATION_EXPECTED=original
+audit_installation() { :; }
+ufw_rotation() {
+    if [[ "$1" == apply ]]; then printf '1'; fi
+    if [[ "$1" == rollback ]]; then printf 'rollback\\n'; fi
+}
+verify_installation_health() { [[ "$FAILURE" != health ]] || return 23; }
+local_identity_setup() { return 23; }
+'''
+    script = prefix + installer[cleanup_start:cleanup_end] + installer[trap_start:trap_end]
+    script += installer[activate_start:activate_end]
+    result = subprocess.run(['bash', '-c', script, 'rotation-trap', str(cron), failure],
+                            capture_output=True, text=True, timeout=5, check=False)
+    assert result.returncode == 23
+    assert ('rollback' in result.stdout) is (failure == 'health')
+    assert not cron.exists()
 
 
 def test_recovery_preflight_requires_the_existing_installer_lock(prepared):

@@ -186,6 +186,7 @@ def test_managed_cron_is_repeatable_and_preserves_existing_jobs(project, tmp_pat
     script = (
         '''set -euo pipefail
 verify_installation_health() { :; }
+cleanup_prepared_installation() { :; }
 local_identity_setup() { :; }
 audit_installation() { :; }
 ufw_rotation() { if [[ "$1" == apply ]]; then printf 0; fi; }
@@ -207,6 +208,7 @@ crontab() {
         "CRON_BEGIN": "# BEGIN mysql_siem managed jobs",
         "CRON_END": "# END mysql_siem managed jobs",
         "APP_PYTHON": sys.executable,
+        "UFW_ROTATION_EXPECTED": "synthetic",
         "SSH_AUTH_CRON": auth,
         "SSH_DETECTION_CRON": detection,
         "PORT_SCAN_CRON": "* * * * * echo port-scan-kept",

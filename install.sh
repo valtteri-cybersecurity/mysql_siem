@@ -873,7 +873,7 @@ if [[ "$INSTALL_OPERATION" == reset ]]; then
     [[ "$RESET_RECOVERY" == 0 || "$RESET_RECOVERY" == 1 ]] || die "Unexpected RESET recovery result; database was preserved."
     RESET_RECOVERY_CHECK_ACTIVE=0
 fi
-ufw_rotation check
+UFW_ROTATION_EXPECTED="$(ufw_rotation check)"
 service_installation snapshot-logs-check "$INSTALL_USER"
 audit_installation permissions --operation "$INSTALL_OPERATION"
 audit_installation check --operation "$INSTALL_OPERATION"
@@ -920,6 +920,9 @@ systemctl enable --now cron
 systemctl enable --now rsyslog
 
 # Upgrade preserves history; the original reset path still requires explicit consent.
+UFW_ROTATION_CURRENT="$(ufw_rotation check)"
+[[ "$UFW_ROTATION_CURRENT" == "$UFW_ROTATION_EXPECTED" ]] ||
+    die "UFW logrotate configuration changed after preflight; database setup was not started."
 DATABASE_SETUP_STARTED=1
 service_installation database-started
 if [[ "${INSTALL_OPERATION:-reset}" == upgrade ]]; then
@@ -1222,7 +1225,7 @@ select_role_cron_jobs
 
 # Update only this installation's marked cron block.
 CRON_TMP="$(mktemp)"
-trap 'rm -f "$CRON_TMP"' EXIT
+trap 'rm -f "$CRON_TMP"; cleanup_prepared_installation' EXIT
 
 if ! CRON_EXISTING="$(LC_ALL=C crontab -u "$INSTALL_USER" -l 2>"$CRON_TMP")"; then
     [[ "$(<"$CRON_TMP")" == "no crontab for $INSTALL_USER" ]] ||
@@ -1260,9 +1263,10 @@ crontab -u "$INSTALL_USER" "$CRON_TMP"
 # Audit uses a fixed status preflight then permanently drops root. The service
 # account receives no sudo/capabilities and all DB work uses run_with_env.sh.
 audit_installation activate
-UFW_ROTATION_STARTED="$(ufw_rotation apply)"
+UFW_ROTATION_STARTED="$(ufw_rotation apply "$UFW_ROTATION_EXPECTED")"
 verify_installation_health
 ufw_rotation commit
+UFW_ROTATION_STARTED=0
 local_identity_setup finish
 unset SIEM_INSTALL_MAINTENANCE
 exec 8<&-

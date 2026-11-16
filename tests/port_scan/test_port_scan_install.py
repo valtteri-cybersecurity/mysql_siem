@@ -103,6 +103,8 @@ def test_managed_cron_is_repeatable_and_preserves_other_jobs(project, tmp_path):
     )
     script = (
         r"""set -euo pipefail
+UFW_ROTATION_EXPECTED=synthetic
+cleanup_prepared_installation() { :; }
 verify_installation_health() { :; }
 local_identity_setup() { :; }
 audit_installation() { :; }
