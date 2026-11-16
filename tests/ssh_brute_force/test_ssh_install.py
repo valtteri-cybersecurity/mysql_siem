@@ -37,6 +37,8 @@ def ssh_cron(project, *, ready="1", source=None, preflight_result="0"):
     installer = (ROOT / "install.sh").read_text()
     start = installer.index("# Schedule the SSH jobs independently;")
     end = installer.index("# Schedule UFW Analysis;", start)
+    finish = installer.index("\nlocal_identity_setup finish\n")
+    cleanup = installer.index('\nrm -f "$CRON_TMP"', finish)
 
     log_helper = "prepare_runtime_log() {" + installer.split(
         "prepare_runtime_log() {", 1
@@ -48,14 +50,36 @@ def ssh_cron(project, *, ready="1", source=None, preflight_result="0"):
         "die() { printf '%s\\n' \"$*\" >&2; exit 1; }\n"
         "chown() { :; }\n"
         "id() { printf 'test-group\\n'; }\n"
-        "runuser() { if [[ \"$*\" == *--check-source* ]]; then return \"$SSH_PREFLIGHT_RESULT\"; fi; return 0; }\n"
+        """runuser() {
+    shift 3
+    if [[ "$1" == /usr/bin/head && "$SSH_PREFLIGHT_RESULT" == real ]]; then
+        # The synthetic wrapper has already loaded the source path. Hold the
+        # installer lock while exercising the unprivileged timestamp check.
+        mkdir "$TEST_STATE"
+        touch "$TEST_STATE/runtime.lock" "$TEST_STATE/maintenance"
+        exec 8< "$TEST_STATE/runtime.lock"
+        flock -x 8
+    fi
+    if [[ "$1" == /usr/bin/timeout && "$SSH_PREFLIGHT_RESULT" != real ]]; then
+        return "$SSH_PREFLIGHT_RESULT"
+    fi
+    "$@"
+}
+local_identity_setup() {
+    if [[ "$SSH_PREFLIGHT_RESULT" == real ]]; then
+        rm "$TEST_STATE/maintenance"
+    fi
+}
+"""
         + log_helper
         + installer[start:end]
+        + installer[finish:cleanup]
         + '\nprintf "%s\\n%s\\n" "$SSH_AUTH_CRON" "$SSH_DETECTION_CRON"'
     )
 
     return subprocess.run(
         ["bash", "-c", script],
+        cwd=ROOT,
         check=True,
         capture_output=True,
         text=True,
@@ -66,6 +90,7 @@ def ssh_cron(project, *, ready="1", source=None, preflight_result="0"):
             "SSH_READY": ready,
             "SSH_PREFLIGHT_RESULT": preflight_result,
             "APP_PYTHON": sys.executable,
+            "TEST_STATE": str(project / "local-state"),
         },
     )
 
@@ -289,11 +314,12 @@ def test_auth_login_migration_is_required_before_installation():
 
 def test_installer_checks_source_timestamp_without_reconfiguring_rsyslog():
     installer = (ROOT / "install.sh").read_text()
-    start = installer.index("# Schedule the SSH jobs independently;")
-    end = installer.index("# Schedule UFW Analysis;", start)
+    start = installer.index("\nlocal_identity_setup finish\n")
+    end = installer.index('log "Installation steps completed.', start)
     section = installer[start:end]
-    assert '-m ingestion.auth.main --check-source --logfile "$SSH_LOG_SOURCE"' in section
-    assert "runuser -u" in section
+    probe = section.index('-m ingestion.auth.main --check-source --logfile "$SSH_TIMESTAMP_SOURCE"')
+    assert section.index('local_identity_setup finish') < section.index('exec 8<&-') < probe
+    assert section.index('runuser -u "$INSTALL_USER"') < probe
     assert "SSH_AUTH_SYSLOG_START/END/TIMEZONE" in section
     assert "/etc/rsyslog" not in section
 
@@ -307,3 +333,13 @@ def test_failed_timestamp_preflight_warns_without_changing_source(project):
     assert "SSH_AUTH_SYSLOG_START/END/TIMEZONE" in result.stderr
     assert source.read_text() == original
     assert "-m ingestion.auth.main --allow-missing-source" in result.stdout
+
+
+@pytest.mark.parametrize("timestamp,valid", [("2026-11-16T07:00:00+00:00", True), ("Nov 16 07:00:00", False)])
+def test_timestamp_preflight_runs_after_releasing_maintenance_lock(project, timestamp, valid):
+    source = project / "auth.log"
+    source.write_text(f"{timestamp} host CRON[1]: session opened\n")
+    result = ssh_cron(project, source=source, preflight_result="real")
+    assert "Local identity maintenance: job skipped." not in result.stderr
+    assert ("Source timestamp check: SUCCESS" in result.stdout) is valid
+    assert ("Auth timestamp preflight failed" in result.stderr) is not valid
