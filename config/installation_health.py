@@ -22,6 +22,7 @@ from config.service_installation import (
     trusted_directory,
     validate_virtualenv,
 )
+from config.ufw_rotation import verify_active as verify_ufw_rotation
 from database import migrate
 from database.connection import get_connection
 from database.identity import IdentityError
@@ -118,7 +119,13 @@ def main(argv=None):
             raise HealthError('Runtime database connection failed.')
         revision = verify_health(connection, args.project, during_maintenance=args.during_maintenance,
                                  revision=args.revision)
+        try:
+            rotation = verify_ufw_rotation(journal.STATE_DIR, during_maintenance=args.during_maintenance)
+        except (OSError, ValueError, RuntimeError, KeyError) as error:
+            print('Status: FAILED - UFW rotation: ' + str(error), file=sys.stderr)
+            return 1
         print('Status: HEALTHY - approved commit ' + revision + '; schema, identities and jobs verified.')
+        print('UFW rotation: ' + rotation + '.')
         return 0
     except (AuthCollectionError, FilesystemSetupError, IdentityError) as error:
         print('Status: FAILED - ' + str(error), file=sys.stderr)

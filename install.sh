@@ -728,6 +728,7 @@ for path in \
     database/ufw_archive_retry_schema.py \
     ingestion/ufw_archive_retry.py \
     config/ufw_rotation.py \
+    config/ufw_external_rotation.py \
     config/ufw-compress.sh \
     ingestion/ufw_records.py \
     ingestion/ufw_validation.py \

@@ -59,6 +59,20 @@ def test_completed_installation_health_is_read_only(installed):
     health.verify_filesystem.assert_called_once()
 
 
+@pytest.mark.parametrize('mode', ['external uncompressed', 'managed gzip'])
+def test_cli_reports_verified_ufw_rotation_mode(installed, monkeypatch, capsys, mode):
+    monkeypatch.setattr(health.os, 'geteuid', lambda: 0)
+    connection = MagicMock()
+    monkeypatch.setattr(health, 'get_connection', lambda **kwargs: connection)
+    monkeypatch.setattr(health, 'verify_health', Mock(return_value='a' * 40))
+    checker = Mock(return_value=mode)
+    monkeypatch.setattr(health, 'verify_ufw_rotation', checker)
+    assert health.main(['--project', str(installed.project), '--during-maintenance']) == 0
+    checker.assert_called_once_with(health.journal.STATE_DIR, during_maintenance=True)
+    assert f'UFW rotation: {mode}.' in capsys.readouterr().out
+    connection.close.assert_called_once()
+
+
 @pytest.mark.parametrize('fault', ['maintenance', 'unfinished', 'revision', 'python', 'receipt', 'host', 'cron', 'role'])
 def test_bad_health_never_releases_maintenance(installed, monkeypatch, fault):
     if fault == 'maintenance':

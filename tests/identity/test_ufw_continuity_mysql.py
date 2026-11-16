@@ -1,7 +1,10 @@
 """Private socket-only MySQL: rotation, failures, recovery and 10,000 retained events."""
 import gzip
 import hashlib
+import shutil
+import subprocess
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import pymysql
 import pytest
@@ -39,6 +42,62 @@ def checkpoints(connection):
         cursor.execute('SELECT id,source_scope,file_device,file_inode,filename,byte_position,prefix_sha '
                        'FROM ufw_file_checkpoints ORDER BY id')
         return cursor.fetchall()
+
+
+def test_labor88_plain_daily_rotation_preserves_known_generations(collection):
+    executable = shutil.which('logrotate')
+    if executable is None:
+        pytest.skip('Private daily rotation test requires logrotate.')
+    connection, path = collection
+    fixture = Path(__file__).parents[1] / 'config/fixtures/ufw_rotation/ubuntu-custom-uncompressed.conf'
+    original = fixture.read_text()
+    config = path.with_name('rotation.conf')
+    config.write_text('create\n' + original.replace('/var/log/ufw.log', str(path)).replace(
+        '[ -x /usr/lib/rsyslog/rsyslog-rotate ] && /usr/lib/rsyslog/rsyslog-rotate || true', ':'))
+    command = [executable, '--force', '--state', str(path.with_name('rotation.state')), str(config)]
+    path.write_bytes(event(0) + event(1))
+    path.chmod(0o640)
+    assert ufw.process_log(connection, max_lines=1)['inserted'] == 1
+    first = checkpoints(connection)[0]
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT generation_key FROM ufw_file_checkpoints WHERE id=%s', (first[0],))
+        generation = cursor.fetchone()
+    for index in range(2, 32):
+        rotated = subprocess.run(command, check=False, capture_output=True, timeout=10)
+        assert rotated.returncode == 0, rotated.stderr.decode()
+        path.write_bytes(event(index))
+    assert Path(str(path) + '.30').stat().st_ino == first[3]
+    assert ufw.process_log(connection)['inserted'] == 31
+    assert ufw.process_log(connection)['inserted'] == 0
+    assert continuity.read_health(connection, 0)['state'] == 'HEALTHY'
+    retained = checkpoints(connection)
+    assert retained[0][0] == first[0]
+    assert retained[0][4] == str(path) + '.30'
+    assert retained[0][5] == len(event(0) + event(1))
+    with connection.cursor() as cursor:
+        cursor.execute('SELECT generation_key FROM ufw_file_checkpoints WHERE id=%s', (first[0],))
+        assert cursor.fetchone() == generation
+        cursor.execute('SELECT dst_port FROM ufw_log ORDER BY id')
+        assert cursor.fetchall() == ((1000,), (1031,)) + tuple((number,) for number in range(1001, 1031))
+        cursor.execute('SELECT COUNT(*) FROM ufw_archives')
+        assert cursor.fetchone() == (0,)
+
+    # Observe unfinished bytes, then let fast retention remove that inode.
+    pending = Path(str(path) + '.30')
+    with pending.open('ab') as output:
+        output.write(event(32) + event(33))
+    ufw.process_log(connection, max_lines=1)
+    assert continuity.read_health(connection, 0)['state'] == 'BACKLOG'
+    observed = checkpoints(connection)[0]
+    rotated = subprocess.run(command, check=False, capture_output=True, timeout=10)
+    assert rotated.returncode == 0, rotated.stderr.decode()
+    path.write_bytes(event(34))
+    result = ufw.process_log(connection)
+    assert result['collection_state'] == 'GAP_DETECTED'
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT resolved FROM ufw_collection_gaps WHERE checkpoint_id=%s AND reason='MISSING_SOURCE'", (first[0],))
+        assert cursor.fetchone() == (0,)
+    assert checkpoints(connection)[0] == observed
 
 
 def test_ten_thousand_events_rotate_compress_interrupt_and_resume(collection, monkeypatch):
