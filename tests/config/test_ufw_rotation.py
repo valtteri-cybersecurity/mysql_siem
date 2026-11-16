@@ -6,10 +6,14 @@ import shutil
 import stat
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from config import ufw_external_rotation as external
 from config import ufw_rotation as rotation
+
+LABOR88 = Path(__file__).parent / 'fixtures/ufw_rotation/ubuntu-custom-uncompressed.conf'
 
 
 @pytest.fixture
@@ -73,6 +77,184 @@ def test_custom_configuration_is_not_overwritten(setup):
         rotation.apply(state, path)
     assert path.read_bytes() == before
     assert not (state / rotation.RECEIPT).exists()
+
+
+def test_labor88_keeps_external_rotation_byte_for_byte(setup, monkeypatch):
+    state, path = setup
+    original = LABOR88.read_bytes()
+    path.write_bytes(original)
+    # Host-side source verification is exercised independently with temporary inputs.
+    monkeypatch.setattr(rotation, 'check_external_source', lambda *args: ())
+    for _ in range(2):
+        expected = rotation.check(path, state=state)
+        assert not rotation.apply(state, path, expected=expected)
+        rotation.commit(state)
+        assert rotation.verify_active(state) == rotation.EXTERNAL_PLAIN
+        assert path.read_bytes() == original
+        assert not (state / rotation.RECEIPT).exists()
+
+
+@pytest.fixture
+def external_installation(setup, monkeypatch):
+    state, old = setup
+    base = old.parent
+    includes = base / 'logrotate.d'
+    includes.mkdir(mode=0o755)
+    path = includes / 'ufw'
+    path.write_bytes(LABOR88.read_bytes())
+    path.chmod(0o644)
+    defaults = base / 'logrotate.conf'
+    defaults.write_text(f'weekly\nsu root adm\nrotate 4\ncreate\ninclude {includes}\n')
+    defaults.chmod(0o644)
+    logdir = base / 'logs'
+    logdir.mkdir(mode=0o755)
+    logdir.chmod(0o775)
+    logfile = logdir / 'ufw.log'
+    logfile.write_bytes(b'2026-11-16T10:00:00+00:00 host kernel: [UFW BLOCK] SRC=192.0.2.1\n')
+    logfile.chmod(0o640)
+    rule = base / '20-ufw.conf'
+    rule.write_text(external.RSYSLOG_RULE + '\n& stop\n')
+    rule.chmod(0o644)
+    helper = base / 'rsyslog-rotate'
+    helper.write_text('#!/bin/sh\nexit 0\n')
+    helper.chmod(0o755)
+    sibling = includes / 'rsyslog'
+    sibling.write_text('/var/log/syslog\n{\n    daily\n    compress\n}\n')
+    sibling.chmod(0o644)
+    monkeypatch.setattr(external, 'LOGROTATE_DEFAULTS', defaults)
+    monkeypatch.setattr(external, 'UFW_RULE', rule)
+    monkeypatch.setattr(external, 'POSTROTATE', helper)
+    monkeypatch.setattr(external, 'LOG', logfile)
+    monkeypatch.setattr(external, 'trusted_directory', rotation.trusted_directory)
+    monkeypatch.setattr(external.grp, 'getgrnam', lambda name: SimpleNamespace(gr_gid=os.getegid()))
+    monkeypatch.setattr(external.pwd, 'getpwnam',
+                        lambda name: SimpleNamespace(pw_uid=os.geteuid(), pw_gid=os.getegid()))
+    monkeypatch.setattr(external.subprocess, 'run', lambda *args, **kwargs: None)
+    monkeypatch.setattr(rotation, 'CONFIG', path)
+    return state, path, defaults, sibling, rule, logfile
+
+
+def test_external_source_and_preflight_fingerprint(external_installation):
+    state, path, _defaults, sibling, _rule, _logfile = external_installation
+    expected = rotation.check(path, state=state)
+    assert not rotation.apply(state, path, expected=expected)
+    sibling.write_text('# verified but changed since preflight\n' + sibling.read_text())
+    with pytest.raises(RuntimeError, match='changed after preflight'):
+        rotation.apply(state, path, expected=expected)
+    assert path.read_bytes() == LABOR88.read_bytes()
+    assert not (state / rotation.RECEIPT).exists()
+
+
+def test_external_mode_preserves_preexisting_committed_gzip_receipt(external_installation):
+    state, path, *_ = external_installation
+    path.write_text(rotation.STOCK)
+    rotation.apply(state, path)
+    assert rotation.verify_active(state, during_maintenance=True) == rotation.MANAGED_GZIP
+    rotation.commit(state)
+    assert rotation.verify_active(state) == rotation.MANAGED_GZIP
+    saved = state / rotation.RECEIPT
+    before = saved.read_bytes()
+    path.write_bytes(LABOR88.read_bytes())
+    assert not rotation.apply(state, path, expected=rotation.check(path, state=state))
+    rotation.commit(state)
+    assert rotation.verify_active(state) == rotation.EXTERNAL_PLAIN
+    assert saved.read_bytes() == before
+
+
+@pytest.mark.parametrize('frequency,retention', [('hourly', 7), ('weekly', 90), ('monthly', 2), ('daily', 255)])
+def test_safe_external_schedule_and_retention_are_user_settings(external_installation, frequency, retention):
+    state, path, defaults, *_ = external_installation
+    original = LABOR88.read_text().replace('rotate 30', f'rotate {retention}').replace('daily', frequency)
+    original = original.replace('    nocompress\n', '    create 0640 syslog adm\n    nocompress\n')
+    defaults.write_text(defaults.read_text().replace('rotate 4', 'rotate 8\ncompress'))
+    path.write_text(original)
+    assert not rotation.apply(state, path, expected=rotation.check(path, state=state))
+    assert rotation.verify_active(state) == rotation.EXTERNAL_PLAIN
+    assert path.read_text() == original
+    assert not (state / rotation.RECEIPT).exists()
+
+
+def test_external_policy_rotates_without_compression(tmp_path):
+    executable = shutil.which('logrotate')
+    if executable is None:
+        pytest.skip('Private rotation test requires logrotate.')
+    source = tmp_path / 'ufw.log'
+    source.write_bytes(b'original private UFW log\n')
+    config = tmp_path / 'rotation.conf'
+    hook = tmp_path / 'postrotate'
+    text = LABOR88.read_text().replace('/var/log/ufw.log', str(source))
+    text = text.replace('[ -x /usr/lib/rsyslog/rsyslog-rotate ] && /usr/lib/rsyslog/rsyslog-rotate || true',
+                        f'printf reopened > "{hook}"')
+    config.write_text('create\ncompress\n' + text)
+    command = [executable, '--state', str(tmp_path / 'state'), '--force']
+    debug = subprocess.run([*command, '--debug', str(config)], check=False, capture_output=True, text=True, timeout=10)
+    assert debug.returncode == 0, debug.stderr
+    assert not hook.exists()
+    for _ in range(2):
+        result = subprocess.run([*command, str(config)], check=False, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0, result.stderr
+        source.write_bytes(b'next private UFW log\n')
+    assert hook.read_text() == 'reopened'
+    assert source.with_suffix('.log.2').read_bytes() == b'original private UFW log\n'
+    assert not list(tmp_path.glob('*.gz'))
+
+
+@pytest.mark.parametrize('line', ['copytruncate', 'create 0666 root root', 'su nobody nogroup', 'dateext',
+                                  'olddir /tmp', 'compress', 'compresscmd /usr/bin/gzip', 'start 0', 'rotate 1', 'weekly'])
+def test_external_stanza_refuses_conflicting_options(setup, line):
+    state, path = setup
+    changed = LABOR88.read_text().replace('    nocompress\n', '    nocompress\n    ' + line + '\n')
+    path.write_text(changed)
+    with pytest.raises(RuntimeError, match='Custom UFW'):
+        rotation.check(path, state=state)
+    assert path.read_text() == changed
+    assert not (state / rotation.RECEIPT).exists()
+
+
+@pytest.mark.parametrize('fault', ['global', 'inherited', 'conflicting', 'rule', 'unreadable', 'symlink',
+                                  'timestamp', 'hardlink', 'missing', 'pending', 'archive-naming', 'archive-conflict'])
+def test_external_policy_refuses_unverified_inputs(external_installation, monkeypatch, fault):
+    state, path, defaults, sibling, rule, logfile = external_installation
+    if fault == 'global':
+        defaults.write_text('dateext\n' + defaults.read_text())
+    elif fault == 'inherited':
+        sibling.write_text('copytruncate\n' + sibling.read_text())
+    elif fault == 'conflicting':
+        sibling.write_text(str(logfile) + ' {\n copytruncate\n}\n')
+    elif fault == 'rule':
+        rule.write_text(':msg,contains,"[UFW " /var/log/syslog\n')
+    elif fault == 'unreadable':
+        def unreadable(*args, **kwargs):
+            raise subprocess.CalledProcessError(1, 'synthetic')
+        monkeypatch.setattr(external.subprocess, 'run', unreadable)
+    elif fault == 'symlink':
+        logfile.symlink_to(logfile.rename(logfile.with_suffix('.original')))
+    elif fault == 'timestamp':
+        logfile.write_text('Nov 16 10:00:00 host kernel: [UFW BLOCK] SRC=192.0.2.1\n')
+    elif fault == 'hardlink':
+        os.link(logfile, logfile.with_suffix('.backup'))
+    elif fault == 'missing':
+        logfile.unlink()
+    elif fault == 'archive-naming':
+        logfile.with_suffix('.log.03').write_bytes(b'')
+    elif fault == 'archive-conflict':
+        sibling.write_text(str(logfile) + '.30 {\n daily\n}\n')
+    else:
+        original = path.read_bytes()
+        path.write_text(rotation.STOCK)
+        rotation.apply(state, path)
+        path.write_bytes(original)
+    saved = state / rotation.RECEIPT
+    before = None
+    if saved.exists():
+        before = saved.read_bytes()
+    with pytest.raises((OSError, RuntimeError)):
+        rotation.check(path, state=state)
+    assert path.read_bytes() == LABOR88.read_bytes()
+    if before is not None:
+        assert saved.read_bytes() == before
+    else:
+        assert not saved.exists()
 
 
 def test_modified_configuration_is_not_overwritten_by_rollback(setup):

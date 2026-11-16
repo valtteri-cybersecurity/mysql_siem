@@ -223,8 +223,8 @@ def process_file(cursor, filename, *, stats=None, max_lines=MAX_LINES, deadline=
         descriptor = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(descriptor, 'rb') as source:
             info = os.fstat(source.fileno())
-            if not stat.S_ISREG(info.st_mode):
-                raise OSError('UFW source must be a regular file.')
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o7022:
+                raise OSError('Unsafe UFW source file type, links or permissions.')
             verification_started = time.monotonic()
             checkpoint, prefix, observed, generation = continuity.start(cursor, source, filename, info, scope, deadline)
             read_deadline = deadline
@@ -479,7 +479,7 @@ def process_log(
                 continuity.save_health(connection, scope, result, error='ArchiveError')
                 result['collection_state'] = continuity.read_health(connection, scope)['state']
                 return result
-        if not continuity.reconcile(cursor, scope, logfiles, overall_deadline):
+        if not continuity.reconcile(cursor, scope, get_logfiles(), overall_deadline):
             result['active_state'] = 'UNKNOWN'
         if result.get('archives_unscanned'):
             result['active_state'] = 'UNKNOWN'
@@ -503,7 +503,8 @@ def process_log(
         continuity.save_health(connection, scope, result)
         result['collection_state'] = continuity.read_health(connection, scope)['state']
         result['status'] = 'SUCCESS'
-        print(f"UFW collection: SUCCESS; lines_read={result['lines_read']}; inserted={result['inserted']}; "
+        print(f"UFW collection: pass committed; coverage={result['collection_state']}; "
+              f"lines_read={result['lines_read']}; inserted={result['inserted']}; "
               f"duplicates={result.get('duplicates', 0)}; quarantined={result.get('quarantined', 0)}; "
               f"non_ufw={result.get('non_ufw', 0)}; stop={result['stop_reason']}")
         return result

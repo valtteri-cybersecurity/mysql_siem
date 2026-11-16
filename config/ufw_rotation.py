@@ -10,10 +10,13 @@ from pathlib import Path
 
 from config import installation_state as journal
 from config.service_installation import trusted_directory
+from config.ufw_external_rotation import check_external_source, supports_external_policy
 
 CONFIG = Path('/etc/logrotate.d/ufw')
 RECEIPT = 'ufw-rotation.json'
 MAX_CONFIG = 65536
+MANAGED_GZIP = 'managed gzip'
+EXTERNAL_PLAIN = 'external uncompressed'
 STOCK = '''/var/log/ufw.log
 {
     rotate 4
@@ -121,8 +124,8 @@ def check(path=CONFIG, *, state=None):
     saved = None
     if state is not None:
         saved = receipt(state)
-    planned_config(current, saved)
-    return fingerprint(current, saved)
+    mode, _managed = rotation_plan(current, saved)
+    return fingerprint(current, saved, source_snapshot(mode, path))
 
 
 def write_config(path, text, mode, gid, previous):
@@ -188,32 +191,47 @@ def managed_config(saved):
     return add_compressor(saved['original']), saved['mode'], saved['gid']
 
 
-def fingerprint(current, saved):
-    return digest(json.dumps([current, saved], sort_keys=True))
+def fingerprint(current, saved, source):
+    return digest(json.dumps([current, saved, source], sort_keys=True))
 
 
-def planned_config(current, saved):
+def source_snapshot(mode, path):
+    if mode == EXTERNAL_PLAIN:
+        return check_external_source(path, read_config)
+    return None
+
+
+def rotation_plan(current, saved):
     if saved is not None and saved['phase'] == 'pending':
         managed = managed_config(saved)
         if current == managed or current == original_config(saved):
-            return managed
+            return MANAGED_GZIP, managed
         raise RuntimeError('UFW configuration changed during interrupted installation; files were preserved.')
     text, mode, gid = current
     if text is None:
-        return MANAGED, 0o644, os.getegid()
-    if configuration_lines(text)[0] == MANAGED_LINES:
+        return MANAGED_GZIP, (MANAGED, 0o644, os.getegid())
+    lines, _ = configuration_lines(text)
+    if supports_external_policy(lines, STOCK_LINES[-3]):
+        return EXTERNAL_PLAIN, None
+    if lines == MANAGED_LINES:
         if saved is None or saved['phase'] != 'committed':
             raise RuntimeError('Managed UFW configuration has no matching committed receipt; preserve the file and review recovery.')
-        return None
-    return add_compressor(text), mode, gid
+        return MANAGED_GZIP, None
+    return MANAGED_GZIP, (add_compressor(text), mode, gid)
 
 
 def apply(state, path=CONFIG, *, expected=None):
     current = read_config(path)
     saved = receipt(state)
-    if expected is not None and fingerprint(current, saved) != expected:
+    # Preserve the preflight drift diagnostic before classifying an edited stanza.
+    source = None
+    if current[0] is not None:
+        lines, _ = configuration_lines(current[0])
+        if supports_external_policy(lines, STOCK_LINES[-3]):
+            source = source_snapshot(EXTERNAL_PLAIN, path)
+    if expected is not None and fingerprint(current, saved, source) != expected:
         raise RuntimeError('UFW configuration or recovery receipt changed after preflight; files were preserved.')
-    managed = planned_config(current, saved)
+    _mode, managed = rotation_plan(current, saved)
     if managed is None:
         return False
     if current == managed:
@@ -261,6 +279,16 @@ def commit(state):
             raise RuntimeError('UFW configuration changed before commit.')
         saved['phase'] = 'committed'
         journal.write_file(state / RECEIPT, json.dumps(saved))
+
+
+def verify_active(state, *, during_maintenance=False):
+    current = read_config(CONFIG)
+    saved = receipt(state)
+    mode, planned = rotation_plan(current, saved)
+    if planned is not None and (current != planned or not during_maintenance):
+        raise RuntimeError('UFW rotation publication is incomplete; preserve the recovery receipt.')
+    source_snapshot(mode, CONFIG)
+    return mode
 
 
 def main(argv=None):
