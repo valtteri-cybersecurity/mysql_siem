@@ -4,13 +4,34 @@ import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
+from config import installation_health
 from config import reset_installation as reset
 from database import migrate as migrations
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_reset_resume_requires_completed_schema_but_upgrade_accepts_pending_migrations(monkeypatch):
+    connection = FakeConnection(exists=True)
+    schema = Mock(side_effect=installation_health.HealthError('Database migrations are incomplete.'))
+    monkeypatch.setattr(installation_health, 'verify_schema', schema)
+    ledger = Mock(return_value={})
+    monkeypatch.setattr(migrations, 'check_migration_history', ledger)
+    monkeypatch.setattr(reset, 'check_ufw_before_upgrade', Mock())
+
+    reset.check_upgrade_database(connection)
+    ledger.assert_called_once_with(connection)
+    schema.assert_not_called()
+
+    with pytest.raises(reset.ResetError, match='Database migrations are incomplete'):
+        reset.check_upgrade_database(connection, completed_reset=True)
+    schema.assert_called_once_with(connection)
+    for sql, _ in connection.statements:
+        assert sql.startswith(('SELECT ', 'SHOW '))
 
 
 class FakeConnection:
