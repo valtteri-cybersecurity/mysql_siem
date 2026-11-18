@@ -7,6 +7,21 @@ from database.schema import SchemaError, ensure_tables, read_schema
 BASE_TYPES = {'ufw', 'auth', 'dns', 'system', 'filesystem', 'security'}
 
 
+def upgrade_process_boot_id(connection, path):
+    with connection.cursor() as cursor:
+        query = ('SELECT column_type, is_nullable, column_default, collation_name '
+                 "FROM information_schema.columns WHERE table_schema = DATABASE() "
+                 "AND table_name = 'collector_snapshots' AND column_name = 'process_boot_id'")
+        cursor.execute(query)
+        definition = cursor.fetchone()
+        if definition is None:
+            cursor.execute(path.read_text(encoding='ascii'))
+            cursor.execute(query)
+            definition = cursor.fetchone()
+        if definition != ('char(36)', 'YES', None, 'ascii_bin'):
+            raise SchemaError('Incompatible process boot ID column; preserve and inspect existing data.')
+
+
 def source_clause(clause):
     # MySQL 8.0 CHECK_CLAUSE escapes quotes; 8.4 may return plain quotes.
     clause = clause.replace("\\'", "'").replace('`', '')

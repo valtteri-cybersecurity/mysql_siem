@@ -164,7 +164,7 @@ def _granted_runtime(cursor, database):
 def test_private_mysql_detection_and_migration(empty_mysql, identity_server, monkeypatch):
     admin = empty_mysql
     with monkeypatch.context() as before:
-        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-5])
+        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-9])
         assert migrate.migrate(admin)[-1] == '034'
     with admin.cursor() as cursor:
         cursor.execute('SELECT DATABASE()')
@@ -178,7 +178,7 @@ def test_private_mysql_detection_and_migration(empty_mysql, identity_server, mon
                        "VALUES (%s,'HIGH','Legacy alert','Preserved',%s,%s,%s,'{}')", (old_rule[0], STAMP, STAMP, '0' * 64))
         old_alert = cursor.lastrowid
     admin.commit()
-    assert migrate.migrate(admin) == ['035', '036', '037', '038', '039']
+    assert migrate.migrate(admin) == ['035', '036', '037', '038', '039', '040', '041', '042', '043']
     migrate.apply_one(admin, '035')
     admin.commit()
     assert migrate.migrate(admin) == []

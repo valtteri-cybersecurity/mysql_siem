@@ -180,6 +180,18 @@ def test_shared_account_is_not_changed(settings, initialized, grant):
     assert not any(sql.startswith(('DROP', 'ALTER USER')) for sql, _ in connection.statements)
 
 
+@pytest.mark.parametrize('table', ['process_state', 'service_state'])
+def test_snapshot_state_rights_accept_both_old_and_new_installations(table):
+    for rights in ('SELECT, INSERT, DELETE', 'SELECT, INSERT, UPDATE, DELETE'):
+        reset.validate_runtime_grants([(f'GRANT {rights} ON `mysql_siem`.`{table}` TO `pythonuser`@`localhost`',)])
+
+
+@pytest.mark.parametrize('table', ['process_events', 'service_events'])
+def test_snapshot_history_remains_append_only_for_runtime(table):
+    with pytest.raises(reset.ResetError, match='Unsafe runtime privileges'):
+        reset.validate_runtime_grants([(f'GRANT UPDATE ON `mysql_siem`.`{table}` TO `pythonuser`@`localhost`',)])
+
+
 @pytest.mark.parametrize('version', ['10.11.0-MariaDB', '8.1.0', '5.7.0'])
 def test_wrong_server_is_not_reset(settings, initialized, version):
     connection = FakeConnection(True)

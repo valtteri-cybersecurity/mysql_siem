@@ -28,9 +28,11 @@ def test_cron_grants_and_required_sources_cover_both_collectors():
     installer = (ROOT / 'install.sh').read_text()
     tree = ast.parse('grants = ' + installer.split('grants = ', 1)[1].split('\nconn =', 1)[0])
     grants = ast.literal_eval(tree.body[0].value)
+    assert 'grants.update(SNAPSHOT_STATE_RUNTIME_PRIVILEGES)' in installer
+    grants.update(setup.SNAPSHOT_STATE_RUNTIME_PRIVILEGES)
     for kind, table in [('processes', 'process'), ('services', 'service')]:
         assert grants[table + '_events'] == 'SELECT, INSERT'
-        assert grants[table + '_state'] == 'SELECT, INSERT, DELETE'
+        assert grants[table + '_state'] == 'SELECT, INSERT, UPDATE, DELETE'
         assert f'metrics/{kind}/main.py' in installer
         cron = next(line for line in installer.splitlines() if f'-m metrics.{kind}.main --log-file' in line)
         assert cron.startswith('* * * * * ')
