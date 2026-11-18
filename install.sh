@@ -335,6 +335,12 @@ install_dependencies() {
     export DEBIAN_FRONTEND=noninteractive
     log "Updating package lists."
     apt-get update
+    if [[ "$(dpkg-query -W -f='${db:Status-Status}' lm-sensors 2>/dev/null || true)" != installed ]]; then
+        # The packaged systemd service can apply sensor limits at startup.
+        # Mask before APT configures the package; leave existing installs alone.
+        systemctl mask lm-sensors.service
+        packages+=(lm-sensors)
+    fi
     log "Installing dependencies."
     apt-get install -y "${packages[@]}"
 }
@@ -673,6 +679,7 @@ for path in \
     requirements-dns.txt \
     requirements-runtime.txt \
     config/service_installation.py \
+    config/system_sensor_setup.py \
     config/reset_installation.py \
     config/legacy_runtime.py \
     config/install_bootstrap.sh \
@@ -758,6 +765,8 @@ for path in \
     database/migrations/024_ufw_quarantine_archives.sql \
     database/ufw_collection_schema.py \
     metrics/system/main.py \
+    metrics/system/cpu.py \
+    metrics/system/sensors.py \
     metrics/filesystem/main.py \
     metrics/filesystem/mount_main.py \
     metrics/filesystem/mounts.py \
@@ -853,6 +862,9 @@ persist_installation_role
 secure_project_sources
 install_dependencies
 install_virtualenv
+# Check actual sysfs reads with the cron account, before loading database settings.
+runuser -u "$INSTALL_USER" -- /usr/bin/env -i PYTHONPATH="$PROJECT_DIR" \
+    "$APP_PYTHON" -B -m config.system_sensor_setup
 printf '%s\n' "$SIEM_BOOTSTRAP_COMMIT" > "$PROJECT_DIR/config/installed-version"
 chown root:"$INSTALL_USER" "$PROJECT_DIR/config/installed-version"
 chmod 640 "$PROJECT_DIR/config/installed-version"
