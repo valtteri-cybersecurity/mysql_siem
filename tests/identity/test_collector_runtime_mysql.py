@@ -11,10 +11,16 @@ import pymysql
 import pytest
 
 from database import migrate
-from database.identity import approve_collector_source, register_collector, register_host, register_source
+from database.identity import (
+    approve_collector_source,
+    register_collector,
+    register_host,
+    register_source,
+)
 from ingestion.audit import get as audit_get
 from ingestion.audit import main as audit_main
 from metrics.processes import main as processes_main
+from metrics.processes.get import process_key
 from metrics.services import main as services_main
 
 
@@ -70,11 +76,16 @@ def test_three_collectors_work_with_installer_grants_and_history_stays_protected
         monkeypatch.setenv('SIEM_COLLECTOR_ID', str(collector))
         monkeypatch.setenv('SIEM_' + kind.upper() + '_SOURCE_ID', str(source))
         if kind == 'processes':
+            boot_id = '5a9a2c37-3d94-455e-97cf-c20d4d8b1040'
             state = {'process_name': 'worker', 'username': 'synthetic', 'status': 'running',
                      'executable_path': '/synthetic', 'cpu_percent': 75.5}
-            observation = {'12:1000.000000': state}
+            observation = {process_key(boot_id, 12, 1000.0): state}
+            monkeypatch.setattr(processes_main, 'read_boot_id', Mock(return_value=boot_id))
             monkeypatch.setattr(processes_main, 'get_processes', Mock(return_value=observation))
             assert processes_main.collect_processes(runtime) == 0
+            with runtime.cursor() as cursor:
+                cursor.execute('SELECT process_boot_id FROM collector_snapshots WHERE host_id = %s', (host,))
+                assert cursor.fetchone() == (boot_id,)
             state['process_name'] = 'changed'
             assert processes_main.collect_processes(runtime) == 1
             assert processes_main.collect_processes(runtime) == 0

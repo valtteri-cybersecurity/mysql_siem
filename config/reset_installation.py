@@ -228,15 +228,21 @@ FILESYSTEM_RUNTIME_PRIVILEGES = {
     'filesystem_file_events': 'SELECT, INSERT',
     'filesystem_scan_state': 'SELECT, INSERT, UPDATE',
 }
+SNAPSHOT_STATE_RUNTIME_PRIVILEGES = {
+    'process_state': 'SELECT, INSERT, UPDATE, DELETE',
+    'service_state': 'SELECT, INSERT, UPDATE, DELETE',
+    'collector_health': 'SELECT, INSERT, UPDATE',
+    'process_measurement_windows': 'SELECT, INSERT, UPDATE',
+    'service_measurement_windows': 'SELECT, INSERT, UPDATE',
+}
 RUNTIME_TABLE_PRIVILEGES = {
     **FILESYSTEM_RUNTIME_PRIVILEGES,
+    **SNAPSHOT_STATE_RUNTIME_PRIVILEGES,
     'filesystem_metrics': 'SELECT, INSERT, UPDATE',
     'security_metrics': 'SELECT, INSERT, UPDATE',
     'system_metrics': 'SELECT, INSERT',
     'process_events': 'SELECT, INSERT',
     'service_events': 'SELECT, INSERT',
-    'process_state': 'SELECT, INSERT, DELETE',
-    'service_state': 'SELECT, INSERT, DELETE',
     'collector_snapshots': 'SELECT, INSERT, UPDATE',
     'audit_events': 'SELECT, INSERT',
     'audit_checkpoints': 'SELECT, INSERT, UPDATE',

@@ -688,6 +688,10 @@ for path in \
     database/migrations/017_ufw_datetime_precision.sql \
     database/migrations/018_processes.sql \
     database/migrations/019_services.sql \
+    database/migrations/040_process_boot_id.sql \
+    database/migrations/041_collector_health.sql \
+    database/migrations/042_process_measurement_windows.sql \
+    database/migrations/043_service_measurement_windows.sql \
     database/snapshot_migrations.py \
     database/audit_migrations.py \
     database/migrations/020_audit.sql \
@@ -706,6 +710,10 @@ for path in \
     config/systemd/mysql-siem-audit.service \
     config/systemd/mysql-siem-audit.timer \
     metrics/snapshot.py \
+    metrics/snapshot_retention.py \
+    metrics/bounded_output.py \
+    config/snapshot_policy.py \
+    metrics/collector_health.py \
     config/run_with_env.sh \
     config/filesystem_runtime.py \
     config/installation_role.py \
@@ -767,10 +775,14 @@ for path in \
     metrics/security/main.py \
     metrics/processes/main.py \
     metrics/processes/get.py \
+    metrics/processes/executable.py \
     metrics/processes/database.py \
+    metrics/processes/windows.py \
+    metrics/measurement_window.py \
     metrics/services/main.py \
     metrics/services/get.py \
     metrics/services/database.py \
+    metrics/services/windows.py \
     analysis/ufw/__init__.py \
     analysis/ufw/source_ips.py \
     analysis/ufw/ports.py \
@@ -992,7 +1004,7 @@ PYTHONPATH="$PROJECT_DIR" "$APP_PYTHON" - <<'PY'
 import os
 import pymysql
 
-from config.reset_installation import FILESYSTEM_RUNTIME_PRIVILEGES
+from config.reset_installation import FILESYSTEM_RUNTIME_PRIVILEGES, SNAPSHOT_STATE_RUNTIME_PRIVILEGES
 
 db_name = os.environ["DB_NAME"]
 db_user = os.environ["DB_USER"]
@@ -1003,8 +1015,6 @@ grants = {
     "system_metrics": "SELECT, INSERT",
     "process_events": "SELECT, INSERT",
     "service_events": "SELECT, INSERT",
-    "process_state": "SELECT, INSERT, DELETE",
-    "service_state": "SELECT, INSERT, DELETE",
     "collector_snapshots": "SELECT, INSERT, UPDATE",
     "audit_events": "SELECT, INSERT",
     "audit_checkpoints": "SELECT, INSERT, UPDATE",
@@ -1030,6 +1040,7 @@ grants = {
     'ufw_filter_stats': 'SELECT, INSERT, UPDATE',
 }
 grants.update(FILESYSTEM_RUNTIME_PRIVILEGES)
+grants.update(SNAPSHOT_STATE_RUNTIME_PRIVILEGES)
 
 conn = pymysql.connect(unix_socket="/run/mysqld/mysqld.sock", user="root")
 try:

@@ -33,6 +33,10 @@ REGISTRY = ROOT / "migrations/014_host_registry.sql"
 UFW_TIME_MIGRATION = ROOT / "migrations/017_ufw_datetime_precision.sql"
 FILESYSTEM_MIGRATION = ROOT / "migrations/034_filesystem_metrics.sql"
 FIM_DETECTION_MIGRATION = ROOT / "migrations/035_filesystem_detection.sql"
+PROCESS_BOOT_MIGRATION = ROOT / "migrations/040_process_boot_id.sql"
+COLLECTOR_HEALTH_MIGRATION = ROOT / "migrations/041_collector_health.sql"
+PROCESS_WINDOWS_MIGRATION = ROOT / "migrations/042_process_measurement_windows.sql"
+SERVICE_WINDOWS_MIGRATION = ROOT / "migrations/043_service_measurement_windows.sql"
 LOCK_NAME = "mysql_siem_schema_migrations"
 
 MIGRATIONS = (
@@ -63,6 +67,10 @@ MIGRATIONS = (
     ("037", "filesystem_retained_digest", ROOT / "filesystem_digest_schema.py"),
     ("038", "filesystem_directory_metadata", ROOT / "filesystem_directory_schema.py"),
     ("039", "filesystem_mount_history", ROOT / "filesystem_mount_history_schema.py"),
+    ("040", "process_boot_id", PROCESS_BOOT_MIGRATION),
+    ("041", "collector_health", COLLECTOR_HEALTH_MIGRATION),
+    ("042", "process_measurement_windows", PROCESS_WINDOWS_MIGRATION),
+    ("043", "service_measurement_windows", SERVICE_WINDOWS_MIGRATION),
 )
 
 
@@ -92,8 +100,8 @@ HISTORY_TABLES = EVENT_TABLES + ANALYSIS_TABLES + (
     "ufw_file_checkpoints", "ufw_collection_gaps", "ufw_archive_proofs", "ufw_collection_health",
     "ufw_filter_rules", "ufw_filter_audit", "ufw_filter_seen", "ufw_filter_stats",
     "auth_ingestion_state", "auth_archive_checkpoints",
-    "process_events", "process_state", "service_events", "service_state", "collector_snapshots",
-    "audit_events", "audit_checkpoints", "audit_targets",
+    "process_events", "process_state", "service_events", "service_state", "collector_snapshots", "collector_health",
+    "process_measurement_windows", "service_measurement_windows", "audit_events", "audit_checkpoints", "audit_targets",
 ) + FILESYSTEM_TABLES
 
 
@@ -619,6 +627,22 @@ def apply_one(connection, version):
     elif version == "039":
         from database.filesystem_mount_history_schema import upgrade
         upgrade(connection)
+
+    elif version == "040":
+        from database.snapshot_migrations import upgrade_process_boot_id
+        upgrade_process_boot_id(connection, PROCESS_BOOT_MIGRATION)
+
+    elif version == "041":
+        with connection.cursor() as cursor:
+            cursor.execute(COLLECTOR_HEALTH_MIGRATION.read_text(encoding="utf-8"))
+
+    elif version == "042":
+        with connection.cursor() as cursor:
+            cursor.execute(PROCESS_WINDOWS_MIGRATION.read_text(encoding="utf-8"))
+
+    elif version == "043":
+        with connection.cursor() as cursor:
+            cursor.execute(SERVICE_WINDOWS_MIGRATION.read_text(encoding="utf-8"))
 
     elif version == "033":
         from database.auth_archive_schema import upgrade

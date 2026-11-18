@@ -316,7 +316,7 @@ def test_private_mysql_fim_is_atomic_scoped_and_retry_safe(mysql, identity_serve
 def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysql, identity_server, monkeypatch, tmp_path):
     admin = empty_mysql
     with monkeypatch.context() as before:
-        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-4])
+        before.setattr(migrate, 'MIGRATIONS', migrate.MIGRATIONS[:-8])
         assert migrate.migrate(admin)[-1] == '035'
     with admin.cursor() as cursor:
         cursor.execute('SELECT DATABASE()')
@@ -370,7 +370,7 @@ def test_private_mysql_upgrade_activates_with_existing_fim_checkpoint(empty_mysq
             filesystem_runtime.prepare(runtime, tmp_path, user, python)
         assert not path.exists()
 
-        assert migrate.migrate(admin) == ['036', '037', '038', '039']
+        assert migrate.migrate(admin) == ['036', '037', '038', '039', '040', '041', '042', '043']
         migrate.apply_one(admin, '036')
         migrate.apply_one(admin, '037')
         migrate.apply_one(admin, '038')
