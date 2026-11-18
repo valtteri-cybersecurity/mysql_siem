@@ -1,7 +1,14 @@
-import glob
 import os
-import time
 from datetime import datetime
+from pathlib import Path
+
+from metrics.system.cpu import (
+    get_cpu_observation,
+    legacy_temperature,
+    read_load_averages,
+    sample_cpu_usage,
+)
+from metrics.system.sensors import AMBIGUOUS, READ_ERROR, read_sensors
 
 
 def get_timestamp():
@@ -16,30 +23,14 @@ def get_uptime():
 
 
 def get_cpu_temp():
-    for zone in glob.glob("/sys/class/thermal/thermal_zone*"):
-        try:
-            with open(f"{zone}/type", "r") as file:
-                sensor_type = file.read().strip().lower()
-
-            if "cpu" in sensor_type or "pkg" in sensor_type or "x86" in sensor_type:
-                with open(f"{zone}/temp", "r") as file:
-                    return round(int(file.read()) / 1000, 1)
-
-        except OSError:
-            continue
-
-    return None
+    status, temperature = legacy_temperature(read_sensors())
+    if status in {AMBIGUOUS, READ_ERROR}:
+        print(f"CPU temperature: {status}.")
+    return temperature
 
 
 def get_cpu_load_avg():
-    with open("/proc/loadavg", "r") as file:
-        load_average = file.read().strip().split()
-
-    return (
-        float(load_average[0]),
-        float(load_average[1]),
-        float(load_average[2]),
-    )
+    return read_load_averages(Path("/proc/loadavg"))
 
 
 def get_meminfo():
@@ -89,41 +80,25 @@ def get_disk_usage():
 
 
 def get_cpu_usage():
-    with open("/proc/stat", "r") as file:
-        cpu = file.readline().split()
-
-    idle_start = int(cpu[4])
-    total_start = sum(map(int, cpu[1:]))
-
-    time.sleep(1)
-
-    with open("/proc/stat", "r") as file:
-        cpu = file.readline().split()
-
-    idle_end = int(cpu[4])
-    total_end = sum(map(int, cpu[1:]))
-
-    idle = idle_end - idle_start
-    total = total_end - total_start
-
-    return round((1 - idle / total) * 100, 1)
+    return sample_cpu_usage(Path("/proc/stat"))["cpu_usage_percent"]
 
 
 def get_data():
     uptime = get_uptime()
-    cpu_avg = get_cpu_load_avg()
-    cpu_usage = get_cpu_usage()
-    cpu_temp = get_cpu_temp()
+    cpu = get_cpu_observation()
+    temperature_status = cpu["measurement_status"]["legacy_cpu_temperature_c"]
+    if temperature_status in {AMBIGUOUS, READ_ERROR}:
+        print(f"CPU temperature: {temperature_status}.")
     mem_info = get_meminfo()
     disk_used, disk_free, disk_percent = get_disk_usage()
 
     return (
         uptime,
-        cpu_avg[0],
-        cpu_avg[1],
-        cpu_avg[2],
-        cpu_usage,
-        cpu_temp,
+        cpu["load_1min"],
+        cpu["load_5min"],
+        cpu["load_15min"],
+        cpu["cpu_usage_percent"],
+        cpu["legacy_cpu_temperature_c"],
         mem_info["memavailable"],
         disk_used,
         disk_free,

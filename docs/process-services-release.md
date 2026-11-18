@@ -82,3 +82,28 @@ Jokainen mitattu ajo teki yhden commitin. Uusi Process päivittää edelleen muu
 | Services, tavallinen | 37065 → 37065 | 11025 → 11025 | 3803 | 92 |
 | Services, suuri | 111855 → 111855 | 33165 → 33165 | 5698 | 92 |
 | Services, kuorma | 373620 → 373620 | 110970 → 110970 | 12348 | 92 |
+
+## Vaiheiden 1–12 katselmus
+
+| Vaihe | Varmennettu toteutus |
+| --- | --- |
+| 1–3 | Deterministinen delta, tilan ja mittausten kenttäjako sekä transaktionaaliset lisäykset, päivitykset ja poistot. Kuormakoe erottaa kohderivit SQL-lauseista. |
+| 4–7 | Boot ID, PID:n uudelleenkäyttö, vanhempisuhteen todentaminen, UID/EUID/GID/EGID sekä suoritettavan tiedoston identiteetti. Kohdennetut regressiot kattavat käsitellyt katoamiset ja käyttöoikeuspuutteet. |
+| 8 | Systemd:n MainPID, User, Group, FragmentPath, DropInPaths ja aliasnimet. Aidossa systemd 255 -ajossa todennettiin myös lainattu aliasmuoto. |
+| 9–11 | Health, viiden minuutin UTC-ikkunat, peruutukset ja uusinnat. Ensimmäisten rinnakkaisten Health-rivien gap lock -deadlock korjattiin rajaamalla kerääjän transaktio READ COMMITTED -tasolle. Isäntäkohtainen lukko ja rekisteriviiteavaimet suojaavat samaa tilannekuvaa. |
+| 12 | Rajattu tulosteenluku, resurssikatot, kuivaharjoittelu ja erikseen kytkettävä siivous. Vanhat turvallisuustapahtumat säilytetään. |
+
+## Julkaisuvalmius ja rajaukset
+
+| Osa | Arvio | Jäljellä oleva työ |
+| --- | --- | --- |
+| Process Collector 2.0 | READY_WITH_LIMITATIONS | Aidot testit muilla jakeluilla ja pidempikestoinen ajastustesti. Otanta voi ohittaa lyhytikäiset prosessit. |
+| Services Collector 2.0 | READY_WITH_LIMITATIONS | Aidot systemd-versioiden ja palvelutilin testit muilla jakeluilla. MainPID kuvaa havaittua pääprosessia. |
+| Yhteinen snapshot ja delta | READY_WITH_LIMITATIONS | Mitattu eräkirjoitus ja rinnakkaiset ensikirjoitukset MySQL 8.0.46:ssa. Lisää MySQL 8.4 hyväksymismatriisiin. |
+| Mittauskoosteet | READY_WITH_LIMITATIONS | Koosteet kuvaavat hyväksyttyjä otoksia. Pitkäaikainen levynkasvu riippuu havaintojen ja kohdeyksityiskohtien määrästä. |
+| Collector Health | READY_WITH_LIMITATIONS | Tietokannan yhteyskatkossa kerääjäloki on ensisijainen lähde. |
+| Retention ja resurssirajat | READY_WITH_LIMITATIONS | Turvallisuustapahtumien poistolle tarvitaan vanhempiviittausten säilymisen takaava ratkaisu. |
+| Migraatiot | READY_WITH_LIMITATIONS | SQL-päivityspolku ja keskeytyksestä jatkaminen testataan eristetyllä MySQL:llä. Käyttöjärjestelmäkohtainen installer-päivitys vaatii oman testiasennuksensa. |
+| Testikattavuus | READY_WITH_LIMITATIONS | Mintin lukuhavainnot ja yksityisen MySQL:n integraatiot täydentävät mockeja. Laajempi jakelukattavuus edellyttää taulukon manuaalisia ajoja. |
+
+Rocky ja Fedora ovat installer-julkaisun estäviä puutteita kyseisillä alustoilla. Ubuntun ja Debianin aito testiasennus on keskitasoinen varmennuspuute ja estää täyden alustakohtaisen hyväksynnän. Kokeellisen suorituskykyvertailun vaihtelu ja fyysisen tallennuskoon puuttuva pitkäaikaismittaus rajaavat kapasiteettiarvioita. Seuraava vaihe on jakelumatriisi sekä pidempi otanta SQL:n ja fyysisen levytilan seurannalla.

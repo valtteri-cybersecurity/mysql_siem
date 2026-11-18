@@ -301,9 +301,15 @@ def test_current_collector_field_order_and_insert_match_contract(payload, monkey
     from metrics.system import db, get
 
     monkeypatch.setattr(get, "get_uptime", lambda: 12)
-    monkeypatch.setattr(get, "get_cpu_load_avg", lambda: (0.25, 0.5, 0.75))
-    monkeypatch.setattr(get, "get_cpu_usage", lambda: 101.5)
-    monkeypatch.setattr(get, "get_cpu_temp", lambda: -12.5)
+    observation = {
+        "load_1min": 0.25,
+        "load_5min": 0.5,
+        "load_15min": 0.75,
+        "cpu_usage_percent": 101.5,
+        "legacy_cpu_temperature_c": -12.5,
+        "measurement_status": {"legacy_cpu_temperature_c": "AVAILABLE"},
+    }
+    monkeypatch.setattr(get, "get_cpu_observation", lambda: observation)
     monkeypatch.setattr(get, "get_meminfo", lambda: {"memavailable": 2048.0})
     monkeypatch.setattr(get, "get_disk_usage", lambda: (1.25, 2.75, 31.25))
     monkeypatch.setattr(db, "identity_schema_enabled", lambda connection: False)

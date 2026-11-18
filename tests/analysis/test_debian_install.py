@@ -6,11 +6,16 @@ from pathlib import Path
 
 import pytest
 
+from config.service_installation import tree_files
+
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = (ROOT / "install.sh").read_text(encoding="utf-8")
 
 
-def dependency_setup(tmp_path, distribution, version="8.4.13", *, client=True, maria=False):
+def dependency_setup(
+    tmp_path, distribution, version="8.4.13", *, client=True, maria=False,
+    retry=False, mask_fails=False, sensors_installed=False,
+):
     release = tmp_path / "os-release"
     release.write_text(distribution, encoding="utf-8")
 
@@ -60,12 +65,43 @@ id() { printf 'mysql_siem\n'; }
 install() { :; }
 persist_installation_role() { :; }
 prepare_service_installation() { printf 'SERVICE_COPY_CHECK\n'; }
-apt-get() { printf 'APT'; printf ' <%s>' "$@"; printf '\n'; }
+dpkg-query() {
+    if [[ "$3" == lm-sensors && "$TEST_SENSORS_INSTALLED" == 1 ]]; then
+        printf 'installed'
+    elif [[ "$3" == auditd ]]; then
+        printf 'install ok installed'
+    else
+        return 1
+    fi
+}
+systemctl() {
+    printf 'SYSTEMCTL <%s> <%s>\n' "$1" "$2"
+    [[ "$TEST_MASK_FAILS" == 0 ]]
+}
+apt-get() {
+    printf 'APT'; printf ' <%s>' "$@"; printf '\n'
+    for package in "$@"; do
+        if [[ "$package" == lm-sensors ]]; then
+            TEST_SENSORS_INSTALLED=1
+        fi
+    done
+}
+sensors() { printf 'SENSOR TOOL EXECUTED\n'; return 1; }
+sensors-detect() { sensors; }
+i2cdetect() { sensors; }
+pwmconfig() { sensors; }
+modprobe() { sensors; }
+rmmod() { sensors; }
 ''' + functions + r'''
-install_virtualenv() { printf 'VENV_CHECK\n'; }
+install_virtualenv() { APP_PYTHON=/synthetic/python; printf 'VENV_CHECK\n'; }
 ''' + INSTALLER[start:end]
 
+    if retry:
+        script += "\n" + INSTALLER[start:end]
+
     env = dict(os.environ)
+    env["TEST_MASK_FAILS"] = str(int(mask_fails))
+    env["TEST_SENSORS_INSTALLED"] = str(int(sensors_installed))
     env["PATH"] = str(binaries)
     env["PROJECT_DIR"] = str(tmp_path / "project with spaces")
     env["TEST_MYSQL_VERSION"] = (
@@ -105,6 +141,9 @@ def test_existing_mysql_is_kept_on_all_supported_distributions(
 
     assert "<rsyslog>" in result.stdout
     assert "<cron>" in result.stdout
+    assert result.stdout.count("<lm-sensors>") == 1
+    assert result.stdout.index("SYSTEMCTL <mask> <lm-sensors.service>") < result.stdout.index("APT <install>")
+    assert "SENSOR TOOL EXECUTED" not in result.stdout
 
     assert "<mysql-server>" not in result.stdout
     assert "<python3-pymysql>" not in result.stdout
@@ -121,6 +160,8 @@ def test_existing_mysql_is_kept_on_all_supported_distributions(
     assert "VENV_CHECK" in result.stdout
 
     assert "RUNUSER:-u mysql_siem -- test -r" in result.stdout
+    assert 'RUNUSER:-u mysql_siem -- /usr/bin/env -i PYTHONPATH=' in result.stdout
+    assert '-B -m config.system_sensor_setup' in result.stdout
 
 
 @pytest.mark.parametrize("distribution", ["ubuntu", "linuxmint"])
@@ -135,6 +176,33 @@ def test_fresh_ubuntu_and_mint_keep_mysql_installation(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.count("<mysql-server>") == 1
+
+
+def test_sensor_dependency_is_idempotent_on_retries(tmp_path):
+    result = dependency_setup(tmp_path, "ID=debian\nVERSION_ID=13\n", retry=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("APT <install>") == 2
+    assert result.stdout.count("<lm-sensors>") == 1
+    assert result.stdout.count("SYSTEMCTL <mask> <lm-sensors.service>") == 1
+    assert result.stdout.count("-B -m config.system_sensor_setup") == 2
+    assert "SENSOR TOOL EXECUTED" not in result.stdout
+    assert "<mysql-server>" not in result.stdout
+
+
+def test_existing_lm_sensors_configuration_is_left_alone(tmp_path):
+    result = dependency_setup(tmp_path, "ID=ubuntu\nVERSION_ID=24.04\n", sensors_installed=True)
+    assert result.returncode == 0, result.stderr
+    assert "APT <install>" in result.stdout
+    assert "<lm-sensors>" not in result.stdout
+    assert "SYSTEMCTL" not in result.stdout
+    assert "-B -m config.system_sensor_setup" in result.stdout
+
+
+def test_no_apt_install_when_sensor_service_cannot_be_masked(tmp_path):
+    result = dependency_setup(tmp_path, "ID=debian\nVERSION_ID=13\n", mask_fails=True)
+    assert result.returncode != 0
+    assert "SYSTEMCTL <mask> <lm-sensors.service>" in result.stdout
+    assert "APT <install>" not in result.stdout
 
 
 def test_debian_without_mysql_stops_before_package_changes(tmp_path):
@@ -323,3 +391,11 @@ def test_project_source_and_cron_log_permissions_are_separate():
         'chown "$INSTALL_USER:$INSTALL_USER" "$path"'
         in INSTALLER
     )
+
+
+def test_cpu_and_sensor_modules_are_validated_and_included_in_the_service_copy():
+    required = INSTALLER.split("\nfor path in ", 1)[1].split("\ndo\n", 1)[0]
+    copied = set(tree_files(ROOT))
+    for module in ("metrics/system/cpu.py", "metrics/system/sensors.py", "config/system_sensor_setup.py"):
+        assert module in required
+        assert ROOT / module in copied
